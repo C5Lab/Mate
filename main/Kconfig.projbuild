@@ -1,0 +1,83 @@
+menu "JanOS Web Client Configuration"
+
+    choice JANOS_BOARD
+        prompt "Target board"
+        default JANOS_BOARD_XIAO_C6
+        help
+            Select the hardware board this firmware will run on.
+
+        config JANOS_BOARD_XIAO_C6
+            bool "XIAO ESP32-C6 (no display)"
+            depends on IDF_TARGET_ESP32C6
+
+        config JANOS_BOARD_CORES3
+            bool "M5Stack CoreS3 SE (ILI9342C 320x240)"
+            depends on IDF_TARGET_ESP32S3
+
+        config JANOS_BOARD_ATOMS3R
+            bool "AtomS3R Dev Kit (GC9107 128x128)"
+            depends on IDF_TARGET_ESP32S3
+
+        config JANOS_BOARD_STICKC_PLUS2
+            bool "M5StickC PLUS2 (ST7789V2 135x240)"
+            depends on IDF_TARGET_ESP32
+    endchoice
+
+    config JANOS_HAS_DISPLAY
+        bool
+        default n if JANOS_BOARD_XIAO_C6
+        default y
+
+    menu "UART Configuration (Monster connection)"
+
+        config JANOS_UART_TX_PIN
+            int "UART TX GPIO pin"
+            default 21 if JANOS_BOARD_XIAO_C6
+            default 2  if JANOS_BOARD_CORES3
+            default 32 if JANOS_BOARD_STICKC_PLUS2
+            default 5  if JANOS_BOARD_ATOMS3R
+            help
+                GPIO pin for UART TX to Monster. For M5Stack boards
+                this is typically the Grove port yellow wire.
+
+        config JANOS_UART_RX_PIN
+            int "UART RX GPIO pin"
+            default 20 if JANOS_BOARD_XIAO_C6
+            default 1  if JANOS_BOARD_CORES3
+            default 33 if JANOS_BOARD_STICKC_PLUS2
+            default 6  if JANOS_BOARD_ATOMS3R
+            help
+                GPIO pin for UART RX from Monster. For M5Stack boards
+                this is typically the Grove port white wire.
+
+        config JANOS_UART_BAUD_RATE
+            int "UART baud rate"
+            default 115200
+
+    endmenu
+
+    menu "WiFi AP Configuration"
+
+        config JANOS_AP_SSID_PREFIX
+            string "AP SSID prefix"
+            default "JanOS"
+            help
+                The AP SSID will be PREFIX-XXXX where XXXX is derived from MAC.
+
+        config JANOS_AP_PASSWORD
+            string "AP password (empty = open)"
+            default "janos1337"
+
+        config JANOS_AP_CHANNEL
+            int "AP WiFi channel"
+            default 6
+            range 1 13
+
+        config JANOS_AP_MAX_CONN
+            int "Max AP connections"
+            default 4
+            range 1 8
+
+    endmenu
+
+endmenu

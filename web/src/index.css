@@ -1,0 +1,286 @@
+/* JanOS Neon Theme */
+:root {
+  --bg:       #050A14;
+  --panel:    #0C1A2A;
+  --card:     #0C1A2A;
+  --card-press: #132338;
+  --border:   #273D57;
+  --text:     #EAF3FF;
+  --muted:    #93A6BC;
+  --cyan:     #52B6FF;
+  --magenta:  #FF2FA3;
+  --green:    #5EDCA3;
+  --red:      #F44336;
+  --yellow:   #FFC107;
+  --orange:   #FF9800;
+  --pink:     #E91E63;
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+  -webkit-font-smoothing: antialiased;
+}
+
+#app { padding: 12px; max-width: 600px; margin: 0 auto; }
+
+/* ---------- Header / Status ---------- */
+.header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 8px 0 14px;
+}
+.header h1 {
+  font-size: 18px; font-weight: 700;
+  background: linear-gradient(135deg, var(--cyan), var(--magenta));
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+}
+.status-bar {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 10px; padding: 10px 14px;
+  display: flex; align-items: center; gap: 10px; margin-bottom: 14px;
+}
+.status-dot {
+  width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0;
+  background: var(--muted);
+}
+.status-dot.active { background: var(--green); box-shadow: 0 0 8px var(--green); }
+.status-dot.busy   { background: var(--cyan); box-shadow: 0 0 8px var(--cyan); animation: pulse 1.2s infinite; }
+.status-text { font-size: 13px; color: var(--muted); flex: 1; }
+
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
+
+/* ---------- Tiles ---------- */
+.tiles {
+  display: grid; grid-template-columns: repeat(3, 1fr);
+  gap: 10px; margin-bottom: 14px;
+}
+@media (max-width: 400px) { .tiles { grid-template-columns: repeat(2, 1fr); } }
+
+.tile {
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: 12px; padding: 18px 10px; text-align: center;
+  cursor: pointer; transition: all .15s; user-select: none;
+}
+.tile:active { transform: scale(0.96); background: var(--card-press); }
+.tile .icon { font-size: 26px; margin-bottom: 6px; }
+.tile .label { font-size: 12px; font-weight: 500; }
+.tile.disabled { opacity: .35; pointer-events: none; }
+.tile.stop { border-color: var(--red); }
+
+/* ---------- Buttons ---------- */
+.btn {
+  padding: 10px 20px; border: none; border-radius: 8px;
+  font-size: 14px; font-weight: 600; cursor: pointer;
+  color: #fff; transition: all .15s;
+}
+.btn:active { transform: scale(0.96); }
+.btn-cyan    { background: var(--cyan); }
+.btn-red     { background: var(--red); }
+.btn-magenta { background: var(--magenta); }
+.btn-green   { background: var(--green); color: #000; }
+.btn-orange  { background: var(--orange); }
+.btn-sm { padding: 6px 14px; font-size: 12px; }
+.btn-block { width: 100%; }
+.btn:disabled { opacity: .4; pointer-events: none; }
+.btn-row { display: flex; gap: 8px; margin-top: 12px; }
+
+/* ---------- Panels ---------- */
+.panel {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 10px; margin-bottom: 14px; overflow: hidden;
+}
+.panel-header {
+  padding: 10px 14px; border-bottom: 1px solid var(--border);
+  font-size: 14px; font-weight: 600; color: var(--cyan);
+  display: flex; justify-content: space-between; align-items: center;
+  position: sticky; top: 0; background: var(--panel); z-index: 1;
+}
+.panel-body { padding: 0; }
+
+/* ---------- Network list ---------- */
+.net-row {
+  display: flex; align-items: center; padding: 8px 14px;
+  border-bottom: 1px solid #1a2a3a; gap: 10px; cursor: pointer;
+}
+.net-row:active { background: var(--card-press); }
+.net-cb {
+  width: 20px; height: 20px; accent-color: var(--magenta);
+  flex-shrink: 0; cursor: pointer;
+}
+.net-info { flex: 1; min-width: 0; }
+.net-ssid { font-size: 14px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.net-meta { font-size: 11px; color: var(--muted); margin-top: 2px; }
+.net-rssi { font-size: 12px; font-weight: 600; flex-shrink: 0; width: 44px; text-align: right; }
+.rssi-good { color: var(--green); }
+.rssi-med  { color: var(--yellow); }
+.rssi-weak { color: var(--red); }
+
+/* ---------- Attack Monitor ---------- */
+.monitor {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 10px; margin-bottom: 14px; padding: 12px;
+}
+.monitor-title { font-size: 14px; font-weight: 600; color: var(--cyan); margin-bottom: 8px; }
+.monitor-log {
+  max-height: 250px; overflow-y: auto; font-family: 'Courier New', monospace;
+  font-size: 11px; color: var(--muted); line-height: 1.5;
+}
+.monitor-log .event { color: var(--green); }
+.monitor-log .error { color: var(--red); }
+.monitor-log .info  { color: var(--cyan); }
+
+/* ---------- Forms ---------- */
+.field { margin-bottom: 12px; }
+.field label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+.field input, .field select {
+  width: 100%; padding: 10px 12px; background: var(--bg); color: var(--text);
+  border: 1px solid var(--border); border-radius: 8px; font-size: 14px;
+  outline: none;
+}
+.field input:focus, .field select:focus { border-color: var(--cyan); }
+
+/* ---------- Misc ---------- */
+.back-btn {
+  display: inline-flex; align-items: center; gap: 4px; padding: 6px 0;
+  color: var(--cyan); font-size: 13px; font-weight: 600; cursor: pointer;
+  background: none; border: none; margin-bottom: 10px;
+}
+.page-title { font-size: 18px; font-weight: 700; margin-bottom: 12px; }
+.badge {
+  display: inline-block; padding: 2px 8px; border-radius: 10px;
+  font-size: 11px; font-weight: 600;
+}
+.badge-green  { background: rgba(94,220,163,.15); color: var(--green); }
+.badge-red    { background: rgba(244,67,54,.15); color: var(--red); }
+.badge-cyan   { background: rgba(82,182,255,.15); color: var(--cyan); }
+
+.spinner {
+  display: inline-block; width: 16px; height: 16px;
+  border: 2px solid var(--border); border-top-color: var(--cyan);
+  border-radius: 50%; animation: spin .8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.empty-msg { text-align: center; padding: 24px; color: var(--muted); font-size: 13px; }
+
+.sel-bar {
+  background: var(--panel); border: 1px solid var(--magenta);
+  border-radius: 10px; padding: 10px 14px; margin-bottom: 14px;
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+}
+.sel-count { font-size: 13px; color: var(--magenta); font-weight: 600; }
+
+.observer-stats {
+  background: linear-gradient(135deg, rgba(82, 182, 255, .16), rgba(94, 220, 163, .10));
+  border: 1px solid rgba(82, 182, 255, .35);
+  border-radius: 12px;
+  padding: 14px 16px;
+  margin-bottom: 14px;
+}
+
+.observer-stat-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .08em;
+  color: var(--muted);
+}
+
+.observer-stat-value {
+  font-size: 34px;
+  line-height: 1;
+  font-weight: 800;
+  color: var(--green);
+  margin-top: 6px;
+}
+
+.observer-hint {
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 14px;
+}
+
+.observer-table-wrap {
+  overflow-x: auto;
+}
+
+.observer-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.observer-table th,
+.observer-table td {
+  padding: 12px 14px;
+  text-align: left;
+  vertical-align: top;
+  border-bottom: 1px solid #1a2a3a;
+}
+
+.observer-table th {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .08em;
+  color: var(--muted);
+  background: rgba(5, 10, 20, .55);
+}
+
+.observer-table td {
+  font-size: 13px;
+}
+
+.observer-ssid {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.observer-macs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.observer-mac {
+  font-family: 'Courier New', monospace;
+  font-size: 11px;
+  color: var(--cyan);
+  background: rgba(82, 182, 255, .10);
+  border: 1px solid rgba(82, 182, 255, .15);
+  border-radius: 999px;
+  padding: 4px 8px;
+}
+
+.observer-empty {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.observer-scan-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.observer-scan-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px;
+  border-bottom: 1px solid #1a2a3a;
+}
+
+.observer-scan-meta {
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 2px;
+}
+
+.observer-scan-side {
+  flex-shrink: 0;
+  font-size: 12px;
+  color: var(--cyan);
+  text-align: right;
+}
