@@ -1,4 +1,4 @@
-# 🚀 JanOS Mate
+# 🧠 JanOS Mate
 
 <p align="center">
 <img width="1983" height="793" alt="mate" src="https://github.com/user-attachments/assets/2c4dabd5-8459-4c04-bcba-03c88f96c868" />
@@ -8,32 +8,14 @@
   <b>⚡ Web control layer for JanOS / projectZero ecosystem</b><br>
   Control recon, attacks and wireless operations directly from your browser.
 </p>
-
----
-
-## 🔗 Quick Access
-
 <p align="center">
-
-  <a href="#"><img src="https://img.shields.io/badge/🚀%20projectZero-Core-blue?style=for-the-badge"></a>
-
-  <a href="#"><img src="https://img.shields.io/badge/🧠%20MonsterC5-Hardware-purple?style=for-the-badge"></a>
-
-  <a href="#"><img src="https://img.shields.io/badge/💻%20WebUI-Control-green?style=for-the-badge"></a>
-
-  <a href="#"><img src="https://img.shields.io/badge/📡%20WiFi%20Ops-Active-red?style=for-the-badge"></a>
-
+  <b>⚡ Web control layer for JanOS / projectZero ecosystem</b><br>
+  Control recon, attacks and wireless operations directly from your browser.
 </p>
 
 ---
 
-## 🧠 Overview
-
-ESP-IDF application that creates a WiFi AP with a captive web portal for controlling  
-
-JanOS firmware on ESP32C5 (Monster) via UART.
-
-## Architecture
+## 🏗️ Architecture
 
 ```
 Phone (browser) ── WiFi AP ──> ESP32 WebClient ── UART 115200 ──> ESP32C5 Monster (JanOS)
@@ -45,16 +27,17 @@ The WebClient translates these into UART commands to Monster and parses response
 
 ## Supported Boards
 
-| Board              | Chip      | Display              | Flash |
-|--------------------|-----------|----------------------|-------|
-| XIAO-ESP32-C6      | ESP32-C6  | None                 | 4MB   |
-| M5Stack CoreS3 SE  | ESP32-S3  | ILI9342C 320x240     | 16MB  |
-| M5StickC PLUS2     | ESP32     | ST7789V2 135x240     | 8MB   |
-| AtomS3R Dev Kit    | ESP32-S3  | GC9107 128x128       | 8MB   |
+| Board              | Chip       | Display              | Flash |
+|--------------------|------------|----------------------|-------|
+| XIAO-ESP32-C6      | ESP32-C6   | None                 | 4MB   |
+| M5Stack CoreS3 SE  | ESP32-S3   | ILI9342C 320x240     | 16MB  |
+| M5StickC PLUS2     | ESP32      | ST7789V2 135x240     | 8MB   |
+| AtomS3R Dev Kit    | ESP32-S3   | GC9107 128x128       | 8MB   |
+| Atom Lite          | ESP32-Pico | None                 | 4MB   |
 
-## Quick Start
+## ⚡ Quick Start
 
-### 1. Build Web UI
+### 1. 🧱 Build Web UI
 
 ```bash
 cd web
@@ -62,7 +45,7 @@ npm install
 npm run build      # outputs to ../spiffs/
 ```
 
-### 2. Build & Flash Firmware
+### 2. 🔧 Build & Flash Firmware
 
 ```bash
 # Set target (pick one):
@@ -79,7 +62,7 @@ idf.py menuconfig
 idf.py build flash monitor
 ```
 
-### 3. Connect
+### 3. 📶 Connect
 
 - Connect to WiFi AP `JanOS-XXXX` (password: `janos1337`)
 - Phone auto-opens captive portal, or navigate to `http://192.168.4.1`
@@ -89,15 +72,20 @@ idf.py build flash monitor
 Default pins are configurable via `idf.py menuconfig`.
 
 ### M5Stack boards (Grove port)
-- **Yellow wire** (Grove pin 1) → Monster TX  →  WebClient RX
-- **White wire** (Grove pin 2)  → Monster RX  ←  WebClient TX
-- **Red** = 5V, **Black** = GND
+- **Yellow wire** 🟡 (Grove pin 1) → Monster TX  →  WebClient RX
+- **White wire** ⚪ (Grove pin 2)  → Monster RX  ←  WebClient TX
+- **Red** 🔴 = 5V, 
+- **Black** ⚫ = GND
 
 ### XIAO-ESP32-C6
 - GPIO 20 = RX (from Monster TX)
 - GPIO 21 = TX (to Monster RX)
 
-## Web UI Development
+### Atom Lite
+- GPIO 26 = RX (from Monster TX)
+- GPIO 32 = TX (to Monster RX)
+
+## 💻 Web UI Development
 
 ```bash
 cd web
@@ -107,7 +95,7 @@ npm run dev        # Vite dev server with hot reload
 Configure the Vite proxy in `vite.config.js` to point to your ESP32's IP
 for testing against real hardware.
 
-## REST API
+## 📡 REST API
 
 | Method | Endpoint            | Description                  |
 |--------|---------------------|------------------------------|
@@ -137,3 +125,7 @@ Connect to `ws://192.168.4.1/ws` for real-time events:
 - `sniffer_count` — packet count update
 - `uart_line` — raw UART line for logging
 
+<p align="center">
+  ⚡ Designed for control. <br>
+  <b>Control the chaos. LAB5.</b>
+</p>
