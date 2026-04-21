@@ -5,8 +5,15 @@
 </p>
 
 <p align="center">
-  <b>⚡ Web control layer for JanOS / projectZero ecosystem</b><br>
-  Control recon, attacks and wireless operations directly from your browser.
+
+  <a href="#"><img src="https://img.shields.io/badge/🚀%20projectZero-Core-blue?style=for-the-badge"></a>
+
+  <a href="#"><img src="https://img.shields.io/badge/🧠%20MonsterC5-Hardware-purple?style=for-the-badge"></a>
+
+  <a href="https://github.com/C5Lab/projectZero/stargazers"><img src="https://img.shields.io/github/stars/C5Lab/projectZero?style=for-the-badge"></a>
+
+  <a href="https://github.com/C5Lab/projectZero/network/members"><img src="https://img.shields.io/github/forks/C5Lab/projectZero?style=for-the-badge"></a>
+
 </p>
 <p align="center">
   <b>⚡ Web control layer for JanOS / projectZero ecosystem</b><br>
