@@ -1,4 +1,4 @@
-# 🧠 Mate - Web control for JanOS
+# 🧠 Mate - web control for JanOS
 
 <p align="center">
 <img width="1983" height="793" alt="mate" src="https://github.com/user-attachments/assets/2c4dabd5-8459-4c04-bcba-03c88f96c868" />
