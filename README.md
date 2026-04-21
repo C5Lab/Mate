@@ -1,6 +1,36 @@
-# JanOS Mate
+# 🚀 JanOS Mate
 
-ESP-IDF application that creates a WiFi AP with a captive web portal for controlling
+<p align="center">
+<img width="1983" height="793" alt="mate" src="https://github.com/user-attachments/assets/2c4dabd5-8459-4c04-bcba-03c88f96c868" />
+</p>
+
+<p align="center">
+  <b>⚡ Web control layer for JanOS / projectZero ecosystem</b><br>
+  Control recon, attacks and wireless operations directly from your browser.
+</p>
+
+---
+
+## 🔗 Quick Access
+
+<p align="center">
+
+  <a href="#"><img src="https://img.shields.io/badge/🚀%20projectZero-Core-blue?style=for-the-badge"></a>
+
+  <a href="#"><img src="https://img.shields.io/badge/🧠%20MonsterC5-Hardware-purple?style=for-the-badge"></a>
+
+  <a href="#"><img src="https://img.shields.io/badge/💻%20WebUI-Control-green?style=for-the-badge"></a>
+
+  <a href="#"><img src="https://img.shields.io/badge/📡%20WiFi%20Ops-Active-red?style=for-the-badge"></a>
+
+</p>
+
+---
+
+## 🧠 Overview
+
+ESP-IDF application that creates a WiFi AP with a captive web portal for controlling  
+
 JanOS firmware on ESP32C5 (Monster) via UART.
 
 ## Architecture
