@@ -2,40 +2,42 @@ import { useEffect, useRef, useState } from 'preact/hooks';
 import { Layout } from '../components/Layout';
 import { AttackMonitor } from '../components/AttackMonitor';
 import { api } from '../api';
-import { getState, setState } from '../store';
+import { setState } from '../store';
 import { showToast } from '../components/Toast';
 import { wsAddListener } from '../ws';
 
 const REFRESH_INTERVAL_MS = 20000;
 
-function ScanResultsPreview({ networks }) {
+function ScanPreview({ networks }) {
   if (!networks.length) {
-    return <div class="empty-msg">Waiting for scan results...</div>;
+    return <div class="empty-state">Waiting for scan results...</div>;
   }
 
   return (
-    <div class="observer-scan-list">
+    <div class="network-scroll" style="max-height: 34vh;">
       {networks.map((network) => (
-        <div class="observer-scan-row" key={network.index}>
-          <div>
-            <div class="observer-ssid">{network.ssid || '[Hidden]'}</div>
-            <div class="observer-scan-meta">{network.bssid} | {network.security} | {network.band}</div>
+        <div class="network-row" key={network.index}>
+          <div class="network-main">
+            <div class="network-title">{network.ssid || '[Hidden]'}</div>
+            <div class="network-meta">{network.bssid} | {network.security} | {network.band}</div>
           </div>
-          <div class="observer-scan-side">CH{network.channel} | {network.rssi}</div>
+          <div class="signal-wrap">
+            <div class="signal-value">CH{network.channel}</div>
+          </div>
         </div>
       ))}
     </div>
   );
 }
 
-function SnifferResultsTable({ aps }) {
+function ObserverTable({ aps }) {
   if (!aps.length) {
-    return <div class="empty-msg">No APs with clients found.</div>;
+    return <div class="empty-state">No AP/client snapshot available yet.</div>;
   }
 
   return (
-    <div class="observer-table-wrap">
-      <table class="observer-table">
+    <div class="table-wrap">
+      <table class="table">
         <thead>
           <tr>
             <th>Network</th>
@@ -47,18 +49,10 @@ function SnifferResultsTable({ aps }) {
         <tbody>
           {aps.map((ap, index) => (
             <tr key={`${ap.ssid}-${ap.channel}-${index}`}>
-              <td>
-                <div class="observer-ssid">{ap.ssid || 'Unknown SSID'}</div>
-              </td>
+              <td>{ap.ssid || 'Unknown'}</td>
               <td>CH{ap.channel}</td>
               <td>{ap.clientCount}</td>
-              <td>
-                <div class="observer-macs">
-                  {ap.clients.length > 0 ? ap.clients.map((client) => (
-                    <span class="observer-mac" key={`${ap.ssid}-${client}`}>{client}</span>
-                  )) : <span class="observer-empty">Waiting for client list...</span>}
-                </div>
-              </td>
+              <td>{ap.clients?.length ? ap.clients.join(', ') : '-'}</td>
             </tr>
           ))}
         </tbody>
@@ -76,6 +70,7 @@ export function Sniffer() {
   const [packetCount, setPacketCount] = useState(0);
   const [aps, setAps] = useState([]);
   const [hasSnapshot, setHasSnapshot] = useState(false);
+
   const refreshTimerRef = useRef(null);
   const scanPollRef = useRef(null);
   const scanTimeoutRef = useRef(null);
@@ -83,7 +78,7 @@ export function Sniffer() {
   useEffect(() => {
     const removeWs = wsAddListener((msg) => {
       if (msg.type === 'sniffer_count') {
-        setPacketCount(msg.count);
+        setPacketCount(msg.count || 0);
       }
 
       if (msg.type === 'sniffer_results_updated') {
@@ -125,9 +120,8 @@ export function Sniffer() {
       setPacketCount(data.packetCount || 0);
       setAps(data.aps || []);
       setHasSnapshot(Boolean(data.hasSnapshot));
-      setIsRefreshing(false);
-    } catch (e) {
-      console.error('Failed to load sniffer results:', e);
+      setState({ packetCount: data.packetCount || 0 });
+    } finally {
       setIsRefreshing(false);
     }
   }
@@ -140,7 +134,6 @@ export function Sniffer() {
         setIsRefreshing(false);
       }
     } catch (e) {
-      console.error('Failed to refresh sniffer results:', e);
       setIsRefreshing(false);
     }
   }
@@ -158,6 +151,7 @@ export function Sniffer() {
     setPacketCount(0);
     setAps([]);
     setHasSnapshot(false);
+
     await refreshSnifferResults();
     refreshTimerRef.current = setInterval(refreshSnifferResults, REFRESH_INTERVAL_MS);
     showToast('Network Observer started', 'success');
@@ -165,26 +159,28 @@ export function Sniffer() {
 
   async function start() {
     stopTimers();
-    setIsScanning(true);
+
     setRunning(false);
+    setIsScanning(true);
     setIsRefreshing(false);
     setPacketCount(0);
     setAps([]);
     setHasSnapshot(false);
     setScanNetworks([]);
     setScanComplete(false);
-    setState({ networks: [], selected: new Set(), status: 'scanning' });
+
+    setState({ status: 'scanning', networks: [], selected: new Set() });
 
     try {
       const res = await api.scan();
       if (!res.ok) {
-        showToast(res.error || 'Scan failed', 'error');
         setIsScanning(false);
+        showToast(res.error || 'Scan failed', 'error');
         return;
       }
     } catch (e) {
-      showToast('Scan failed', 'error');
       setIsScanning(false);
+      showToast('Scan failed', 'error');
       return;
     }
 
@@ -194,24 +190,26 @@ export function Sniffer() {
         if (!data.ok) return;
 
         setScanNetworks(data.networks || []);
-        setState({ networks: data.networks || [], selected: new Set() });
+        setState({ networks: data.networks || [], scanCount: data.count || 0 });
 
         if (data.complete) {
           stopTimers();
           setScanComplete(true);
-          showToast(`Scan complete: ${data.count} networks`, 'success');
+          setState({ status: 'idle', lastScanAt: Date.now() });
+          showToast(`Scan complete: ${data.count} APs`, 'success');
           await startSnifferAfterScan();
         }
       } catch (e) {
-        console.error('Failed to poll scan results:', e);
+        /* ignore and keep polling */
       }
-    }, 2000);
+    }, 1800);
 
     scanTimeoutRef.current = setTimeout(() => {
       stopTimers();
       setIsScanning(false);
+      setState({ status: 'idle' });
       showToast('Scan timed out', 'warning');
-    }, 60000);
+    }, 70000);
   }
 
   async function stop() {
@@ -220,55 +218,71 @@ export function Sniffer() {
     setRunning(false);
     setIsScanning(false);
     setIsRefreshing(false);
+    showToast('Observer stopped', 'warning');
   }
 
   return (
-    <Layout title="Network Observer" back="/">
-      <div class="observer-stats">
-        <div class="observer-stat-label">Packages</div>
-        <div class="observer-stat-value">{packetCount}</div>
-      </div>
+    <Layout
+      title="Network Observer"
+      subtitle="One-tap flow: scan first, then monitor packet/client telemetry continuously."
+      back="/"
+    >
+      <section class="glass-card card-body reveal">
+        <div class="stats-grid" style="grid-template-columns: repeat(3, minmax(0, 1fr));">
+          <article class="stat-card">
+            <div class="stat-label">Packets</div>
+            <div class="stat-value">{packetCount}</div>
+          </article>
+          <article class="stat-card">
+            <div class="stat-label">Scan APs</div>
+            <div class="stat-value">{scanNetworks.length}</div>
+          </article>
+          <article class="stat-card">
+            <div class="stat-label">Snapshot</div>
+            <div class="stat-value">{hasSnapshot ? 'Ready' : 'Pending'}</div>
+          </article>
+        </div>
 
-      <div class="btn-row" style="margin-top:0;margin-bottom:14px">
-        <button class="btn btn-green" onClick={start} disabled={running || isScanning}>
-          {isScanning ? <><span class="spinner" /> Scanning...</> : 'Start'}
-        </button>
-        <button class="btn btn-red" onClick={stop} disabled={!running && !isScanning}>
-          Stop
-        </button>
-      </div>
-
-      <div class="observer-hint">
-        Start runs one scan, then launches the observer and refreshes client data every 20 seconds.
-      </div>
+        <div class="btn-row">
+          <button class="btn btn-success" onClick={start} disabled={running || isScanning}>
+            {isScanning ? <span class="spinner" /> : null}
+            {isScanning ? 'Scanning...' : 'Start Observer'}
+          </button>
+          <button class="btn btn-secondary" onClick={refreshSnifferResults} disabled={!running || isRefreshing}>
+            {isRefreshing ? <span class="spinner" /> : null}
+            Refresh Snapshot
+          </button>
+          <button class="btn btn-danger" onClick={stop} disabled={!running && !isScanning}>
+            Stop
+          </button>
+        </div>
+      </section>
 
       {(scanNetworks.length > 0 || isScanning || scanComplete) && (
-        <div class="panel">
-          <div class="panel-header">
-            <span>Scan Results ({scanNetworks.length})</span>
-            {scanComplete && <span class="badge badge-cyan">ready</span>}
+        <section class="glass-card card-body reveal">
+          <div class="section-head">
+            <h3 class="section-title">Scan Stage</h3>
+            {scanComplete ? <span class="badge info">Complete</span> : null}
           </div>
-          <div class="panel-body" style="max-height:40vh;overflow-y:auto;padding:0">
-            <ScanResultsPreview networks={scanNetworks} />
-          </div>
-        </div>
+          <ScanPreview networks={scanNetworks} />
+        </section>
       )}
 
-      <div class="panel">
-        <div class="panel-header">
-          <span>Observed Clients</span>
-          {running && isRefreshing && <span class="badge badge-cyan">refreshing</span>}
+      <section class="glass-card card-body reveal">
+        <div class="section-head">
+          <h3 class="section-title">Observed Clients</h3>
+          {running && isRefreshing ? <span class="badge info">Refreshing</span> : null}
         </div>
-        <div class="panel-body">
-          {hasSnapshot ? <SnifferResultsTable aps={aps} /> : (
-            <div class="empty-msg">
-              {running ? 'Waiting for first observer snapshot...' : 'Press Start to begin observing.'}
-            </div>
-          )}
-        </div>
-      </div>
+        {hasSnapshot ? (
+          <ObserverTable aps={aps} />
+        ) : (
+          <div class="empty-state">
+            {running ? 'Waiting for first snapshot...' : 'Start observer to collect client telemetry.'}
+          </div>
+        )}
+      </section>
 
-      <AttackMonitor title="Network Observer Monitor" attackType="sniffer" />
+      <AttackMonitor title="Observer Live Log" attackType="sniffer" />
     </Layout>
   );
 }

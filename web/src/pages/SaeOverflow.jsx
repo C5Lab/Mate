@@ -8,56 +8,75 @@ import { showToast } from '../components/Toast';
 export function SaeOverflow() {
   const [running, setRunning] = useState(false);
   const st = getState();
-
-  const targetNet = st.networks.find(n => st.selected.has(n.index));
+  const target = st.networks.find((n) => st.selected.has(n.index));
 
   async function start() {
     if (st.selected.size !== 1) {
-      showToast('Select exactly 1 network for SAE overflow', 'warning');
+      showToast('Select exactly one WPA3 target', 'warning');
       return;
     }
+
     await api.select(Array.from(st.selected));
     const res = await api.sae();
     if (res.ok) {
       setRunning(true);
+      showToast('SAE Overflow started', 'success');
     } else {
-      showToast(res.error || 'Failed', 'error');
+      showToast(res.error || 'Failed to start', 'error');
     }
   }
 
   async function stop() {
     await api.stop();
     setRunning(false);
+    showToast('Stopped', 'warning');
   }
 
+  const likelyIncompatible =
+    target && !target.security.includes('WPA3') && !target.security.includes('SAE');
+
   return (
-    <Layout title="SAE Overflow" back="/">
-      <div style="margin-bottom:12px;font-size:13px;color:var(--muted)">
-        Target: {targetNet ? `${targetNet.ssid} (${targetNet.security})` : 'none'}
-      </div>
-
-      {targetNet && !targetNet.security.includes('WPA3') && !targetNet.security.includes('SAE') && (
-        <div style="margin-bottom:12px;padding:10px;background:rgba(244,67,54,.1);border:1px solid var(--red);border-radius:8px;font-size:12px;color:var(--red)">
-          Warning: Target does not appear to be WPA3/SAE. Attack may not be effective.
+    <Layout
+      title="SAE Overflow"
+      subtitle="Single-target WPA3/SAE test flow with strict target validation."
+      back="/"
+    >
+      <section class="glass-card card-body reveal">
+        <div class="kv">
+          <div class="kv-row">
+            <span class="kv-key">Target</span>
+            <span class="kv-val">{target ? `${target.ssid} (${target.security})` : 'Not selected'}</span>
+          </div>
+          <div class="kv-row">
+            <span class="kv-key">Selected count</span>
+            <span class="kv-val">{st.selected.size}</span>
+          </div>
         </div>
-      )}
 
-      <div class="btn-row" style="margin-top:0;margin-bottom:14px">
-        {!running ? (
-          <button class="btn btn-magenta" onClick={start}
-                  disabled={st.selected.size !== 1}>
-            {'\u{1F513}'} Start SAE Overflow
-          </button>
-        ) : (
-          <button class="btn btn-red" onClick={stop}>
-            {'\u{26D4}'} Stop
-          </button>
-        )}
-      </div>
+        {likelyIncompatible ? (
+          <div class="alert warn">Target does not look like WPA3/SAE. Expected effectiveness is low.</div>
+        ) : null}
 
-      <AttackMonitor title="SAE Monitor" attackType="sae" onEvent={(msg) => {
-        if (msg.type === 'attack_stopped') setRunning(false);
-      }} />
+        <div class="btn-row">
+          {!running ? (
+            <button class="btn btn-primary" onClick={start} disabled={st.selected.size !== 1}>
+              Start SAE Overflow
+            </button>
+          ) : (
+            <button class="btn btn-danger" onClick={stop}>
+              Stop SAE Overflow
+            </button>
+          )}
+        </div>
+      </section>
+
+      <AttackMonitor
+        title="SAE Telemetry"
+        attackType="sae"
+        onEvent={(msg) => {
+          if (msg.type === 'attack_stopped') setRunning(false);
+        }}
+      />
     </Layout>
   );
 }

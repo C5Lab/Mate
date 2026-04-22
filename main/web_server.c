@@ -1,6 +1,7 @@
 #include "web_server.h"
 #include "command_handler.h"
 #include "response_parser.h"
+#include "wifi_ap.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -314,10 +315,14 @@ static esp_err_t api_attack_post(httpd_req_t *req)
     bool ok = false;
 
     if (strstr(uri, "/deauth"))         ok = cmd_do_deauth();
+    else if (strstr(uri, "/blackout"))   ok = cmd_do_blackout();
     else if (strstr(uri, "/eviltwin"))   ok = cmd_do_evil_twin();
     else if (strstr(uri, "/sae"))        ok = cmd_do_sae();
     else if (strstr(uri, "/handshake"))  ok = cmd_do_handshake();
     else if (strstr(uri, "/sniffer"))    ok = cmd_do_sniffer();
+    else if (strstr(uri, "/mitm"))       ok = cmd_do_mitm();
+    else if (strstr(uri, "/nmap"))       ok = cmd_do_nmap();
+    else if (strstr(uri, "/arp"))        ok = cmd_do_arp();
     else if (strstr(uri, "/rogueap")) {
         char body[256] = {0};
         httpd_req_recv(req, body, sizeof(body) - 1);
@@ -349,10 +354,71 @@ static esp_err_t api_attack_post(httpd_req_t *req)
     return ESP_OK;
 }
 
+static bool json_get_string(const char *json, const char *key, char *out, int out_len)
+{
+    if (!json || !key || !out || out_len <= 1) return false;
+    const char *k = strstr(json, key);
+    if (!k) return false;
+    const char *q1 = strchr(k, '"');
+    if (!q1) return false;
+    q1 = strchr(q1 + 1, '"');
+    if (!q1) return false;
+    const char *colon = strchr(q1, ':');
+    if (!colon) return false;
+    const char *q2 = strchr(colon, '"');
+    if (!q2) return false;
+    q2++;
+    const char *q3 = strchr(q2, '"');
+    if (!q3) return false;
+
+    int len = (int)(q3 - q2);
+    if (len >= out_len) len = out_len - 1;
+    memcpy(out, q2, len);
+    out[len] = '\0';
+    return len > 0;
+}
+
 static esp_err_t api_stop_post(httpd_req_t *req)
 {
     cmd_do_stop();
     send_json(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
+static esp_err_t api_wifi_connect_post(httpd_req_t *req)
+{
+    char body[256] = {0};
+    int received = httpd_req_recv(req, body, sizeof(body) - 1);
+    if (received <= 0) {
+        send_json(req, "{\"ok\":false,\"error\":\"no body\"}");
+        return ESP_OK;
+    }
+
+    char ssid[33] = {0};
+    char password[65] = {0};
+    if (!json_get_string(body, "\"ssid\"", ssid, sizeof(ssid))) {
+        send_json(req, "{\"ok\":false,\"error\":\"ssid required\"}");
+        return ESP_OK;
+    }
+    json_get_string(body, "\"password\"", password, sizeof(password));
+
+    if (cmd_do_wifi_connect(ssid, password)) {
+        send_json(req, "{\"ok\":true,\"status\":\"connecting\"}");
+    } else {
+        httpd_resp_set_status(req, "409 Conflict");
+        send_json(req, "{\"ok\":false,\"error\":\"busy\"}");
+    }
+    return ESP_OK;
+}
+
+static esp_err_t api_wifi_disconnect_post(httpd_req_t *req)
+{
+    if (cmd_do_wifi_disconnect()) {
+        send_json(req, "{\"ok\":true}");
+    } else {
+        httpd_resp_set_status(req, "409 Conflict");
+        send_json(req, "{\"ok\":false,\"error\":\"busy\"}");
+    }
     return ESP_OK;
 }
 
@@ -507,13 +573,110 @@ static esp_err_t api_sniffer_refresh_post(httpd_req_t *req)
 
 static esp_err_t api_status_get(httpd_req_t *req)
 {
-    char buf[128];
+    const char *sta_ssid = cmd_get_sta_ssid();
+    char buf[384];
     snprintf(buf, sizeof(buf),
-        "{\"ok\":true,\"state\":\"%s\",\"scan_count\":%d,\"packet_count\":%d}",
+        "{\"ok\":true,\"state\":\"%s\",\"scan_count\":%d,\"packet_count\":%d,"
+        "\"c5_connected\":%s,\"heap_free\":%u,\"heap_internal\":%u,\"ap_clients\":%d,"
+        "\"sta_connected\":%s,\"sta_ssid\":\"%s\"}",
         cmd_state_name(cmd_get_state()),
         cmd_get_scan_results()->count,
-        cmd_get_sniffer_results()->packet_count);
+        cmd_get_sniffer_results()->packet_count,
+        cmd_is_c5_connected() ? "true" : "false",
+        (unsigned)esp_get_free_heap_size(),
+        (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+        wifi_ap_get_client_count(),
+        cmd_is_sta_connected() ? "true" : "false",
+        sta_ssid ? sta_ssid : "");
     send_json(req, buf);
+    return ESP_OK;
+}
+
+static esp_err_t api_dashboard_get(httpd_req_t *req)
+{
+    const scan_results_t *scan = cmd_get_scan_results();
+    int strongest_idx = -1;
+    int strongest_rssi = -999;
+    for (int i = 0; i < scan->count; i++) {
+        if (scan->networks[i].rssi > strongest_rssi) {
+            strongest_rssi = scan->networks[i].rssi;
+            strongest_idx = i;
+        }
+    }
+
+    int handshake_count = cmd_get_handshake_count();
+    cmd_state_t state = cmd_get_state();
+    bool hs_loading = (state == STATE_LISTING_HANDSHAKES);
+    if (handshake_count < 0 && state == STATE_IDLE) {
+        cmd_do_list_handshake_count();
+        hs_loading = true;
+    }
+
+    float lat = 0.0f, lon = 0.0f;
+    bool has_fix = cmd_get_last_gps_fix(&lat, &lon);
+
+    const char *sta_ssid = cmd_get_sta_ssid();
+    char buf[640];
+    snprintf(
+        buf,
+        sizeof(buf),
+        "{\"ok\":true,\"c5_connected\":%s,\"ap_clients\":%d,\"heap_free\":%u,"
+        "\"heap_internal\":%u,\"handshake_count\":%d,\"handshake_loading\":%s,"
+        "\"gps_fix\":%s,\"gps_lat\":%.6f,\"gps_lon\":%.6f,\"last_net_rssi\":%d,"
+        "\"sd_free_gb\":-1,\"sd_total_gb\":-1,\"sta_connected\":%s,\"sta_ssid\":\"%s\"}",
+        cmd_is_c5_connected() ? "true" : "false",
+        wifi_ap_get_client_count(),
+        (unsigned)esp_get_free_heap_size(),
+        (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+        handshake_count < 0 ? 0 : handshake_count,
+        hs_loading ? "true" : "false",
+        has_fix ? "true" : "false",
+        has_fix ? lat : 0.0f,
+        has_fix ? lon : 0.0f,
+        strongest_idx >= 0 ? strongest_rssi : -120,
+        cmd_is_sta_connected() ? "true" : "false",
+        sta_ssid ? sta_ssid : ""
+    );
+    send_json(req, buf);
+    return ESP_OK;
+}
+
+static esp_err_t api_wardrive_logs_get(httpd_req_t *req)
+{
+    parsed_portal_file_t files[MAX_PORTAL_FILES];
+    int n = cmd_get_wardrive_logs(files, MAX_PORTAL_FILES);
+    cmd_state_t state = cmd_get_state();
+
+    if (n > 0) {
+        char buf[2048] = "{\"ok\":true,\"files\":[";
+        int pos = strlen(buf);
+        for (int i = 0; i < n; i++) {
+            pos += snprintf(buf + pos, sizeof(buf) - pos,
+                "%s{\"index\":%d,\"name\":\"%s\"}",
+                i > 0 ? "," : "", files[i].index, files[i].filename);
+        }
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "]}");
+        send_json(req, buf);
+        return ESP_OK;
+    }
+
+    if (state == STATE_LISTING_WARDRIVE) {
+        send_json(req, "{\"ok\":true,\"status\":\"loading\"}");
+        return ESP_OK;
+    }
+
+    if (state != STATE_IDLE) {
+        httpd_resp_set_status(req, "409 Conflict");
+        send_json(req, "{\"ok\":false,\"error\":\"busy\"}");
+        return ESP_OK;
+    }
+
+    if (cmd_do_list_wardrive_logs()) {
+        send_json(req, "{\"ok\":true,\"status\":\"loading\"}");
+    } else {
+        httpd_resp_set_status(req, "409 Conflict");
+        send_json(req, "{\"ok\":false,\"error\":\"busy\"}");
+    }
     return ESP_OK;
 }
 
@@ -587,7 +750,7 @@ esp_err_t web_server_start(void)
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.uri_match_fn     = httpd_uri_match_wildcard;
     config.stack_size       = 6144;
-    config.max_uri_handlers = 20;
+    config.max_uri_handlers = 24;
     config.max_open_sockets = 7;
     config.lru_purge_enable = true;
     config.recv_wait_timeout  = 10;
@@ -653,12 +816,16 @@ esp_err_t web_server_start(void)
     REGISTER_URI("/api/select",        HTTP_POST, api_select_post);
     REGISTER_URI("/api/attack/*",      HTTP_POST, api_attack_post);
     REGISTER_URI("/api/stop",          HTTP_POST, api_stop_post);
+    REGISTER_URI("/api/wifi/connect",  HTTP_POST, api_wifi_connect_post);
+    REGISTER_URI("/api/wifi/disconnect", HTTP_POST, api_wifi_disconnect_post);
     REGISTER_URI("/api/portals",       HTTP_GET,  api_portals_get);
     REGISTER_URI("/api/portal/select", HTTP_POST, api_portal_select_post);
     REGISTER_URI("/api/passwords",     HTTP_GET,  api_passwords_get);
+    REGISTER_URI("/api/wardrive/logs", HTTP_GET,  api_wardrive_logs_get);
     REGISTER_URI("/api/sniffer/results", HTTP_GET,  api_sniffer_results_get);
     REGISTER_URI("/api/sniffer/results", HTTP_POST, api_sniffer_refresh_post);
     REGISTER_URI("/api/status",        HTTP_GET,  api_status_get);
+    REGISTER_URI("/api/dashboard",     HTTP_GET,  api_dashboard_get);
 
     /* Captive portal detection endpoints */
     REGISTER_URI("/generate_204",        HTTP_GET, android_204_handler);

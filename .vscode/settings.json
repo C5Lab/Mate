@@ -1,5 +1,5 @@
 {
-    "idf.currentSetup": "/Users/jan/.espressif/v6.0/esp-idf",
+    "idf.currentSetup": "/Users/dominikhrycaj/.espressif/release-v6.0/esp-idf",
     "idf.customExtraVars": {
         "IDF_TARGET": "esp32"
     },
@@ -7,7 +7,7 @@
         "interface/ftdi/esp32_devkitj_v1.cfg",
         "target/esp32.cfg"
     ],
-    "idf.monitorPort": "/dev/tty.usbserial-5A490765391",
-    "idf.port": "/dev/tty.usbserial-5A490765391",
+    "idf.monitorPort": "/dev/tty.usbserial-3552730EB6",
+    "idf.port": "/dev/tty.usbserial-3552730EB6",
     "idf.flashType": "UART"
 }

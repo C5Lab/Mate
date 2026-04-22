@@ -13,9 +13,16 @@ typedef enum {
     STATE_ATTACK_SAE,
     STATE_ATTACK_HANDSHAKE,
     STATE_ATTACK_SNIFFER,
+    STATE_ATTACK_BLACKOUT,
+    STATE_ATTACK_MITM,
+    STATE_ATTACK_NMAP,
+    STATE_ATTACK_ARP,
+    STATE_WIFI_CONNECTING,
     STATE_LISTING_PORTALS,
     STATE_LISTING_PASSWORDS,
     STATE_LISTING_SNIFFER,
+    STATE_LISTING_HANDSHAKES,
+    STATE_LISTING_WARDRIVE,
 } cmd_state_t;
 
 /**
@@ -71,6 +78,24 @@ bool cmd_do_handshake(void);
 /** Start sniffer. */
 bool cmd_do_sniffer(void);
 
+/** Start blackout attack. */
+bool cmd_do_blackout(void);
+
+/** Start MITM capture mode (PCAP net). */
+bool cmd_do_mitm(void);
+
+/** Start Nmap scan (default quick mode). */
+bool cmd_do_nmap(void);
+
+/** Start ARP host discovery. */
+bool cmd_do_arp(void);
+
+/** Connect STA to selected AP SSID. */
+bool cmd_do_wifi_connect(const char *ssid, const char *password);
+
+/** Disconnect STA from AP. */
+bool cmd_do_wifi_disconnect(void);
+
 /** Stop all operations. */
 bool cmd_do_stop(void);
 
@@ -85,6 +110,12 @@ bool cmd_do_list_passwords(void);
 
 /** Request sniffer results. */
 bool cmd_do_sniffer_results(void);
+
+/** Request handshake file count from SD card. */
+bool cmd_do_list_handshake_count(void);
+
+/** Request wardrive log files from SD card. */
+bool cmd_do_list_wardrive_logs(void);
 
 /* ---------- State queries ---------- */
 
@@ -102,3 +133,21 @@ int cmd_get_passwords(parsed_password_t *out, int max);
 
 /** Get cached network observer results. */
 const sniffer_results_t *cmd_get_sniffer_results(void);
+
+/** Get cached handshake .pcap count from SD card listing. */
+int cmd_get_handshake_count(void);
+
+/** Whether UART from C5 was seen recently. */
+bool cmd_is_c5_connected(void);
+
+/** Last known GPS fix from UART output. */
+bool cmd_get_last_gps_fix(float *lat, float *lon);
+
+/** Current STA connection state from wifi_connect flow. */
+bool cmd_is_sta_connected(void);
+
+/** Last connected STA SSID, or empty string. */
+const char *cmd_get_sta_ssid(void);
+
+/** Get cached wardrive log file list. */
+int cmd_get_wardrive_logs(parsed_portal_file_t *out, int max);

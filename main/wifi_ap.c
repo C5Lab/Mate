@@ -15,6 +15,7 @@ static const char *TAG = "wifi_ap";
 
 static char s_ssid[33];
 static const char *s_ip = "192.168.4.1";
+static int s_client_count = 0;
 
 /* ---------- Captive Portal DNS ----------
  * Minimal DNS server: responds to every A-record query
@@ -98,9 +99,11 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
 {
     if (id == WIFI_EVENT_AP_STACONNECTED) {
         wifi_event_ap_staconnected_t *e = data;
+        s_client_count++;
         ESP_LOGI(TAG, "Client connected: " MACSTR, MAC2STR(e->mac));
     } else if (id == WIFI_EVENT_AP_STADISCONNECTED) {
         wifi_event_ap_stadisconnected_t *e = data;
+        if (s_client_count > 0) s_client_count--;
         ESP_LOGI(TAG, "Client disconnected: " MACSTR, MAC2STR(e->mac));
     }
 }
@@ -165,4 +168,9 @@ const char *wifi_ap_get_ssid(void)
 const char *wifi_ap_get_ip(void)
 {
     return s_ip;
+}
+
+int wifi_ap_get_client_count(void)
+{
+    return s_client_count;
 }
