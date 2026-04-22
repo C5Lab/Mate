@@ -27,6 +27,8 @@ jobs:
     runs-on: ubuntu-24.04
     container:
       image: espressif/idf:release-v6.0
+    outputs:
+      wc_version: ${{ steps.version.outputs.wc_version }}
 
     strategy:
       fail-fast: false
@@ -55,6 +57,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Read firmware version
+        id: version
+        run: |
+          ver=$(grep -oP '(?<=JANOS_WC_VERSION ")[^"]+' main/main.c)
+          echo "wc_version=$ver" >> "$GITHUB_OUTPUT"
 
       - name: Cache ESP-IDF artifacts
         uses: actions/cache@v4
@@ -124,10 +132,11 @@ jobs:
         env:
           EVENT_TAG: ${{ github.event.release.tag_name }}
           INPUT_TAG: ${{ inputs.release_tag }}
+          WC_VERSION: ${{ needs.build.outputs.wc_version }}
         run: |
           TAG="${EVENT_TAG:-}"
           if [ -z "$TAG" ]; then TAG="${INPUT_TAG:-}"; fi
-          if [ -z "$TAG" ]; then TAG="build-${{ github.run_number }}"; fi
+          if [ -z "$TAG" ]; then TAG="v${WC_VERSION}"; fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "Using tag: $TAG"
 
