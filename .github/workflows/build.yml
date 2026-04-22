@@ -101,9 +101,9 @@ jobs:
           set -e
           mkdir -p artifacts/${{ matrix.board }}
           cp build-${{ matrix.board }}/janos-web-client.bin              artifacts/${{ matrix.board }}/mate-${{ matrix.board }}.bin
-          cp build-${{ matrix.board }}/partition_table/partition-table.bin artifacts/${{ matrix.board }}/
-          cp build-${{ matrix.board }}/bootloader/bootloader.bin          artifacts/${{ matrix.board }}/
-          cp build-${{ matrix.board }}/storage.bin                        artifacts/${{ matrix.board }}/
+          cp build-${{ matrix.board }}/partition_table/partition-table.bin artifacts/${{ matrix.board }}/partition-table-${{ matrix.board }}.bin
+          cp build-${{ matrix.board }}/bootloader/bootloader.bin          artifacts/${{ matrix.board }}/bootloader-${{ matrix.board }}.bin
+          cp build-${{ matrix.board }}/storage.bin                        artifacts/${{ matrix.board }}/storage-${{ matrix.board }}.bin
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
