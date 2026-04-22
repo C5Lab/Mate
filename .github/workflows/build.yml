@@ -161,13 +161,10 @@ jobs:
             files+=("$f")
           done < <(find release_artifacts -name "*.bin" -print0)
 
-          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --title "Mate $TAG"
-          else
-            gh release create "$TAG" -R "$GITHUB_REPOSITORY" \
-              --target "$GITHUB_SHA" \
-              --title "Mate $TAG" \
-              --notes-file release_notes.md
-          fi
+          gh release delete "$TAG" -R "$GITHUB_REPOSITORY" --yes 2>/dev/null || true
 
-          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber "${files[@]}"
+          gh release create "$TAG" -R "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Mate $TAG" \
+            --notes-file release_notes.md \
+            "${files[@]}"
