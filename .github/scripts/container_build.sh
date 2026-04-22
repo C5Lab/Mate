@@ -55,6 +55,8 @@ done
 
 build_native() {
   cd "$APP_DIR"
+  # Remove root sdkconfig so idf.py regenerates it from sdkconfig.defaults for the correct target
+  rm -f sdkconfig sdkconfig.old
   normalize_sdkconfig
   export IDF_TARGET
   export SDKCONFIG_DEFAULTS
@@ -62,6 +64,7 @@ build_native() {
     # shellcheck disable=SC1091
     . /opt/esp/idf/export.sh >/dev/null 2>&1
   fi
+  idf.py set-target "${IDF_TARGET}"
   idf.py -B "${BUILD_DIR}" build
 }
 
@@ -81,4 +84,4 @@ docker run --rm \
   --volume "${APP_DIR}:/project" \
   --volume "${CACHE_DIR}:/root/.espressif" \
   "$IMAGE" \
-  bash -c '. /opt/esp/idf/export.sh >/dev/null 2>&1; idf.py -B "${BUILD_DIR}" build'
+  bash -c '. /opt/esp/idf/export.sh >/dev/null 2>&1; rm -f sdkconfig sdkconfig.old; idf.py set-target "${IDF_TARGET}"; idf.py -B "${BUILD_DIR}" build'
