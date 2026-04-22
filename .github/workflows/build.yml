@@ -148,9 +148,9 @@ jobs:
           set -euo pipefail
 
           files=()
-          for f in release_artifacts/**/*.bin; do
-            [ -f "$f" ] && files+=("$f")
-          done
+          while IFS= read -r -d '' f; do
+            files+=("$f")
+          done < <(find release_artifacts -name "*.bin" -print0)
 
           if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --title "Mate $TAG"
