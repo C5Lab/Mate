@@ -23,6 +23,7 @@ const ATTACK_OPTIONS = [
 ];
 
 const STA_REQUIRED_ATTACKS = new Set(['mitm', 'nmap', 'arp']);
+const NMAP_LEVELS = ['quick', 'medium', 'heavy'];
 
 function isOpenSecurity(security) {
   return !security || /open/i.test(security);
@@ -61,6 +62,8 @@ export function Scan() {
   const [monitorLines, setMonitorLines] = useState([]);
   const [arpRows, setArpRows] = useState([]);
   const [nmapRows, setNmapRows] = useState([]);
+  const [nmapLevel, setNmapLevel] = useState('quick');
+  const [nmapTargetIp, setNmapTargetIp] = useState('');
 
   const pendingRef = useRef(null);
   const connectOutcomeRef = useRef(null);
@@ -94,7 +97,7 @@ export function Scan() {
       }
 
       if (msg.type === 'wifi_connect_failed') {
-        connectOutcomeRef.current = { ok: false, error: 'FAILED/TIMEOUT' };
+        connectOutcomeRef.current = { ok: false, error: 'FAILED/TIMEOUT', at: Date.now() };
         pushLine('wifi connect failed');
       }
 
@@ -272,14 +275,9 @@ export function Scan() {
 
   async function waitForWifiConnection(targetSsid, timeoutMs = 30000) {
     const started = Date.now();
-    while (Date.now() - started < timeoutMs) {
-      if (connectOutcomeRef.current?.ok === true) {
-        return { ok: true };
-      }
-      if (connectOutcomeRef.current?.ok === false) {
-        return { ok: false, error: connectOutcomeRef.current.error || 'connection failed' };
-      }
+    let softFailure = null;
 
+    while (Date.now() - started < timeoutMs) {
       try {
         const status = await api.status();
         if (
@@ -292,9 +290,27 @@ export function Scan() {
       } catch (e) {
         /* poll continues */
       }
-      await sleep(1000);
+
+      if (connectOutcomeRef.current?.ok === true) {
+        return { ok: true };
+      }
+
+      if (connectOutcomeRef.current?.ok === false) {
+        if (!softFailure) {
+          softFailure = {
+            at: connectOutcomeRef.current.at || Date.now(),
+            error: connectOutcomeRef.current.error || 'connection failed',
+          };
+        }
+        if (Date.now() - softFailure.at > 2500) {
+          return { ok: false, error: softFailure.error };
+        }
+      }
+
+      await sleep(900);
     }
-    return { ok: false, error: 'timeout' };
+
+    return { ok: false, error: softFailure?.error || 'timeout' };
   }
 
   async function connectAndLaunchPending() {
@@ -379,7 +395,7 @@ export function Scan() {
       sae: api.sae,
       sniffer: api.sniffer,
       mitm: api.mitm,
-      nmap: api.nmap,
+      nmap: () => api.nmap(nmapLevel, nmapTargetIp.trim()),
       arp: api.arp,
     }[attack];
 
@@ -490,6 +506,29 @@ export function Scan() {
             </button>
           ))}
         </div>
+        {attack === 'nmap' ? (
+          <div class="field">
+            <label class="field-label">Nmap Profile</label>
+            <div class="attack-picker">
+              {NMAP_LEVELS.map((level) => (
+                <button
+                  key={level}
+                  class={`attack-chip ${nmapLevel === level ? 'active' : ''}`}
+                  onClick={() => setNmapLevel(level)}
+                >
+                  {level}
+                </button>
+              ))}
+            </div>
+            <input
+              class="input"
+              value={nmapTargetIp}
+              onInput={(e) => setNmapTargetIp(e.target.value)}
+              placeholder="Optional host IP (e.g. 192.168.1.10)"
+              inputMode="decimal"
+            />
+          </div>
+        ) : null}
         <button class="btn btn-primary" onClick={launchAttack} disabled={!st.selected.size || scanning}>
           Launch {selectedAttack?.label}
         </button>

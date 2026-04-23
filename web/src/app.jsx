@@ -20,6 +20,7 @@ import { Bluetooth } from './pages/Bluetooth';
 import { Wardrive } from './pages/Wardrive';
 import { Karma } from './pages/Karma';
 import { DeauthDetector } from './pages/DeauthDetector';
+import { Portal } from './pages/Portal';
 
 function normalizeStatus(value) {
   if (!value) return 'idle';
@@ -27,29 +28,15 @@ function normalizeStatus(value) {
   return value;
 }
 
-function statusTitle(status) {
-  const map = {
-    idle: 'Ready',
-    scanning: 'Scanning',
-    deauth: 'Deauth',
-    eviltwin: 'Evil Twin',
-    rogueap: 'Rogue AP',
-    sae: 'SAE Overflow',
-    handshake: 'Handshaker',
-    sniffer: 'Observer',
-    blackout: 'Blackout',
-    mitm: 'MITM',
-    nmap: 'Nmap',
-    arp: 'ARP',
-    wifi_connecting: 'WiFi Connect',
-    listing_handshakes: 'Handshakes',
-    listing_wardrive: 'Wardrive Logs',
-    listing_portals: 'Portal Index',
-    listing_passwords: 'SD Passwords',
-    listing_sniffer: 'Sniffer Snapshot',
-  };
-
-  return map[status] || status;
+function WifiMetricIcon({ connected }) {
+  return (
+    <svg class={`metric-icon ${connected ? 'ok' : 'bad'}`} viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M3 9a14.5 14.5 0 0 1 18 0" />
+      <path d="M6.5 12.5a9.5 9.5 0 0 1 11 0" />
+      <path d="M10.2 16a4.2 4.2 0 0 1 3.6 0" />
+      <circle cx="12" cy="19.2" r="1.2" />
+    </svg>
+  );
 }
 
 export function App() {
@@ -164,8 +151,8 @@ export function App() {
   }, []);
 
   const st = getState();
-  const status = normalizeStatus(st.status);
   const heapMb = (st.heapFree / (1024 * 1024)).toFixed(1);
+  const wifiLabel = st.staConnected ? (st.staSsid || 'Connected') : 'Disconnected';
 
   function updateQuickAction(slot, value) {
     const next = [...(st.quickActions || ['scan', 'blackout', 'stop'])];
@@ -204,8 +191,10 @@ export function App() {
           </div>
 
           <div class="chip compact chip-graphic">
-            <span class="chip-glyph">OP</span>
-            <span class="chip-value">{statusTitle(status)}</span>
+            <span class="chip-glyph chip-glyph-icon">
+              <WifiMetricIcon connected={!!st.staConnected} />
+            </span>
+            <span class="chip-value">{wifiLabel}</span>
           </div>
         </div>
       </header>
@@ -226,6 +215,7 @@ export function App() {
           <Bluetooth path="/bluetooth" />
           <Wardrive path="/wardrive" />
           <Karma path="/karma" />
+          <Portal path="/portal" />
           <DeauthDetector path="/detector" />
         </Router>
       </main>

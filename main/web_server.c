@@ -309,6 +309,8 @@ static esp_err_t api_select_post(httpd_req_t *req)
     return ESP_OK;
 }
 
+static bool json_get_string(const char *json, const char *key, char *out, int out_len);
+
 static esp_err_t api_attack_post(httpd_req_t *req)
 {
     const char *uri = req->uri;
@@ -321,7 +323,34 @@ static esp_err_t api_attack_post(httpd_req_t *req)
     else if (strstr(uri, "/handshake"))  ok = cmd_do_handshake();
     else if (strstr(uri, "/sniffer"))    ok = cmd_do_sniffer();
     else if (strstr(uri, "/mitm"))       ok = cmd_do_mitm();
-    else if (strstr(uri, "/nmap"))       ok = cmd_do_nmap();
+    else if (strstr(uri, "/portal")) {
+        char body[160] = {0};
+        if (req->content_len > 0) {
+            int received = httpd_req_recv(req, body, sizeof(body) - 1);
+            if (received < 0) {
+                body[0] = '\0';
+            }
+        }
+
+        char ssid[33] = {0};
+        json_get_string(body, "\"ssid\"", ssid, sizeof(ssid));
+        ok = cmd_do_portal(ssid);
+    }
+    else if (strstr(uri, "/nmap")) {
+        char body[160] = {0};
+        if (req->content_len > 0) {
+            int received = httpd_req_recv(req, body, sizeof(body) - 1);
+            if (received < 0) {
+                body[0] = '\0';
+            }
+        }
+
+        char level[16] = {0};
+        char target_ip[24] = {0};
+        json_get_string(body, "\"level\"", level, sizeof(level));
+        json_get_string(body, "\"ip\"", target_ip, sizeof(target_ip));
+        ok = cmd_do_nmap(level[0] ? level : NULL, target_ip[0] ? target_ip : NULL);
+    }
     else if (strstr(uri, "/arp"))        ok = cmd_do_arp();
     else if (strstr(uri, "/rogueap")) {
         char body[256] = {0};

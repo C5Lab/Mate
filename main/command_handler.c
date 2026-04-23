@@ -61,12 +61,31 @@ static bool                 s_sta_connected = false;
 static char                 s_sta_ssid[33] = {0};
 static char                 s_wifi_connect_target[33] = {0};
 static bool                 s_wifi_connect_is_disconnect = false;
+static bool                 s_wifi_connect_saw_success = false;
+static bool                 s_wifi_connect_saw_failure = false;
 
 static bool is_prompt_line(const char *line)
 {
     if (!line) return false;
     while (*line == ' ') line++;
     return line[0] == '>' && (line[1] == '\0' || line[1] == ' ');
+}
+
+static bool is_not_connected_line(const char *line)
+{
+    if (!line) return false;
+    return strstr(line, "Not connected to WiFi") != NULL ||
+           strstr(line, "Not connected to any AP") != NULL;
+}
+
+static void mark_sta_disconnected(void)
+{
+    bool was_connected = s_sta_connected || s_sta_ssid[0] != '\0';
+    s_sta_connected = false;
+    s_sta_ssid[0] = '\0';
+    if (was_connected) {
+        broadcast_json("{\"type\":\"wifi_disconnected\"}");
+    }
 }
 
 static void reset_sniffer_build(void)
@@ -255,7 +274,8 @@ static void on_uart_line(const char *line, void *ctx)
     }
 
     case STATE_ATTACK_EVILTWIN:
-    case STATE_ATTACK_ROGUEAP: {
+    case STATE_ATTACK_ROGUEAP:
+    case STATE_ATTACK_PORTAL: {
         attack_event_t ev = parse_attack_event(line);
         if (ev.type == ATTACK_EVENT_CLIENT_CONNECTED) {
             broadcast_json("{\"type\":\"client_connected\",\"mac\":\"%s\"}", ev.detail);
@@ -349,7 +369,13 @@ static void on_uart_line(const char *line, void *ctx)
 
     case STATE_ATTACK_MITM: {
         attack_event_t ev = parse_attack_event(line);
-        if (ev.type == ATTACK_EVENT_PCAP_SAVED || ev.type == ATTACK_EVENT_STOP_ACK) {
+        if (ev.type == ATTACK_EVENT_PCAP_SAVED ||
+            ev.type == ATTACK_EVENT_STOP_ACK ||
+            is_prompt_line(line) ||
+            is_not_connected_line(line)) {
+            if (is_not_connected_line(line)) {
+                mark_sta_disconnected();
+            }
             xSemaphoreTake(s_mutex, portMAX_DELAY);
             s_state = STATE_IDLE;
             xSemaphoreGive(s_mutex);
@@ -364,7 +390,10 @@ static void on_uart_line(const char *line, void *ctx)
             strstr(line, "(scan stopped by user)") ||
             (strstr(line, "Scanned ") && strstr(line, "open ports")) ||
             is_prompt_line(line) ||
-            strstr(line, "Not connected to WiFi")) {
+            is_not_connected_line(line)) {
+            if (is_not_connected_line(line)) {
+                mark_sta_disconnected();
+            }
             xSemaphoreTake(s_mutex, portMAX_DELAY);
             s_state = STATE_IDLE;
             xSemaphoreGive(s_mutex);
@@ -374,7 +403,10 @@ static void on_uart_line(const char *line, void *ctx)
     }
 
     case STATE_ATTACK_ARP: {
-        if (is_prompt_line(line) || strstr(line, "Not connected to WiFi")) {
+        if (is_prompt_line(line) || is_not_connected_line(line)) {
+            if (is_not_connected_line(line)) {
+                mark_sta_disconnected();
+            }
             xSemaphoreTake(s_mutex, portMAX_DELAY);
             s_state = STATE_IDLE;
             xSemaphoreGive(s_mutex);
@@ -384,7 +416,13 @@ static void on_uart_line(const char *line, void *ctx)
     }
 
     case STATE_WIFI_CONNECTING: {
+        /* SKILL markers for wifi_connect:
+         * success -> "SUCCESS"
+         * failure -> "FAILED" or "TIMEOUT"
+         * Prefer SUCCESS if both appear in the same session.
+         */
         if (strstr(line, "SUCCESS")) {
+            s_wifi_connect_saw_success = true;
             if (s_wifi_connect_target[0]) {
                 s_sta_connected = true;
                 strncpy(s_sta_ssid, s_wifi_connect_target, sizeof(s_sta_ssid) - 1);
@@ -400,6 +438,10 @@ static void on_uart_line(const char *line, void *ctx)
         }
 
         if (strstr(line, "FAILED") || strstr(line, "TIMEOUT")) {
+            s_wifi_connect_saw_failure = true;
+            if (s_wifi_connect_saw_success) {
+                break;
+            }
             s_sta_connected = false;
             s_sta_ssid[0] = '\0';
             xSemaphoreTake(s_mutex, portMAX_DELAY);
@@ -426,10 +468,15 @@ static void on_uart_line(const char *line, void *ctx)
             xSemaphoreTake(s_mutex, portMAX_DELAY);
             s_state = STATE_IDLE;
             xSemaphoreGive(s_mutex);
-            if (!s_sta_connected && !s_wifi_connect_is_disconnect) {
+
+            if (!s_wifi_connect_is_disconnect &&
+                !s_wifi_connect_saw_success &&
+                s_wifi_connect_saw_failure) {
                 broadcast_json("{\"type\":\"wifi_connect_failed\"}");
             }
             s_wifi_connect_is_disconnect = false;
+            s_wifi_connect_saw_success = false;
+            s_wifi_connect_saw_failure = false;
         }
         break;
     }
@@ -604,6 +651,7 @@ const char *cmd_state_name(cmd_state_t s)
     case STATE_ATTACK_DEAUTH:     return "deauth";
     case STATE_ATTACK_EVILTWIN:   return "eviltwin";
     case STATE_ATTACK_ROGUEAP:    return "rogueap";
+    case STATE_ATTACK_PORTAL:     return "portal";
     case STATE_ATTACK_SAE:        return "sae";
     case STATE_ATTACK_HANDSHAKE:  return "handshake";
     case STATE_ATTACK_SNIFFER:    return "sniffer";
@@ -713,6 +761,18 @@ bool cmd_do_rogueap(const char *ssid, const char *password)
     return true;
 }
 
+bool cmd_do_portal(const char *ssid)
+{
+    if (!ssid || !ssid[0]) return false;
+    if (!set_state_if_idle(STATE_ATTACK_PORTAL)) return false;
+    char cmd[128];
+    snprintf(cmd, sizeof(cmd), "start_portal %s", ssid);
+    if (s_display_cb) s_display_cb(cmd, NULL);
+    uart_bridge_send(cmd);
+    broadcast_json("{\"type\":\"attack_started\",\"attack\":\"portal\"}");
+    return true;
+}
+
 bool cmd_do_sae(void)
 {
     if (!set_state_if_idle(STATE_ATTACK_SAE)) return false;
@@ -761,11 +821,42 @@ bool cmd_do_mitm(void)
     return true;
 }
 
-bool cmd_do_nmap(void)
+bool cmd_do_nmap(const char *level, const char *target_ip)
 {
     if (!set_state_if_idle(STATE_ATTACK_NMAP)) return false;
-    if (s_display_cb) s_display_cb("start_nmap", NULL);
-    uart_bridge_send("start_nmap");
+
+    char cmd[96];
+    snprintf(cmd, sizeof(cmd), "start_nmap");
+
+    if (level && level[0]) {
+        if (strcmp(level, "quick") != 0 &&
+            strcmp(level, "medium") != 0 &&
+            strcmp(level, "heavy") != 0) {
+            xSemaphoreTake(s_mutex, portMAX_DELAY);
+            s_state = STATE_IDLE;
+            xSemaphoreGive(s_mutex);
+            ESP_LOGW(TAG, "Invalid nmap level: %s", level);
+            return false;
+        }
+        snprintf(cmd, sizeof(cmd), "start_nmap %s", level);
+    }
+
+    if (target_ip && target_ip[0]) {
+        size_t cmd_len = strlen(cmd);
+        size_t ip_len = strlen(target_ip);
+        if (cmd_len + 1 + ip_len >= sizeof(cmd)) {
+            xSemaphoreTake(s_mutex, portMAX_DELAY);
+            s_state = STATE_IDLE;
+            xSemaphoreGive(s_mutex);
+            ESP_LOGW(TAG, "Nmap command too long: ip=%s", target_ip);
+            return false;
+        }
+        cmd[cmd_len++] = ' ';
+        memcpy(cmd + cmd_len, target_ip, ip_len + 1);
+    }
+
+    if (s_display_cb) s_display_cb(cmd, NULL);
+    uart_bridge_send(cmd);
     broadcast_json("{\"type\":\"attack_started\",\"attack\":\"nmap\"}");
     return true;
 }
@@ -787,6 +878,8 @@ bool cmd_do_wifi_connect(const char *ssid, const char *password)
     strncpy(s_wifi_connect_target, ssid, sizeof(s_wifi_connect_target) - 1);
     s_wifi_connect_target[sizeof(s_wifi_connect_target) - 1] = '\0';
     s_wifi_connect_is_disconnect = false;
+    s_wifi_connect_saw_success = false;
+    s_wifi_connect_saw_failure = false;
 
     char cmd[256];
     if (password && password[0]) {
@@ -806,6 +899,8 @@ bool cmd_do_wifi_disconnect(void)
     if (!set_state_if_idle(STATE_WIFI_CONNECTING)) return false;
     s_wifi_connect_target[0] = '\0';
     s_wifi_connect_is_disconnect = true;
+    s_wifi_connect_saw_success = false;
+    s_wifi_connect_saw_failure = false;
     if (s_display_cb) s_display_cb("wifi_disconnect", NULL);
     uart_bridge_send("wifi_disconnect");
     return true;

@@ -10,7 +10,6 @@ const ACTIONS = [
   {
     id: 'blackout',
     title: 'Blackout',
-    icon: 'alert',
     note: 'Mass deauth wave on selected targets',
     available: true,
     run: async () => api.blackout(),
@@ -18,7 +17,6 @@ const ACTIONS = [
   {
     id: 'handshaker',
     title: 'Handshaker',
-    icon: 'handshake',
     note: 'Capture handshake packets',
     available: true,
     run: async () => api.handshake(),
@@ -26,15 +24,13 @@ const ACTIONS = [
   {
     id: 'portal',
     title: 'Portal',
-    icon: 'portal',
-    note: 'Launch portal-based Evil Twin flow',
+    note: 'Open captive portal with custom SSID and SD template',
     available: true,
-    route: '/eviltwin',
+    route: '/portal',
   },
   {
     id: 'snifferdog',
     title: 'SnifferDog',
-    icon: 'eye',
     note: 'Observer mode with AP/client snapshots',
     available: true,
     run: async () => api.sniffer(),
@@ -43,77 +39,17 @@ const ACTIONS = [
   {
     id: 'beaconspam',
     title: 'Beacon Spam',
-    icon: 'radar',
     note: 'Unavailable in current firmware API',
     available: false,
   },
   {
     id: 'karma',
     title: 'Karma',
-    icon: 'bolt',
     note: 'Open dedicated Karma module',
     available: true,
     route: '/karma',
   },
 ];
-
-function Glyph({ name }) {
-  const common = {
-    width: 18,
-    height: 18,
-    viewBox: '0 0 24 24',
-    fill: 'none',
-    stroke: 'currentColor',
-    strokeWidth: 1.9,
-    strokeLinecap: 'round',
-    strokeLinejoin: 'round',
-    class: 'glyph-svg',
-    'aria-hidden': 'true',
-  };
-
-  const icons = {
-    alert: (
-      <svg {...common}>
-        <path d="M12 4 3.8 19h16.4z" />
-        <path d="M12 9v5" />
-        <circle cx="12" cy="17" r="1" fill="currentColor" stroke="none" />
-      </svg>
-    ),
-    handshake: (
-      <svg {...common}>
-        <path d="M7 12.5 4.8 10.3a2 2 0 0 1 2.8-2.8l2.3 2.3" />
-        <path d="m17 11.5 2.2 2.2a2 2 0 0 1-2.8 2.8l-2.3-2.3" />
-        <path d="m9 10 2.2 2.2a1.8 1.8 0 0 0 2.6 0l2.2-2.2" />
-      </svg>
-    ),
-    portal: (
-      <svg {...common}>
-        <circle cx="12" cy="12" r="8" />
-        <circle cx="12" cy="12" r="4" />
-      </svg>
-    ),
-    eye: (
-      <svg {...common}>
-        <path d="M2.8 12s3.4-6 9.2-6 9.2 6 9.2 6-3.4 6-9.2 6-9.2-6-9.2-6Z" />
-        <circle cx="12" cy="12" r="2.2" />
-      </svg>
-    ),
-    radar: (
-      <svg {...common}>
-        <circle cx="12" cy="12" r="8" />
-        <circle cx="12" cy="12" r="4" />
-        <path d="m12 12 5.5-2.5" />
-      </svg>
-    ),
-    bolt: (
-      <svg {...common}>
-        <path d="M13 3 6 13h5l-1 8 8-12h-5z" />
-      </svg>
-    ),
-  };
-
-  return icons[name] || icons.alert;
-}
 
 export function GlobalAttacks() {
   const [activeLabel, setActiveLabel] = useState('None');
@@ -183,10 +119,9 @@ export function GlobalAttacks() {
           {ACTIONS.map((action) => (
             <button
               key={action.id}
-              class={`action-card ${action.available ? 'action-accent-magenta' : 'action-accent-red'}`}
+              class={`action-card action-card-text-only ${action.available ? 'action-accent-magenta' : 'action-accent-red'}`}
               onClick={() => triggerAction(action)}
             >
-              <span class="action-icon plain"><Glyph name={action.icon} /></span>
               <span class="action-title">{action.title}</span>
               <span class="action-note">{action.note}</span>
             </button>

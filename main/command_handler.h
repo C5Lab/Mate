@@ -10,6 +10,7 @@ typedef enum {
     STATE_ATTACK_DEAUTH,
     STATE_ATTACK_EVILTWIN,
     STATE_ATTACK_ROGUEAP,
+    STATE_ATTACK_PORTAL,
     STATE_ATTACK_SAE,
     STATE_ATTACK_HANDSHAKE,
     STATE_ATTACK_SNIFFER,
@@ -69,6 +70,9 @@ bool cmd_do_evil_twin(void);
 /** Start rogue AP. */
 bool cmd_do_rogueap(const char *ssid, const char *password);
 
+/** Start open captive portal AP with custom SSID. */
+bool cmd_do_portal(const char *ssid);
+
 /** Start SAE overflow. Requires exactly 1 selected network. */
 bool cmd_do_sae(void);
 
@@ -84,8 +88,8 @@ bool cmd_do_blackout(void);
 /** Start MITM capture mode (PCAP net). */
 bool cmd_do_mitm(void);
 
-/** Start Nmap scan (default quick mode). */
-bool cmd_do_nmap(void);
+/** Start Nmap scan with optional level (quick/medium/heavy) and optional target IP. */
+bool cmd_do_nmap(const char *level, const char *target_ip);
 
 /** Start ARP host discovery. */
 bool cmd_do_arp(void);

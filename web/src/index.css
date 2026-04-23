@@ -1,31 +1,31 @@
 :root {
-  --bg-0: #0b0f14;
-  --bg-1: #0f141a;
-  --bg-2: #121821;
+  --bg-0: #121015;
+  --bg-1: #17141b;
+  --bg-2: #1d1923;
 
-  --text-primary: #e6edf3;
-  --text-secondary: #9fb0c3;
-  --text-muted: #5c6b7a;
+  --text-primary: #e8e2ea;
+  --text-secondary: #b8afc1;
+  --text-muted: #7f7588;
 
-  --accent: #ff2e88;
-  --accent-hover: #ff4da6;
-  --accent-glow: rgba(255, 46, 136, 0.25);
+  --accent: #f242a4;
+  --accent-hover: #de5aa8;
+  --accent-glow: rgba(242, 66, 164, 0.24);
 
-  --cyan: #4fd7ff;
-  --green: #46d28f;
-  --red: #ff5b6e;
-  --yellow: #ffc66d;
+  --cyan: #ba95ab;
+  --green: #5ec391;
+  --red: #da607e;
+  --yellow: #c9a06d;
 
   --radius-sm: 12px;
   --radius-md: 16px;
   --radius-lg: 20px;
 
-  --border-soft: rgba(159, 176, 195, 0.16);
-  --border-strong: rgba(159, 176, 195, 0.24);
+  --border-soft: rgba(184, 175, 193, 0.16);
+  --border-strong: rgba(184, 175, 193, 0.24);
 
-  --surface: linear-gradient(145deg, rgba(18, 24, 33, 0.95), rgba(15, 20, 26, 0.9));
-  --surface-elevated: linear-gradient(145deg, rgba(23, 31, 42, 0.95), rgba(16, 22, 30, 0.96));
-  --surface-glass: linear-gradient(160deg, rgba(230, 237, 243, 0.03), rgba(255, 255, 255, 0.01));
+  --surface: linear-gradient(145deg, rgba(24, 20, 30, 0.96), rgba(17, 14, 21, 0.93));
+  --surface-elevated: linear-gradient(145deg, rgba(31, 26, 38, 0.96), rgba(20, 16, 25, 0.97));
+  --surface-glass: linear-gradient(160deg, rgba(232, 226, 234, 0.03), rgba(255, 255, 255, 0.01));
 
   --shadow-soft: 0 10px 30px rgba(0, 0, 0, 0.28);
   --shadow-inset: inset 0 1px 0 rgba(230, 237, 243, 0.03);
@@ -42,10 +42,15 @@ body {
   min-height: 100%;
 }
 
+html {
+  background: #100d13;
+  overscroll-behavior-y: none;
+}
+
 body {
   background:
-    radial-gradient(1200px 420px at 20% -15%, rgba(255, 46, 136, 0.12), transparent 60%),
-    radial-gradient(900px 300px at 100% 0%, rgba(79, 215, 255, 0.08), transparent 55%),
+    radial-gradient(1200px 420px at 20% -15%, rgba(242, 66, 164, 0.15), transparent 60%),
+    radial-gradient(900px 340px at 100% 0%, rgba(128, 102, 122, 0.15), transparent 58%),
     linear-gradient(180deg, var(--bg-0), var(--bg-1) 42%, var(--bg-0));
   color: var(--text-primary);
   font-family: 'Sora', 'Nunito Sans', 'Fira Sans', 'IBM Plex Sans', 'Segoe UI', sans-serif;
@@ -53,6 +58,8 @@ body {
   line-height: 1.45;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
+  overscroll-behavior-y: none;
+  -webkit-tap-highlight-color: transparent;
 }
 
 a {
@@ -61,7 +68,21 @@ a {
 }
 
 #app {
-  min-height: 100vh;
+  min-height: 100dvh;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+button {
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
 }
 
 .app-shell {
@@ -170,8 +191,38 @@ a {
 .chip-glyph {
   font-size: 10px;
   font-weight: 800;
-  color: var(--cyan);
+  color: #c79bb2;
   letter-spacing: 0.07em;
+}
+
+.chip-glyph-icon {
+  display: inline-flex;
+  align-items: center;
+}
+
+.metric-icon {
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: #c79bb2;
+  stroke-width: 1.9;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.metric-icon circle {
+  fill: currentColor;
+  stroke: none;
+}
+
+.metric-icon.ok {
+  color: var(--green);
+  stroke: var(--green);
+}
+
+.metric-icon.bad {
+  color: #b48a9f;
+  stroke: #b48a9f;
 }
 
 .chip {
@@ -386,6 +437,13 @@ a {
   display: grid;
   gap: 6px;
   min-height: 78px;
+  color: var(--text-primary);
+}
+
+.action-card-text-only {
+  justify-items: center;
+  align-content: center;
+  text-align: center;
 }
 
 .quick-action-mini {
@@ -397,6 +455,7 @@ a {
   justify-items: center;
   gap: 6px;
   min-height: 64px;
+  color: var(--text-primary);
 }
 
 .action-icon {
@@ -439,8 +498,8 @@ a {
 
 .action-accent-cyan .action-icon {
   color: var(--cyan);
-  border-color: rgba(79, 215, 255, 0.32);
-  background: rgba(79, 215, 255, 0.12);
+  border-color: rgba(186, 149, 171, 0.28);
+  background: rgba(186, 149, 171, 0.12);
 }
 
 .action-accent-green .action-icon {
@@ -538,6 +597,7 @@ a {
   align-content: center;
   gap: 6px;
   padding: 8px;
+  color: var(--text-primary);
 }
 
 .module-icon {
@@ -549,8 +609,8 @@ a {
   justify-content: center;
   font-weight: 700;
   font-size: 14px;
-  border: 1px solid rgba(79, 215, 255, 0.32);
-  background: rgba(79, 215, 255, 0.12);
+  border: 1px solid rgba(186, 149, 171, 0.3);
+  background: rgba(186, 149, 171, 0.12);
   color: var(--cyan);
 }
 
@@ -634,6 +694,7 @@ a {
   justify-content: center;
   gap: 7px;
   color: var(--text-primary);
+  cursor: pointer;
 }
 
 .btn:active {
@@ -667,9 +728,9 @@ a {
 }
 
 .btn-info {
-  background: linear-gradient(120deg, rgba(79, 215, 255, 0.95), rgba(53, 133, 204, 0.95));
-  color: #07111f;
-  border-color: rgba(79, 215, 255, 0.45);
+  background: linear-gradient(120deg, rgba(86, 71, 85, 0.96), rgba(130, 95, 120, 0.96));
+  color: #f2e8ef;
+  border-color: rgba(186, 149, 171, 0.35);
 }
 
 .btn-soft {
@@ -714,9 +775,9 @@ a {
 }
 
 .badge.info {
-  border-color: rgba(79, 215, 255, 0.36);
-  color: #9fe8ff;
-  background: rgba(79, 215, 255, 0.12);
+  border-color: rgba(199, 155, 178, 0.36);
+  color: #e2bdd0;
+  background: rgba(199, 155, 178, 0.13);
 }
 
 .badge.warn {
@@ -925,6 +986,7 @@ a {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
+  color: var(--text-primary);
 }
 
 .attack-chip.active {
@@ -1022,7 +1084,7 @@ a {
 }
 
 .line-info {
-  color: #9fe8ff;
+  color: #e2bdd0;
 }
 
 .table-wrap {
@@ -1201,8 +1263,8 @@ a {
 }
 
 .toast-info {
-  color: #9fe8ff;
-  border-color: rgba(79, 215, 255, 0.38);
+  color: #e2bdd0;
+  border-color: rgba(199, 155, 178, 0.38);
 }
 
 .toast-success {
