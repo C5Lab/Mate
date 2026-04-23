@@ -1,10 +1,10 @@
 import { route } from 'preact-router';
-import { useState } from 'preact/hooks';
+import { useEffect, useState } from 'preact/hooks';
 import { Layout } from '../components/Layout';
-import { AttackMonitor } from '../components/AttackMonitor';
 import { api } from '../api';
 import { getState } from '../store';
 import { showToast } from '../components/Toast';
+import { wsAddListener } from '../ws';
 
 const ACTIONS = [
   {
@@ -54,6 +54,11 @@ const ACTIONS = [
 export function GlobalAttacks() {
   const [activeLabel, setActiveLabel] = useState('None');
   const st = getState();
+
+  useEffect(() => wsAddListener((msg) => {
+    if (msg.type === 'attack_started' && msg.attack) setActiveLabel(msg.attack);
+    if (msg.type === 'attack_stopped') setActiveLabel('None');
+  }), []);
 
   async function triggerAction(action) {
     if (!action.available) {
@@ -132,18 +137,6 @@ export function GlobalAttacks() {
           Stop Global Operations
         </button>
       </section>
-
-      <AttackMonitor
-        title="Global Operations Log"
-        onEvent={(msg) => {
-          if (msg.type === 'attack_started' && msg.attack) {
-            setActiveLabel(msg.attack);
-          }
-          if (msg.type === 'attack_stopped') {
-            setActiveLabel('None');
-          }
-        }}
-      />
     </Layout>
   );
 }

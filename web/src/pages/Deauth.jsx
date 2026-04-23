@@ -1,13 +1,18 @@
-import { useState } from 'preact/hooks';
+import { useEffect, useState } from 'preact/hooks';
 import { Layout } from '../components/Layout';
-import { AttackMonitor } from '../components/AttackMonitor';
 import { api } from '../api';
 import { getState } from '../store';
 import { showToast } from '../components/Toast';
+import { wsAddListener } from '../ws';
 
 export function Deauth() {
   const [running, setRunning] = useState(false);
   const st = getState();
+
+  useEffect(() => wsAddListener((msg) => {
+    if (msg.type === 'attack_started' && msg.attack === 'deauth') setRunning(true);
+    if (msg.type === 'attack_stopped') setRunning(false);
+  }), []);
 
   async function start() {
     if (!st.selected.size) {
@@ -60,16 +65,6 @@ export function Deauth() {
           )}
         </div>
       </section>
-
-      <AttackMonitor
-        title="Deauth Telemetry"
-        attackType="deauth"
-        onEvent={(msg) => {
-          if (msg.type === 'attack_stopped') {
-            setRunning(false);
-          }
-        }}
-      />
     </Layout>
   );
 }

@@ -1,14 +1,25 @@
-import { useState } from 'preact/hooks';
+import { useEffect, useState } from 'preact/hooks';
 import { Layout } from '../components/Layout';
-import { AttackMonitor } from '../components/AttackMonitor';
 import { api } from '../api';
 import { getState } from '../store';
 import { showToast } from '../components/Toast';
+import { wsAddListener } from '../ws';
 
 export function Handshaker() {
   const [running, setRunning] = useState(false);
   const [captures, setCaptures] = useState([]);
   const st = getState();
+
+  useEffect(() => wsAddListener((msg) => {
+    if (msg.type === 'attack_started' && msg.attack === 'handshake') setRunning(true);
+    if (msg.type === 'attack_stopped') setRunning(false);
+    if (msg.type === 'handshake_captured' || msg.type === 'handshake_saved' || msg.type === 'pcap_saved') {
+      setCaptures((prev) => [
+        ...prev,
+        { ssid: msg.ssid || 'Unknown', file: msg.file || '', ts: new Date().toLocaleTimeString() },
+      ]);
+    }
+  }), []);
 
   async function start() {
     if (st.selected.size > 0) {
@@ -90,24 +101,6 @@ export function Handshaker() {
           </div>
         </section>
       ) : null}
-
-      <AttackMonitor
-        title="Handshaker Telemetry"
-        attackType="handshake"
-        onEvent={(msg) => {
-          if (msg.type === 'attack_stopped') setRunning(false);
-          if (msg.type === 'handshake_captured' || msg.type === 'handshake_saved' || msg.type === 'pcap_saved') {
-            setCaptures((prev) => [
-              ...prev,
-              {
-                ssid: msg.ssid || 'Unknown',
-                file: msg.file || '',
-                ts: new Date().toLocaleTimeString(),
-              },
-            ]);
-          }
-        }}
-      />
     </Layout>
   );
 }

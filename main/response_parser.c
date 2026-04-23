@@ -104,6 +104,38 @@ bool parse_portal_file_line(const char *line, parsed_portal_file_t *f)
     return f->index > 0 && len > 0;
 }
 
+/* ---------- Probe parsing ---------- */
+
+bool parse_probe_line(const char *line, parsed_probe_t *p)
+{
+    if (!line || !p) return false;
+
+    const char *q = line;
+    while (*q == ' ' || *q == '\t') q++;
+    if (!isdigit((unsigned char)*q)) return false;
+
+    int idx = 0;
+    while (isdigit((unsigned char)*q)) {
+        idx = idx * 10 + (*q - '0');
+        q++;
+    }
+    if (idx <= 0) return false;
+    if (*q != ' ' && *q != '\t') return false;
+    while (*q == ' ' || *q == '\t') q++;
+    if (*q == '\0') return false;
+
+    memset(p, 0, sizeof(*p));
+    p->index = idx;
+    strncpy(p->ssid, q, sizeof(p->ssid) - 1);
+
+    int len = strlen(p->ssid);
+    while (len > 0 && p->ssid[len - 1] <= ' ') {
+        p->ssid[--len] = '\0';
+    }
+
+    return len > 0;
+}
+
 /* ---------- Sniffer parsing ---------- */
 
 bool parse_sniffer_ap_line(const char *line, parsed_sniffer_ap_t *ap)

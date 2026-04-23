@@ -1,14 +1,19 @@
-import { useState } from 'preact/hooks';
+import { useEffect, useState } from 'preact/hooks';
 import { Layout } from '../components/Layout';
-import { AttackMonitor } from '../components/AttackMonitor';
 import { api } from '../api';
 import { getState } from '../store';
 import { showToast } from '../components/Toast';
+import { wsAddListener } from '../ws';
 
 export function SaeOverflow() {
   const [running, setRunning] = useState(false);
   const st = getState();
   const target = st.networks.find((n) => st.selected.has(n.index));
+
+  useEffect(() => wsAddListener((msg) => {
+    if (msg.type === 'attack_started' && msg.attack === 'sae') setRunning(true);
+    if (msg.type === 'attack_stopped') setRunning(false);
+  }), []);
 
   async function start() {
     if (st.selected.size !== 1) {
@@ -69,14 +74,6 @@ export function SaeOverflow() {
           )}
         </div>
       </section>
-
-      <AttackMonitor
-        title="SAE Telemetry"
-        attackType="sae"
-        onEvent={(msg) => {
-          if (msg.type === 'attack_stopped') setRunning(false);
-        }}
-      />
     </Layout>
   );
 }

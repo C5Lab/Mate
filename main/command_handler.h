@@ -24,6 +24,8 @@ typedef enum {
     STATE_LISTING_SNIFFER,
     STATE_LISTING_HANDSHAKES,
     STATE_LISTING_WARDRIVE,
+    STATE_LISTING_PROBES,
+    STATE_ATTACK_KARMA,
 } cmd_state_t;
 
 /**
@@ -81,6 +83,15 @@ bool cmd_do_handshake(void);
 
 /** Start sniffer. */
 bool cmd_do_sniffer(void);
+
+/** Start sniffer using existing scan results (no fresh scan). */
+bool cmd_do_sniffer_noscan(void);
+
+/** Request indexed probe list (start_karma uses these indices). */
+bool cmd_do_list_probes(void);
+
+/** Start Karma attack against probe at given 1-based index. */
+bool cmd_do_karma(int probe_index);
 
 /** Start blackout attack. */
 bool cmd_do_blackout(void);
@@ -141,6 +152,10 @@ const sniffer_results_t *cmd_get_sniffer_results(void);
 /** Get cached handshake .pcap count from SD card listing. */
 int cmd_get_handshake_count(void);
 
+/** Whether the initial handshake count fetch already completed at least once
+ *  for this boot. Used to gate the dashboard auto-trigger to a one-shot. */
+bool cmd_handshake_initial_done(void);
+
 /** Whether UART from C5 was seen recently. */
 bool cmd_is_c5_connected(void);
 
@@ -155,3 +170,6 @@ const char *cmd_get_sta_ssid(void);
 
 /** Get cached wardrive log file list. */
 int cmd_get_wardrive_logs(parsed_portal_file_t *out, int max);
+
+/** Get cached probe list. */
+int cmd_get_probes(parsed_probe_t *out, int max);

@@ -1,10 +1,10 @@
 import { useEffect, useState } from 'preact/hooks';
 import { Layout } from '../components/Layout';
-import { AttackMonitor } from '../components/AttackMonitor';
 import { PortalPicker } from '../components/PortalPicker';
 import { api } from '../api';
 import { getState } from '../store';
 import { showToast } from '../components/Toast';
+import { wsAddListener } from '../ws';
 
 export function RogueAP() {
   const [running, setRunning] = useState(false);
@@ -18,6 +18,10 @@ export function RogueAP() {
     loadPasswords();
     const selected = st.networks.find((n) => st.selected.has(n.index));
     if (selected?.ssid) setSsid(selected.ssid);
+    return wsAddListener((msg) => {
+      if (msg.type === 'attack_started' && msg.attack === 'rogueap') setRunning(true);
+      if (msg.type === 'attack_stopped') setRunning(false);
+    });
   }, []);
 
   async function loadPasswords() {
@@ -126,14 +130,6 @@ export function RogueAP() {
           )}
         </div>
       </section>
-
-      <AttackMonitor
-        title="Rogue AP Telemetry"
-        attackType="rogueap"
-        onEvent={(msg) => {
-          if (msg.type === 'attack_stopped') setRunning(false);
-        }}
-      />
     </Layout>
   );
 }

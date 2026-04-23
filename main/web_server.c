@@ -321,8 +321,27 @@ static esp_err_t api_attack_post(httpd_req_t *req)
     else if (strstr(uri, "/eviltwin"))   ok = cmd_do_evil_twin();
     else if (strstr(uri, "/sae"))        ok = cmd_do_sae();
     else if (strstr(uri, "/handshake"))  ok = cmd_do_handshake();
+    else if (strstr(uri, "/sniffer_noscan")) ok = cmd_do_sniffer_noscan();
     else if (strstr(uri, "/sniffer"))    ok = cmd_do_sniffer();
     else if (strstr(uri, "/mitm"))       ok = cmd_do_mitm();
+    else if (strstr(uri, "/karma")) {
+        char body[96] = {0};
+        if (req->content_len > 0) {
+            int received = httpd_req_recv(req, body, sizeof(body) - 1);
+            if (received < 0) {
+                body[0] = '\0';
+            }
+        }
+
+        int probe_index = 0;
+        const char *p = strstr(body, "\"index\"");
+        if (p) {
+            p += 7;
+            while (*p && !(*p >= '0' && *p <= '9')) p++;
+            probe_index = atoi(p);
+        }
+        ok = cmd_do_karma(probe_index);
+    }
     else if (strstr(uri, "/portal")) {
         char body[160] = {0};
         if (req->content_len > 0) {
@@ -600,6 +619,45 @@ static esp_err_t api_sniffer_refresh_post(httpd_req_t *req)
     return ESP_OK;
 }
 
+static esp_err_t api_probes_get(httpd_req_t *req)
+{
+    parsed_probe_t probes[MAX_PROBES];
+    int n = cmd_get_probes(probes, MAX_PROBES);
+    cmd_state_t state = cmd_get_state();
+
+    if (n == 0 && state == STATE_IDLE) {
+        cmd_do_list_probes();
+        state = cmd_get_state();
+    }
+
+    char buf[2048];
+    int pos = snprintf(buf, sizeof(buf),
+        "{\"ok\":true,\"loading\":%s,\"probes\":[",
+        (state == STATE_LISTING_PROBES) ? "true" : "false");
+
+    for (int i = 0; i < n && pos < (int)sizeof(buf) - 64; i++) {
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            "%s{\"index\":%d,\"ssid\":\"%s\"}",
+            i > 0 ? "," : "", probes[i].index, probes[i].ssid);
+    }
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "]}");
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, buf, pos);
+    return ESP_OK;
+}
+
+static esp_err_t api_probes_refresh_post(httpd_req_t *req)
+{
+    if (cmd_do_list_probes()) {
+        send_json(req, "{\"ok\":true,\"status\":\"loading\"}");
+    } else {
+        httpd_resp_set_status(req, "409 Conflict");
+        send_json(req, "{\"ok\":false,\"error\":\"busy\"}");
+    }
+    return ESP_OK;
+}
+
 static esp_err_t api_status_get(httpd_req_t *req)
 {
     const char *sta_ssid = cmd_get_sta_ssid();
@@ -636,7 +694,9 @@ static esp_err_t api_dashboard_get(httpd_req_t *req)
     int handshake_count = cmd_get_handshake_count();
     cmd_state_t state = cmd_get_state();
     bool hs_loading = (state == STATE_LISTING_HANDSHAKES);
-    if (handshake_count < 0 && state == STATE_IDLE) {
+    /* Auto-trigger SD listing once per ESP boot only. After the first
+     * successful response we never re-fire from the dashboard endpoint. */
+    if (!cmd_handshake_initial_done() && state == STATE_IDLE && cmd_is_c5_connected()) {
         cmd_do_list_handshake_count();
         hs_loading = true;
     }
@@ -853,6 +913,8 @@ esp_err_t web_server_start(void)
     REGISTER_URI("/api/wardrive/logs", HTTP_GET,  api_wardrive_logs_get);
     REGISTER_URI("/api/sniffer/results", HTTP_GET,  api_sniffer_results_get);
     REGISTER_URI("/api/sniffer/results", HTTP_POST, api_sniffer_refresh_post);
+    REGISTER_URI("/api/probes",          HTTP_GET,  api_probes_get);
+    REGISTER_URI("/api/probes",          HTTP_POST, api_probes_refresh_post);
     REGISTER_URI("/api/status",        HTTP_GET,  api_status_get);
     REGISTER_URI("/api/dashboard",     HTTP_GET,  api_dashboard_get);
 

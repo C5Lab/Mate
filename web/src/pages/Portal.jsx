@@ -1,14 +1,27 @@
-import { useState } from 'preact/hooks';
+import { useEffect, useState } from 'preact/hooks';
 import { Layout } from '../components/Layout';
-import { AttackMonitor } from '../components/AttackMonitor';
 import { PortalPicker } from '../components/PortalPicker';
 import { api } from '../api';
 import { showToast } from '../components/Toast';
+import { wsAddListener } from '../ws';
 
 export function Portal() {
   const [running, setRunning] = useState(false);
   const [ssid, setSsid] = useState('');
   const [portalSelected, setPortalSelected] = useState(false);
+  const [passwords, setPasswords] = useState([]);
+
+  useEffect(() => wsAddListener((msg) => {
+    if (msg.type === 'attack_started' && msg.attack === 'portal') setRunning(true);
+    if (msg.type === 'attack_stopped') setRunning(false);
+    if (msg.type === 'password_received') {
+      setPasswords((prev) => [
+        { id: `${Date.now()}-${Math.random().toString(16).slice(2, 6)}`, password: msg.password, time: new Date().toLocaleTimeString() },
+        ...prev,
+      ]);
+      showToast(`Password captured: ${msg.password}`, 'success');
+    }
+  }), []);
 
   async function start() {
     const trimmed = ssid.trim();
@@ -74,13 +87,24 @@ export function Portal() {
         </div>
       </section>
 
-      <AttackMonitor
-        title="Portal Telemetry"
-        attackType="portal"
-        onEvent={(msg) => {
-          if (msg.type === 'attack_stopped') setRunning(false);
-        }}
-      />
+      {passwords.length > 0 ? (
+        <section class="glass-card card-body reveal">
+          <div class="section-head">
+            <h3 class="section-title">Captured Credentials</h3>
+            <span class="badge ok">{passwords.length}</span>
+          </div>
+          <div class="table-wrap">
+            <table class="table">
+              <thead><tr><th>Time</th><th>Password</th></tr></thead>
+              <tbody>
+                {passwords.map((pw) => (
+                  <tr key={pw.id}><td>{pw.time}</td><td>{pw.password}</td></tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      ) : null}
     </Layout>
   );
 }

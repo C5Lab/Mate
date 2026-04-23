@@ -51,8 +51,14 @@ static sniffer_results_t    s_sniffer_build;
 static bool                 s_sniffer_collecting = false;
 static int                  s_sniffer_ap_index = -1;
 static int                  s_handshake_count = -1;
+static bool                 s_handshake_initial_done = false;
 static parsed_portal_file_t s_wardrive_logs[MAX_PORTAL_FILES];
 static int                  s_wardrive_count = 0;
+static parsed_probe_t       s_probes[MAX_PROBES];
+static int                  s_probe_count = 0;
+static parsed_probe_t       s_probes_build[MAX_PROBES];
+static int                  s_probes_build_count = 0;
+static cmd_state_t          s_probe_resume_state = STATE_IDLE;
 static bool                 s_has_last_gps_fix = false;
 static float                s_last_gps_lat = 0.0f;
 static float                s_last_gps_lon = 0.0f;
@@ -275,7 +281,8 @@ static void on_uart_line(const char *line, void *ctx)
 
     case STATE_ATTACK_EVILTWIN:
     case STATE_ATTACK_ROGUEAP:
-    case STATE_ATTACK_PORTAL: {
+    case STATE_ATTACK_PORTAL:
+    case STATE_ATTACK_KARMA: {
         attack_event_t ev = parse_attack_event(line);
         if (ev.type == ATTACK_EVENT_CLIENT_CONNECTED) {
             broadcast_json("{\"type\":\"client_connected\",\"mac\":\"%s\"}", ev.detail);
@@ -580,6 +587,7 @@ static void on_uart_line(const char *line, void *ctx)
 
         if ((strstr(line, "Found ") && strstr(line, "file(s) in")) || is_prompt_line(line)) {
             if (s_handshake_count < 0) s_handshake_count = 0;
+            s_handshake_initial_done = true;
             xSemaphoreTake(s_mutex, portMAX_DELAY);
             s_state = STATE_IDLE;
             xSemaphoreGive(s_mutex);
@@ -598,6 +606,27 @@ static void on_uart_line(const char *line, void *ctx)
             xSemaphoreTake(s_mutex, portMAX_DELAY);
             s_state = STATE_IDLE;
             xSemaphoreGive(s_mutex);
+        }
+        break;
+    }
+
+    case STATE_LISTING_PROBES: {
+        parsed_probe_t pr;
+        if (parse_probe_line(line, &pr) && s_probes_build_count < MAX_PROBES) {
+            s_probes_build[s_probes_build_count++] = pr;
+            break;
+        }
+
+        if (is_prompt_line(line)) {
+            memcpy(s_probes, s_probes_build, sizeof(s_probes));
+            s_probe_count = s_probes_build_count;
+
+            xSemaphoreTake(s_mutex, portMAX_DELAY);
+            s_state = s_probe_resume_state;
+            xSemaphoreGive(s_mutex);
+            s_probe_resume_state = STATE_IDLE;
+
+            broadcast_json("{\"type\":\"probes_updated\",\"count\":%d}", s_probe_count);
         }
         break;
     }
@@ -665,6 +694,8 @@ const char *cmd_state_name(cmd_state_t s)
     case STATE_LISTING_SNIFFER:   return "listing_sniffer";
     case STATE_LISTING_HANDSHAKES:return "listing_handshakes";
     case STATE_LISTING_WARDRIVE:  return "listing_wardrive";
+    case STATE_LISTING_PROBES:    return "listing_probes";
+    case STATE_ATTACK_KARMA:      return "karma";
     }
     return "unknown";
 }
@@ -695,9 +726,35 @@ const sniffer_results_t *cmd_get_sniffer_results(void)
 
 /* ---------- Commands ---------- */
 
+static bool is_listing_state(cmd_state_t s)
+{
+    return s == STATE_LISTING_PORTALS ||
+           s == STATE_LISTING_PASSWORDS ||
+           s == STATE_LISTING_SNIFFER ||
+           s == STATE_LISTING_HANDSHAKES ||
+           s == STATE_LISTING_WARDRIVE ||
+           s == STATE_LISTING_PROBES;
+}
+
 static bool set_state_if_idle(cmd_state_t new_state)
 {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
+
+    /* Recover from stuck listing states. Listings are passive reads waiting
+     * for a UART prompt; if C5 is silent for >8s the response was lost and
+     * we can safely preempt. */
+    if (s_state != STATE_IDLE && is_listing_state(s_state)) {
+        int64_t now_ms = esp_timer_get_time() / 1000;
+        int64_t silent_ms = (s_last_uart_ms > 0) ? (now_ms - s_last_uart_ms) : 999999;
+        if (silent_ms > 8000) {
+            ESP_LOGW(TAG, "Recovering stuck %s -> idle (UART silent %lldms)",
+                     cmd_state_name(s_state), silent_ms);
+            s_probe_resume_state = STATE_IDLE;
+            s_sniffer_collecting = false;
+            s_state = STATE_IDLE;
+        }
+    }
+
     if (s_state != STATE_IDLE) {
         xSemaphoreGive(s_mutex);
         ESP_LOGW(TAG, "Busy (state=%s), rejecting command", cmd_state_name(s_state));
@@ -800,6 +857,62 @@ bool cmd_do_sniffer(void)
     if (s_display_cb) s_display_cb("start_sniffer", NULL);
     uart_bridge_send("start_sniffer");
     broadcast_json("{\"type\":\"attack_started\",\"attack\":\"sniffer\"}");
+    return true;
+}
+
+bool cmd_do_sniffer_noscan(void)
+{
+    if (!set_state_if_idle(STATE_ATTACK_SNIFFER)) return false;
+    memset(&s_sniffer, 0, sizeof(s_sniffer));
+    reset_sniffer_build();
+    s_sniffer_collecting = false;
+    if (s_display_cb) s_display_cb("start_sniffer_noscan", NULL);
+    uart_bridge_send("start_sniffer_noscan");
+    broadcast_json("{\"type\":\"attack_started\",\"attack\":\"sniffer\"}");
+    return true;
+}
+
+bool cmd_do_list_probes(void)
+{
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+
+    if (s_state != STATE_IDLE && s_state != STATE_ATTACK_SNIFFER && is_listing_state(s_state)) {
+        int64_t now_ms = esp_timer_get_time() / 1000;
+        int64_t silent_ms = (s_last_uart_ms > 0) ? (now_ms - s_last_uart_ms) : 999999;
+        if (silent_ms > 8000) {
+            ESP_LOGW(TAG, "Recovering stuck %s -> idle (UART silent %lldms)",
+                     cmd_state_name(s_state), silent_ms);
+            s_probe_resume_state = STATE_IDLE;
+            s_state = STATE_IDLE;
+        }
+    }
+
+    cmd_state_t cur = s_state;
+    if (cur != STATE_IDLE && cur != STATE_ATTACK_SNIFFER) {
+        xSemaphoreGive(s_mutex);
+        ESP_LOGW(TAG, "Busy (state=%s), rejecting list_probes", cmd_state_name(cur));
+        return false;
+    }
+    s_probe_resume_state = cur;
+    s_state = STATE_LISTING_PROBES;
+    xSemaphoreGive(s_mutex);
+
+    s_probes_build_count = 0;
+    if (s_display_cb) s_display_cb("list_probes", NULL);
+    uart_bridge_send("list_probes");
+    return true;
+}
+
+bool cmd_do_karma(int probe_index)
+{
+    if (probe_index <= 0) return false;
+    if (!set_state_if_idle(STATE_ATTACK_KARMA)) return false;
+
+    char cmd[48];
+    snprintf(cmd, sizeof(cmd), "start_karma %d", probe_index);
+    if (s_display_cb) s_display_cb(cmd, NULL);
+    uart_bridge_send(cmd);
+    broadcast_json("{\"type\":\"attack_started\",\"attack\":\"karma\"}");
     return true;
 }
 
@@ -912,6 +1025,7 @@ bool cmd_do_stop(void)
     uart_bridge_send("stop");
 
     s_sniffer_collecting = false;
+    s_probe_resume_state = STATE_IDLE;
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     s_state = STATE_IDLE;
@@ -954,6 +1068,20 @@ bool cmd_do_list_passwords(void)
 bool cmd_do_sniffer_results(void)
 {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
+
+    if (s_state != STATE_IDLE &&
+        s_state != STATE_ATTACK_SNIFFER &&
+        s_state != STATE_LISTING_SNIFFER &&
+        is_listing_state(s_state)) {
+        int64_t now_ms = esp_timer_get_time() / 1000;
+        int64_t silent_ms = (s_last_uart_ms > 0) ? (now_ms - s_last_uart_ms) : 999999;
+        if (silent_ms > 8000) {
+            ESP_LOGW(TAG, "Recovering stuck %s -> idle (UART silent %lldms)",
+                     cmd_state_name(s_state), silent_ms);
+            s_state = STATE_IDLE;
+        }
+    }
+
     if (s_state == STATE_IDLE) {
         s_state = STATE_LISTING_SNIFFER;
     } else if (s_state != STATE_ATTACK_SNIFFER && s_state != STATE_LISTING_SNIFFER) {
@@ -992,6 +1120,11 @@ int cmd_get_handshake_count(void)
     return s_handshake_count;
 }
 
+bool cmd_handshake_initial_done(void)
+{
+    return s_handshake_initial_done;
+}
+
 bool cmd_is_c5_connected(void)
 {
     int64_t now_ms = esp_timer_get_time() / 1000;
@@ -1021,5 +1154,12 @@ int cmd_get_wardrive_logs(parsed_portal_file_t *out, int max)
 {
     int n = s_wardrive_count < max ? s_wardrive_count : max;
     memcpy(out, s_wardrive_logs, n * sizeof(parsed_portal_file_t));
+    return n;
+}
+
+int cmd_get_probes(parsed_probe_t *out, int max)
+{
+    int n = s_probe_count < max ? s_probe_count : max;
+    memcpy(out, s_probes, n * sizeof(parsed_probe_t));
     return n;
 }

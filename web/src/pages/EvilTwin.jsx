@@ -1,16 +1,32 @@
-import { useState } from 'preact/hooks';
+import { useEffect, useState } from 'preact/hooks';
 import { Layout } from '../components/Layout';
-import { AttackMonitor } from '../components/AttackMonitor';
 import { PortalPicker } from '../components/PortalPicker';
 import { api } from '../api';
 import { getState } from '../store';
 import { showToast } from '../components/Toast';
+import { wsAddListener } from '../ws';
 
 export function EvilTwin() {
   const [running, setRunning] = useState(false);
   const [portalSelected, setPortalSelected] = useState(false);
   const [passwords, setPasswords] = useState([]);
   const st = getState();
+
+  useEffect(() => wsAddListener((msg) => {
+    if (msg.type === 'attack_started' && msg.attack === 'eviltwin') setRunning(true);
+    if (msg.type === 'attack_stopped') setRunning(false);
+    if (msg.type === 'password_received') {
+      setPasswords((prev) => [
+        {
+          id: `${Date.now()}-${Math.random().toString(16).slice(2, 6)}`,
+          password: msg.password,
+          time: new Date().toLocaleTimeString(),
+        },
+        ...prev,
+      ]);
+      showToast(`Password captured: ${msg.password}`, 'success');
+    }
+  }), []);
 
   const targetNet = st.networks.find((n) => st.selected.has(n.index));
 
@@ -99,24 +115,6 @@ export function EvilTwin() {
           </div>
         </section>
       ) : null}
-
-      <AttackMonitor
-        title="Evil Twin Telemetry"
-        attackType="eviltwin"
-        onEvent={(msg) => {
-          if (msg.type === 'attack_stopped') setRunning(false);
-          if (msg.type === 'password_received') {
-            setPasswords((prev) => [
-              ...prev,
-              {
-                id: `${Date.now()}-${Math.random().toString(16).slice(2, 6)}`,
-                password: msg.password,
-                time: new Date().toLocaleTimeString(),
-              },
-            ]);
-          }
-        }}
-      />
     </Layout>
   );
 }

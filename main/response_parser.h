@@ -58,6 +58,20 @@ typedef struct {
  */
 bool parse_portal_file_line(const char *line, parsed_portal_file_t *f);
 
+/* ---------- Probe requests ---------- */
+
+#define MAX_PROBES 32
+
+typedef struct {
+    int  index;
+    char ssid[33];
+} parsed_probe_t;
+
+/**
+ * Parse an indexed probe line: "  N SSID" (1-based index, SSID may contain spaces).
+ */
+bool parse_probe_line(const char *line, parsed_probe_t *p);
+
 /* ---------- Sniffer results ---------- */
 
 #define MAX_SNIFFER_APS      64
