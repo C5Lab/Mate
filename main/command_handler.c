@@ -811,7 +811,7 @@ bool cmd_do_rogueap(const char *ssid, const char *password)
 {
     if (!set_state_if_idle(STATE_ATTACK_ROGUEAP)) return false;
     char cmd[160];
-    snprintf(cmd, sizeof(cmd), "start_rogueap %s %s", ssid, password);
+    snprintf(cmd, sizeof(cmd), "start_rogueap \"%s\" %s", ssid, password);
     if (s_display_cb) s_display_cb(cmd, NULL);
     uart_bridge_send(cmd);
     broadcast_json("{\"type\":\"attack_started\",\"attack\":\"rogueap\"}");
@@ -823,7 +823,7 @@ bool cmd_do_portal(const char *ssid)
     if (!ssid || !ssid[0]) return false;
     if (!set_state_if_idle(STATE_ATTACK_PORTAL)) return false;
     char cmd[128];
-    snprintf(cmd, sizeof(cmd), "start_portal %s", ssid);
+    snprintf(cmd, sizeof(cmd), "start_portal \"%s\"", ssid);
     if (s_display_cb) s_display_cb(cmd, NULL);
     uart_bridge_send(cmd);
     broadcast_json("{\"type\":\"attack_started\",\"attack\":\"portal\"}");

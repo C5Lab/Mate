@@ -248,6 +248,10 @@ attack_event_t parse_attack_event(const char *line)
         strncpy(ev.detail, pw, sizeof(ev.detail) - 1);
     } else if (strstr(line, "Password verified!")) {
         ev.type = ATTACK_EVENT_PASSWORD_VERIFIED;
+    } else if (strstr(line, "Password: ")) {
+        ev.type = ATTACK_EVENT_PASSWORD_RECEIVED;
+        const char *pw = strstr(line, "Password: ") + 10;
+        strncpy(ev.detail, pw, sizeof(ev.detail) - 1);
     } else if (strstr(line, "AP: Client connected")) {
         ev.type = ATTACK_EVENT_CLIENT_CONNECTED;
         const char *mac = strstr(line, "MAC:");
