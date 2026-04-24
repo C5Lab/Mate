@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git -C c:/Users/mati/Documents\\\\GitHub\\\\Mate show main:.github/workflows/build.yml)",
+      "Bash(where bash *)",
+      "Bash(curl -s https://raw.githubusercontent.com/C5Lab/projectZero/main/ESP32C5/binaries-esp32c5/flash_board.py)",
+      "PowerShell(Invoke-WebRequest -Uri \"https://raw.githubusercontent.com/C5Lab/projectZero/main/ESP32C5/binaries-esp32c5/flash_board.py\" -UseBasicParsing)"
+    ]
+  }
+}
