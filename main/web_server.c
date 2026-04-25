@@ -694,9 +694,19 @@ static esp_err_t api_dashboard_get(httpd_req_t *req)
     int handshake_count = cmd_get_handshake_count();
     cmd_state_t state = cmd_get_state();
     bool hs_loading = (state == STATE_LISTING_HANDSHAKES);
-    /* Auto-trigger SD listing once per ESP boot only. After the first
-     * successful response we never re-fire from the dashboard endpoint. */
-    if (!cmd_handshake_initial_done() && state == STATE_IDLE && cmd_is_c5_connected()) {
+    /* Auto-trigger SD listing AT MOST ONCE per ESP boot. We use an
+     * "attempted" latch (set the moment we fire) rather than the
+     * "completed" flag, otherwise any failure to receive JanOS's response
+     * would make every subsequent dashboard poll re-fire `list_dir
+     * /sdcard/lab/handshakes` -- which has nothing to do with what the
+     * user is actually doing (SubGHz, scans, etc.) and noisily steals UART
+     * airtime in the middle of unrelated commands. */
+    static bool s_dashboard_hs_attempted = false;
+    if (!s_dashboard_hs_attempted &&
+        !cmd_handshake_initial_done() &&
+        state == STATE_IDLE &&
+        cmd_is_c5_connected()) {
+        s_dashboard_hs_attempted = true;
         cmd_do_list_handshake_count();
         hs_loading = true;
     }
@@ -766,6 +776,182 @@ static esp_err_t api_wardrive_logs_get(httpd_req_t *req)
         httpd_resp_set_status(req, "409 Conflict");
         send_json(req, "{\"ok\":false,\"error\":\"busy\"}");
     }
+    return ESP_OK;
+}
+
+/* ---------- Sub-GHz handlers ---------- */
+
+static bool json_get_float(const char *json, const char *key, float *out)
+{
+    if (!json || !key || !out) return false;
+    const char *k = strstr(json, key);
+    if (!k) return false;
+    const char *colon = strchr(k, ':');
+    if (!colon) return false;
+    const char *p = colon + 1;
+    while (*p == ' ' || *p == '\t') p++;
+    char *end = NULL;
+    float v = strtof(p, &end);
+    if (end == p) return false;
+    *out = v;
+    return true;
+}
+
+static bool json_get_int(const char *json, const char *key, int *out)
+{
+    float f;
+    if (!json_get_float(json, key, &f)) return false;
+    *out = (int)f;
+    return true;
+}
+
+static bool json_get_bool(const char *json, const char *key, bool *out)
+{
+    if (!json || !key || !out) return false;
+    const char *k = strstr(json, key);
+    if (!k) return false;
+    const char *colon = strchr(k, ':');
+    if (!colon) return false;
+    const char *p = colon + 1;
+    while (*p == ' ' || *p == '\t') p++;
+    if (strncmp(p, "true", 4) == 0)  { *out = true;  return true; }
+    if (strncmp(p, "false", 5) == 0) { *out = false; return true; }
+    return false;
+}
+
+static esp_err_t api_subghz_post(httpd_req_t *req)
+{
+    const char *uri = req->uri;
+    char body[160] = {0};
+    if (req->content_len > 0) {
+        int received = httpd_req_recv(req, body, sizeof(body) - 1);
+        if (received < 0) body[0] = '\0';
+    }
+
+    bool ok = false;
+
+    if (strstr(uri, "/listen")) {
+        float freq = 433.92f;
+        bool raw = false;
+        json_get_float(body, "\"freq\"", &freq);
+        json_get_bool(body, "\"raw\"", &raw);
+        ok = cmd_do_subghz_listen(freq, raw);
+    }
+    else if (strstr(uri, "/jam")) {
+        float freq = 433.92f;
+        json_get_float(body, "\"freq\"", &freq);
+        ok = cmd_do_subghz_jam(freq);
+    }
+    else if (strstr(uri, "/tx")) {
+        char preset[16] = {0};
+        if (json_get_string(body, "\"preset\"", preset, sizeof(preset)) && preset[0]) {
+            ok = cmd_do_subghz_tx_preset(preset);
+        } else {
+            int idx = 0;
+            json_get_int(body, "\"index\"", &idx);
+            ok = cmd_do_subghz_tx(idx);
+        }
+    }
+    else if (strstr(uri, "/delete")) {
+        int idx = 0;
+        json_get_int(body, "\"index\"", &idx);
+        ok = cmd_do_subghz_delete(idx);
+    }
+    else if (strstr(uri, "/clear")) {
+        ok = cmd_do_subghz_clear();
+    }
+    else if (strstr(uri, "/export")) {
+        ok = cmd_do_subghz_export();
+    }
+    else if (strstr(uri, "/import")) {
+        ok = cmd_do_subghz_import();
+    }
+    else if (strstr(uri, "/list/refresh")) {
+        ok = cmd_do_subghz_list_refresh();
+    }
+
+    if (ok) {
+        send_json(req, "{\"ok\":true}");
+    } else {
+        httpd_resp_set_status(req, "409 Conflict");
+        send_json(req, "{\"ok\":false,\"error\":\"busy or bad params\"}");
+    }
+    return ESP_OK;
+}
+
+static esp_err_t api_subghz_list_get(httpd_req_t *req)
+{
+    /* Heap-allocate both the signal array AND the JSON buffer. The httpd
+     * worker stack is only ~4 KB; sizeof(subghz_signal_t) * 64 is several
+     * KB by itself and would overflow the stack (stack overflow → corrupt
+     * frame → memcpy crash inside httpd_resp_send).
+     *
+     * Allocate sigs proportionally to the actual cached count, not a fixed
+     * MAX_SUBGHZ_SIGNALS (~8.7 KiB) — the previous fixed allocation routinely
+     * failed OOM on this ESP32 once WiFi+httpd were up, silently returning
+     * `{ok:false}` and leaving the Transmit/Manage/Listen pages stuck on
+     * "No stored signals" even though the cache was populated.
+     *
+     * The JSON buf is also smaller (4 KiB) since 64 entries × ~200 B would
+     * not fit in the previous 8 KiB buffer either — the cap was illusory. */
+    int count = cmd_get_subghz_count();
+    if (count < 0)                  count = 0;
+    if (count > MAX_SUBGHZ_SIGNALS) count = MAX_SUBGHZ_SIGNALS;
+
+    const size_t SIGS_BYTES = sizeof(subghz_signal_t) * (count > 0 ? count : 1);
+    const size_t BUF_BYTES  = 4096;
+
+    subghz_signal_t *sigs = malloc(SIGS_BYTES);
+    char            *buf  = malloc(BUF_BYTES);
+    if (!sigs || !buf) {
+        ESP_LOGW(TAG,
+                 "subghz_list_get OOM: sigs=%p buf=%p count=%d "
+                 "free_heap=%u largest_internal=%u",
+                 sigs, buf, count,
+                 (unsigned)esp_get_free_heap_size(),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+        free(sigs);
+        free(buf);
+        send_json(req, "{\"ok\":false,\"error\":\"oom\"}");
+        return ESP_OK;
+    }
+
+    int n = cmd_get_subghz_signals(sigs, count > 0 ? count : 1);
+
+    /* Track ACTUAL bytes written, not the snprintf return value (which is
+     * the would-have-been length and can exceed the buffer on truncation). */
+    size_t pos = 0;
+    int w = snprintf(buf, BUF_BYTES, "{\"ok\":true,\"count\":%d,\"signals\":[", n);
+    if (w > 0) pos += (size_t)w < BUF_BYTES ? (size_t)w : BUF_BYTES - 1;
+
+    for (int i = 0; i < n; i++) {
+        if (pos + 256 >= BUF_BYTES) break; /* leave room for "]}" + safety */
+        const subghz_signal_t *s = &sigs[i];
+        w = snprintf(buf + pos, BUF_BYTES - pos,
+            "%s{\"idx\":%d,\"type\":\"%s\",\"freq\":%.2f,\"bits\":%d,"
+            "\"serial\":\"%s\",\"btn\":%d,\"cnt\":%d,\"mf\":\"%s\","
+            "\"id\":\"%s\",\"te\":%d,\"proto\":%d,"
+            "\"is_raw\":%s,\"edges\":%d}",
+            i > 0 ? "," : "",
+            s->idx, s->type, s->freq, s->bits,
+            s->serial, s->btn, s->cnt, s->mf,
+            s->id_str, s->te, s->proto,
+            s->is_raw ? "true" : "false", s->edges);
+        if (w <= 0) break;
+        if ((size_t)w >= BUF_BYTES - pos) {
+            pos = BUF_BYTES - 1; /* truncated; stop appending */
+            break;
+        }
+        pos += (size_t)w;
+    }
+
+    w = snprintf(buf + pos, BUF_BYTES - pos, "]}");
+    if (w > 0 && (size_t)w < BUF_BYTES - pos) pos += (size_t)w;
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, buf, pos);
+    free(buf);
+    free(sigs);
     return ESP_OK;
 }
 
@@ -839,7 +1025,7 @@ esp_err_t web_server_start(void)
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.uri_match_fn     = httpd_uri_match_wildcard;
     config.stack_size       = 6144;
-    config.max_uri_handlers = 24;
+    config.max_uri_handlers = 32;
     config.max_open_sockets = 7;
     config.lru_purge_enable = true;
     config.recv_wait_timeout  = 10;
@@ -917,6 +1103,8 @@ esp_err_t web_server_start(void)
     REGISTER_URI("/api/probes",          HTTP_POST, api_probes_refresh_post);
     REGISTER_URI("/api/status",        HTTP_GET,  api_status_get);
     REGISTER_URI("/api/dashboard",     HTTP_GET,  api_dashboard_get);
+    REGISTER_URI("/api/subghz/list",   HTTP_GET,  api_subghz_list_get);
+    REGISTER_URI("/api/subghz/*",      HTTP_POST, api_subghz_post);
 
     /* Captive portal detection endpoints */
     REGISTER_URI("/generate_204",        HTTP_GET, android_204_handler);

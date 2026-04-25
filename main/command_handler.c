@@ -69,6 +69,11 @@ static char                 s_wifi_connect_target[33] = {0};
 static bool                 s_wifi_connect_is_disconnect = false;
 static bool                 s_wifi_connect_saw_success = false;
 static bool                 s_wifi_connect_saw_failure = false;
+static subghz_signal_t      s_subghz_signals[MAX_SUBGHZ_SIGNALS];
+static int                  s_subghz_count = 0;
+static subghz_signal_t      s_subghz_build[MAX_SUBGHZ_SIGNALS];
+static int                  s_subghz_build_count = 0;
+static int                  s_subghz_import_count = 0;
 
 static bool is_prompt_line(const char *line)
 {
@@ -170,10 +175,225 @@ static void sync_display_status(void)
     }
 }
 
+/* Robust per-key parser. JanOS emits two RX schemas (KeeLoq/StarLine vs.
+ * generic protocols), and the same applies to LIST entries; rather than
+ * trying to anchor everything in one sscanf, look up each key and parse
+ * just that field. This is also tolerant of `mf=` values with spaces
+ * (e.g. "BENINCA TO.GO") which `%s` would otherwise truncate. */
+static void parse_subghz_rx_fields(const char *data, subghz_signal_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    const char *p;
+    if ((p = strstr(data, "idx=")))    sscanf(p, "idx=%d",      &out->idx);
+    if ((p = strstr(data, "type=")))   sscanf(p, "type=%15s",   out->type);
+    if ((p = strstr(data, "freq=")))   sscanf(p, "freq=%f",     &out->freq);
+    if ((p = strstr(data, "bits=")))   sscanf(p, "bits=%d",     &out->bits);
+    if ((p = strstr(data, "serial="))) sscanf(p, "serial=%23s", out->serial);
+    if ((p = strstr(data, "btn=")))    sscanf(p, "btn=%d",      &out->btn);
+    if ((p = strstr(data, "cnt=")))    sscanf(p, "cnt=%d",      &out->cnt);
+    if ((p = strstr(data, "id=")))     sscanf(p, "id=%23s",     out->id_str);
+    if ((p = strstr(data, "te=")))     sscanf(p, "te=%d",       &out->te);
+    if ((p = strstr(data, "proto=")))  sscanf(p, "proto=%d",    &out->proto);
+    if ((p = strstr(data, "edges="))) {
+        sscanf(p, "edges=%d", &out->edges);
+        out->is_raw = true;
+        if (out->type[0] == '\0') {
+            snprintf(out->type, sizeof(out->type), "RAW");
+        }
+    }
+    /* mf=... runs to end-of-line (or up to " te=") so spaced manufacturer
+     * names like "BENINCA TO.GO" survive intact. */
+    if ((p = strstr(data, "mf="))) {
+        p += 3;
+        const char *te = strstr(p, " te=");
+        size_t n = te ? (size_t)(te - p) : strlen(p);
+        /* Trim trailing CR/LF/space */
+        while (n > 0 && (p[n - 1] == '\r' || p[n - 1] == '\n' || p[n - 1] == ' ')) n--;
+        if (n >= sizeof(out->mf)) n = sizeof(out->mf) - 1;
+        memcpy(out->mf, p, n);
+        out->mf[n] = '\0';
+    }
+}
+
+/* Mate-side cache of signals captured during Listen.
+ *
+ * JanOS auto-saves keys to its own keystore, but we keep a parallel cache here
+ * so that:
+ *   - the Transmit/Manage pages have something to show even before they issue
+ *     `subghz_list` (avoids a flicker of "No stored signals.");
+ *   - if `subghz_list` happens to come back empty (race with stop, JanOS
+ *     keystore evicted, or any other reason) we don't blow away signals the
+ *     user just caught and clearly remembers seeing in the Listen table.
+ *
+ * Dedup is by `idx` because that's JanOS's slot id and is stable across the
+ * RX → list refresh round-trip. Updates in place when seen again. */
+static void cache_subghz_signal(const subghz_signal_t *s)
+{
+    if (!s || s->idx <= 0) return;
+
+    for (int i = 0; i < s_subghz_count; i++) {
+        if (s_subghz_signals[i].idx == s->idx) {
+            s_subghz_signals[i] = *s;
+            return;
+        }
+    }
+    if (s_subghz_count < MAX_SUBGHZ_SIGNALS) {
+        s_subghz_signals[s_subghz_count++] = *s;
+    }
+}
+
+static bool handle_subghz_event_line(const char *line)
+{
+    /* Returns true if the line was a SubGHZ event so the outer dispatcher can
+     * stop further processing for this line. */
+
+    const char *m;
+
+    if ((m = strstr(line, "[SUBGHZ_RSSI]")) != NULL) {
+        /* JanOS paces RSSI at ~10 Hz; cap broadcasts to ~10 Hz as a guard
+         * so a burst can never overload the WS queue / browser. */
+        static int64_t s_last_rssi_ms = 0;
+        int64_t now_ms = esp_timer_get_time() / 1000;
+        if (now_ms - s_last_rssi_ms < 90) {
+            return true;
+        }
+        s_last_rssi_ms = now_ms;
+        int rssi = atoi(m + 13);
+        broadcast_json("{\"type\":\"subghz_rssi\",\"rssi\":%d}", rssi);
+        return true;
+    }
+
+    if ((m = strstr(line, "[SUBGHZ_RX_DUP] ")) != NULL) {
+        subghz_signal_t s;
+        parse_subghz_rx_fields(m + 16, &s);
+        /* Cache DUPs too: when the user catches a button that JanOS already
+         * has in its keystore, we only ever see RX_DUP for that idx. Without
+         * caching here, Mate would have no metadata for that signal until
+         * the next subghz_list refresh, and the Listen/Transmit pages would
+         * stay empty. cache_subghz_signal updates in place by idx. */
+        cache_subghz_signal(&s);
+        broadcast_json(
+            "{\"type\":\"subghz_rx\",\"idx\":%d,\"signalType\":\"%s\","
+            "\"freq\":%.2f,\"bits\":%d,\"serial\":\"%s\",\"btn\":%d,"
+            "\"cnt\":%d,\"mf\":\"%s\",\"id\":\"%s\",\"te\":%d,"
+            "\"proto\":%d,\"dup\":true}",
+            s.idx, s.type, s.freq, s.bits, s.serial, s.btn,
+            s.cnt, s.mf, s.id_str, s.te, s.proto);
+        return true;
+    }
+
+    if ((m = strstr(line, "[SUBGHZ_RX] ")) != NULL) {
+        subghz_signal_t s;
+        parse_subghz_rx_fields(m + 12, &s);
+        cache_subghz_signal(&s);
+        broadcast_json(
+            "{\"type\":\"subghz_rx\",\"idx\":%d,\"signalType\":\"%s\","
+            "\"freq\":%.2f,\"bits\":%d,\"serial\":\"%s\",\"btn\":%d,"
+            "\"cnt\":%d,\"mf\":\"%s\",\"id\":\"%s\",\"te\":%d,"
+            "\"proto\":%d,\"dup\":false}",
+            s.idx, s.type, s.freq, s.bits, s.serial, s.btn,
+            s.cnt, s.mf, s.id_str, s.te, s.proto);
+        return true;
+    }
+
+    if ((m = strstr(line, "[SUBGHZ_RAW] ")) != NULL) {
+        int idx = 0, edges = 0;
+        float freq = 0;
+        sscanf(m + 13, "idx=%d freq=%f edges=%d", &idx, &freq, &edges);
+        subghz_signal_t s = {0};
+        s.idx    = idx;
+        s.freq   = freq;
+        s.edges  = edges;
+        s.is_raw = true;
+        snprintf(s.type, sizeof(s.type), "RAW");
+        snprintf(s.mf, sizeof(s.mf), "%de", edges);
+        cache_subghz_signal(&s);
+        broadcast_json(
+            "{\"type\":\"subghz_raw\",\"idx\":%d,\"freq\":%.2f,\"edges\":%d}",
+            idx, freq, edges);
+        return true;
+    }
+
+    if ((m = strstr(line, "[SUBGHZ_TX]")) != NULL) {
+        int idx = 0;
+        const char *p = strstr(m, "idx=");
+        if (p) idx = atoi(p + 4);
+        broadcast_json("{\"type\":\"subghz_tx_done\",\"idx\":%d}", idx);
+        return true;
+    }
+
+    /* SUBGHZ_LIST / SUBGHZ_LIST_END are handled here (rather than in the
+     * FSM) so the Transmit/Manage refresh works no matter what state the
+     * command handler happens to be in when the response arrives. The FSM
+     * had a tendency to get stuck in non-IDLE states (e.g. SUBGHZ_LISTEN
+     * after the user navigated away without an explicit stop), which would
+     * silently drop the list response and leave the page showing
+     * "No stored signals" even though JanOS had returned data. */
+    if ((m = strstr(line, "[SUBGHZ_LIST] ")) != NULL) {
+        if (s_subghz_build_count < MAX_SUBGHZ_SIGNALS) {
+            subghz_signal_t *s = &s_subghz_build[s_subghz_build_count];
+            parse_subghz_rx_fields(m + 14, s);
+            /* For RAW entries, surface "Ne" in mf so the legacy UI still
+             * has something to show in the manufacturer column. */
+            if (s->is_raw && s->mf[0] == '\0') {
+                snprintf(s->mf, sizeof(s->mf), "%de", s->edges);
+            }
+            s_subghz_build_count++;
+        }
+        broadcast_json("{\"type\":\"subghz_list_item\",\"count\":%d}",
+                       s_subghz_build_count);
+        return true;
+    }
+
+    if ((m = strstr(line, "[SUBGHZ_LIST_END]")) != NULL) {
+        int reported = 0;
+        sscanf(m, "[SUBGHZ_LIST_END] count=%d", &reported);
+
+        /* Only overwrite the cache if JanOS reported any signals. An
+         * empty LIST_END after a fresh capture (the user just saw signals
+         * in Listen) is almost always a race or transient JanOS keystore
+         * issue — wiping the Mate cache in that case would make the
+         * user's signals "vanish" from Transmit/Manage. */
+        if (s_subghz_build_count > 0) {
+            memcpy(s_subghz_signals, s_subghz_build,
+                   sizeof(subghz_signal_t) * s_subghz_build_count);
+            s_subghz_count = s_subghz_build_count;
+        }
+
+        ESP_LOGI(TAG, "SUBGHZ list refresh: parsed=%d reported=%d cached=%d",
+                 s_subghz_build_count, reported, s_subghz_count);
+
+        /* Reset the build buffer so the next refresh starts clean. */
+        s_subghz_build_count = 0;
+
+        /* Best-effort FSM recovery: if we happened to be in SUBGHZ_LIST,
+         * drop back to IDLE so the next command can run. */
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        if (s_state == STATE_SUBGHZ_LIST) {
+            s_state = STATE_IDLE;
+        }
+        xSemaphoreGive(s_mutex);
+
+        broadcast_json("{\"type\":\"subghz_list_end\",\"count\":%d}",
+                       s_subghz_count);
+        return true;
+    }
+
+    return false;
+}
+
 static void on_uart_line(const char *line, void *ctx)
 {
     (void)ctx;
     s_last_uart_ms = esp_timer_get_time() / 1000;
+
+    /* Sub-GHz event lines are state-independent; they can arrive at any time
+     * while listening (RSSI/RX/RAW) or at any moment a TX completes. RSSI
+     * arrives at ~10 Hz, so we MUST avoid the LCD redraw / display update on
+     * this path or the uart_rx_task starves and the host reboots. */
+    if (handle_subghz_event_line(line)) {
+        return;
+    }
 
     /* Update display if available */
     if (s_display_cb) {
@@ -610,6 +830,76 @@ static void on_uart_line(const char *line, void *ctx)
         break;
     }
 
+    case STATE_SUBGHZ_LISTEN:
+    case STATE_SUBGHZ_JAM: {
+        /* Listen/jam are long-running. The Sub-GHz event lines were already
+         * handled above; the only thing the FSM needs here is the stop ack.
+         * Do NOT use is_prompt_line here -- JanOS prints a CLI prompt after
+         * `subghz_freq` and again after each KeeLoq-decode diagnostic that
+         * follows a capture, which would falsely flip us back to IDLE
+         * mid-listen and make the UI think we stopped. */
+        if (strstr(line, "[SUBGHZ_STOP]") || strstr(line, "subghz: stopped")) {
+            xSemaphoreTake(s_mutex, portMAX_DELAY);
+            if (s_state == STATE_SUBGHZ_LISTEN || s_state == STATE_SUBGHZ_JAM) {
+                s_state = STATE_IDLE;
+            }
+            xSemaphoreGive(s_mutex);
+            broadcast_json("{\"type\":\"attack_stopped\"}");
+        }
+        break;
+    }
+
+    case STATE_SUBGHZ_LIST: {
+        /* [SUBGHZ_LIST] / [SUBGHZ_LIST_END] are handled in
+         * handle_subghz_event_line so they work regardless of state.
+         * Nothing else interesting can arrive while a list is in flight. */
+        break;
+    }
+
+    case STATE_SUBGHZ_IMPORT: {
+        /* Normal completion: JanOS prints `[SUBGHZ_IMPORT_END] count=N`.
+         * Failure: JanOS prints `Import failed.` (no end marker), e.g. when
+         *   /sdcard/lab/subghz doesn't exist or SD isn't mounted.
+         * Also accept the CLI prompt as a fallback so we never get wedged
+         * waiting 8+ seconds for the recovery timeout. */
+        bool done = strstr(line, "[SUBGHZ_IMPORT_END]") != NULL;
+        bool failed = strstr(line, "Import failed") != NULL;
+        if (done || failed || is_prompt_line(line)) {
+            xSemaphoreTake(s_mutex, portMAX_DELAY);
+            if (s_state == STATE_SUBGHZ_IMPORT) s_state = STATE_IDLE;
+            xSemaphoreGive(s_mutex);
+            if (failed) {
+                broadcast_json("{\"type\":\"subghz_import_done\","
+                               "\"count\":%d,\"error\":\"sd_missing\"}",
+                               s_subghz_import_count);
+            } else {
+                broadcast_json("{\"type\":\"subghz_import_done\",\"count\":%d}",
+                               s_subghz_import_count);
+            }
+            /* Auto-refresh the in-memory list from JanOS so the Manage table
+             * shows imported entries without the frontend having to chase
+             * another round-trip. */
+            cmd_do_subghz_list_refresh();
+            break;
+        }
+        if (strstr(line, "[SUBGHZ_IMPORT]")) {
+            s_subghz_import_count++;
+            broadcast_json("{\"type\":\"subghz_import_progress\",\"count\":%d}",
+                           s_subghz_import_count);
+        }
+        break;
+    }
+
+    case STATE_SUBGHZ_EXPORT: {
+        if (strstr(line, "[SUBGHZ_EXPORT_END]") || is_prompt_line(line)) {
+            xSemaphoreTake(s_mutex, portMAX_DELAY);
+            if (s_state == STATE_SUBGHZ_EXPORT) s_state = STATE_IDLE;
+            xSemaphoreGive(s_mutex);
+            broadcast_json("{\"type\":\"subghz_export_done\"}");
+        }
+        break;
+    }
+
     case STATE_LISTING_PROBES: {
         parsed_probe_t pr;
         if (parse_probe_line(line, &pr) && s_probes_build_count < MAX_PROBES) {
@@ -696,6 +986,11 @@ const char *cmd_state_name(cmd_state_t s)
     case STATE_LISTING_WARDRIVE:  return "listing_wardrive";
     case STATE_LISTING_PROBES:    return "listing_probes";
     case STATE_ATTACK_KARMA:      return "karma";
+    case STATE_SUBGHZ_LISTEN:     return "subghz_listen";
+    case STATE_SUBGHZ_JAM:        return "subghz_jam";
+    case STATE_SUBGHZ_LIST:       return "subghz_list";
+    case STATE_SUBGHZ_IMPORT:     return "subghz_import";
+    case STATE_SUBGHZ_EXPORT:     return "subghz_export";
     }
     return "unknown";
 }
@@ -733,7 +1028,10 @@ static bool is_listing_state(cmd_state_t s)
            s == STATE_LISTING_SNIFFER ||
            s == STATE_LISTING_HANDSHAKES ||
            s == STATE_LISTING_WARDRIVE ||
-           s == STATE_LISTING_PROBES;
+           s == STATE_LISTING_PROBES ||
+           s == STATE_SUBGHZ_LIST ||
+           s == STATE_SUBGHZ_IMPORT ||
+           s == STATE_SUBGHZ_EXPORT;
 }
 
 static bool set_state_if_idle(cmd_state_t new_state)
@@ -741,12 +1039,20 @@ static bool set_state_if_idle(cmd_state_t new_state)
     xSemaphoreTake(s_mutex, portMAX_DELAY);
 
     /* Recover from stuck listing states. Listings are passive reads waiting
-     * for a UART prompt; if C5 is silent for >8s the response was lost and
-     * we can safely preempt. */
+     * for a UART prompt; if C5 is silent past the threshold the response
+     * was lost and we can safely preempt.
+     *
+     * SubGHz import/export hit the SD card and can legitimately be silent
+     * for longer than e.g. a network scan (large directories, slow cards),
+     * so they get a longer fuse before we declare them stuck. */
     if (s_state != STATE_IDLE && is_listing_state(s_state)) {
         int64_t now_ms = esp_timer_get_time() / 1000;
         int64_t silent_ms = (s_last_uart_ms > 0) ? (now_ms - s_last_uart_ms) : 999999;
-        if (silent_ms > 8000) {
+        int64_t threshold_ms =
+            (s_state == STATE_SUBGHZ_IMPORT || s_state == STATE_SUBGHZ_EXPORT)
+                ? 30000   /* SD I/O */
+                : 8000;
+        if (silent_ms > threshold_ms) {
             ESP_LOGW(TAG, "Recovering stuck %s -> idle (UART silent %lldms)",
                      cmd_state_name(s_state), silent_ms);
             s_probe_resume_state = STATE_IDLE;
@@ -1023,9 +1329,12 @@ bool cmd_do_stop(void)
 {
     if (s_display_cb) s_display_cb("stop", NULL);
     uart_bridge_send("stop");
+    /* Sub-GHz uses a dedicated stop verb on the C5 side. */
+    uart_bridge_send("subghz_stop");
 
     s_sniffer_collecting = false;
     s_probe_resume_state = STATE_IDLE;
+    s_subghz_import_count = 0;
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     s_state = STATE_IDLE;
@@ -1162,4 +1471,135 @@ int cmd_get_probes(parsed_probe_t *out, int max)
     int n = s_probe_count < max ? s_probe_count : max;
     memcpy(out, s_probes, n * sizeof(parsed_probe_t));
     return n;
+}
+
+/* ---------- Sub-GHz commands ---------- */
+
+bool cmd_do_subghz_listen(float freq_mhz, bool raw)
+{
+    if (!set_state_if_idle(STATE_SUBGHZ_LISTEN)) return false;
+    char freq_cmd[40];
+    snprintf(freq_cmd, sizeof(freq_cmd), "subghz_freq %.2f", freq_mhz);
+    if (s_display_cb) s_display_cb(freq_cmd, NULL);
+    uart_bridge_send(freq_cmd);
+    const char *rx_cmd = raw ? "subghz_rx raw" : "subghz_rx";
+    if (s_display_cb) s_display_cb(rx_cmd, NULL);
+    uart_bridge_send(rx_cmd);
+    broadcast_json("{\"type\":\"attack_started\",\"attack\":\"subghz_listen\"}");
+    return true;
+}
+
+bool cmd_do_subghz_jam(float freq_mhz)
+{
+    if (!set_state_if_idle(STATE_SUBGHZ_JAM)) return false;
+    char freq_cmd[40];
+    snprintf(freq_cmd, sizeof(freq_cmd), "subghz_freq %.2f", freq_mhz);
+    if (s_display_cb) s_display_cb(freq_cmd, NULL);
+    uart_bridge_send(freq_cmd);
+    if (s_display_cb) s_display_cb("subghz_jam", NULL);
+    uart_bridge_send("subghz_jam");
+    broadcast_json("{\"type\":\"attack_started\",\"attack\":\"subghz_jam\"}");
+    return true;
+}
+
+bool cmd_do_subghz_tx(int index)
+{
+    if (index <= 0) return false;
+    char cmd[32];
+    snprintf(cmd, sizeof(cmd), "subghz_tx %d", index);
+    if (s_display_cb) s_display_cb(cmd, NULL);
+    uart_bridge_send(cmd);
+    return true;
+}
+
+bool cmd_do_subghz_tx_preset(const char *preset)
+{
+    if (!preset || !preset[0]) return false;
+    if (strcmp(preset, "tesla") == 0) {
+        if (s_display_cb) s_display_cb("subghz_freq 315.00", NULL);
+        uart_bridge_send("subghz_freq 315.00");
+        if (s_display_cb) s_display_cb("subghz_tx tesla", NULL);
+        uart_bridge_send("subghz_tx tesla");
+        return true;
+    }
+    return false;
+}
+
+bool cmd_do_subghz_delete(int index)
+{
+    if (index <= 0) return false;
+    char cmd[32];
+    snprintf(cmd, sizeof(cmd), "subghz_delete %d", index);
+    if (s_display_cb) s_display_cb(cmd, NULL);
+    uart_bridge_send(cmd);
+    return true;
+}
+
+bool cmd_do_subghz_clear(void)
+{
+    if (s_display_cb) s_display_cb("subghz_clear", NULL);
+    uart_bridge_send("subghz_clear");
+    s_subghz_count = 0;
+    return true;
+}
+
+bool cmd_do_subghz_export(void)
+{
+    if (!set_state_if_idle(STATE_SUBGHZ_EXPORT)) return false;
+    if (s_display_cb) s_display_cb("subghz_export all", NULL);
+    uart_bridge_send("subghz_export all");
+    return true;
+}
+
+bool cmd_do_subghz_import(void)
+{
+    if (!set_state_if_idle(STATE_SUBGHZ_IMPORT)) return false;
+    s_subghz_import_count = 0;
+    if (s_display_cb) s_display_cb("subghz_import all", NULL);
+    uart_bridge_send("subghz_import all");
+    return true;
+}
+
+bool cmd_do_subghz_list_refresh(void)
+{
+    /* `subghz_list` is a cheap query — accept it even if the FSM is
+     * still in STATE_SUBGHZ_LIST from a previous in-flight refresh, and
+     * preempt with a short fuse if the previous refresh was clearly
+     * abandoned (UART silent for >2s). */
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (s_state == STATE_SUBGHZ_LIST) {
+        int64_t now_ms = esp_timer_get_time() / 1000;
+        int64_t silent_ms = (s_last_uart_ms > 0) ? (now_ms - s_last_uart_ms) : 999999;
+        if (silent_ms > 2000) {
+            ESP_LOGW(TAG, "Preempting stale SUBGHZ_LIST (silent %lldms)", silent_ms);
+            s_state = STATE_IDLE;
+        }
+    }
+    bool ok = (s_state == STATE_IDLE || s_state == STATE_SUBGHZ_LIST);
+    if (ok) s_state = STATE_SUBGHZ_LIST;
+    cmd_state_t cur = s_state;
+    xSemaphoreGive(s_mutex);
+
+    if (!ok) {
+        ESP_LOGW(TAG, "subghz_list refresh rejected (busy state=%s)",
+                 cmd_state_name(cur));
+        return false;
+    }
+
+    s_subghz_build_count = 0;
+    if (s_display_cb) s_display_cb("subghz_list", NULL);
+    uart_bridge_send("subghz_list");
+    return true;
+}
+
+int cmd_get_subghz_signals(subghz_signal_t *out, int max)
+{
+    int n = s_subghz_count < max ? s_subghz_count : max;
+    memcpy(out, s_subghz_signals, n * sizeof(subghz_signal_t));
+    return n;
+}
+
+int cmd_get_subghz_count(void)
+{
+    return s_subghz_count;
 }

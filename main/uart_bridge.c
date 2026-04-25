@@ -72,7 +72,7 @@ static void uart_rx_task(void *arg)
             continue;
         }
 
-        ESP_LOGI(TAG, "RX got %d bytes", len);
+        ESP_LOGD(TAG, "RX got %d bytes", len);
         idle_count = 0;
         s_last_rx_ms = millis();
 
@@ -82,7 +82,12 @@ static void uart_rx_task(void *arg)
             if (c == '\n' || c == '\r') {
                 if (s_line_pos > 0) {
                     s_line_buf[s_line_pos] = '\0';
-                    ESP_LOGI(TAG, "RX line: %s", s_line_buf);
+                    /* Mirror the TX log so the user sees both sides of the
+                     * conversation in the Mate console. INFO level by design
+                     * — JanOS lines are sparse enough that this isn't spammy
+                     * during normal operation, and seeing the raw RX is
+                     * essential for diagnosing parser issues. */
+                    ESP_LOGI(TAG, "RX: %s", s_line_buf);
                     dispatch_line(s_line_buf);
                     s_line_pos = 0;
                 }
@@ -92,6 +97,7 @@ static void uart_rx_task(void *arg)
                 } else if (s_line_pos == UART_BRIDGE_LINE_MAX - 1) {
                     s_line_buf[s_line_pos] = '\0';
                     ESP_LOGW(TAG, "Line too long, truncating: %.40s...", s_line_buf);
+                    ESP_LOGI(TAG, "RX (truncated): %s", s_line_buf);
                     dispatch_line(s_line_buf);
                     s_line_pos = 0;
                 }

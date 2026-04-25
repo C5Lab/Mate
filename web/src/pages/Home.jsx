@@ -7,6 +7,7 @@ import { quickActionById } from '../quickActions';
 const MODULES = [
   { id: 'scan', title: 'Scan', icon: 'wifi', path: '/scan' },
   { id: 'attacks', title: 'Attacks', icon: 'radar', path: '/global' },
+  { id: 'subghz', title: 'SubGHZ', icon: 'radio', path: '/subghz' },
   { id: 'observer', title: 'Observer', icon: 'eye', path: '/sniffer' },
   { id: 'wardrive', title: 'Wardrive', icon: 'map', path: '/wardrive' },
   { id: 'bluetooth', title: 'Bluetooth', icon: 'bt', path: '/bluetooth' },
@@ -89,6 +90,13 @@ function Glyph({ name }) {
       <svg {...common}>
         <rect x="4.2" y="4.2" width="15.6" height="15.6" rx="2.6" />
         <circle cx="12" cy="12" r="2.4" />
+      </svg>
+    ),
+    radio: (
+      <svg {...common}>
+        <circle cx="12" cy="12" r="2" fill="currentColor" stroke="none" />
+        <path d="M8.5 8.5a5 5 0 0 0 0 7M15.5 8.5a5 5 0 0 1 0 7" />
+        <path d="M5.5 5.5a9 9 0 0 0 0 13M18.5 5.5a9 9 0 0 1 0 13" />
       </svg>
     ),
   };

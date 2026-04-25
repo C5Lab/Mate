@@ -26,7 +26,30 @@ typedef enum {
     STATE_LISTING_WARDRIVE,
     STATE_LISTING_PROBES,
     STATE_ATTACK_KARMA,
+    STATE_SUBGHZ_LISTEN,
+    STATE_SUBGHZ_JAM,
+    STATE_SUBGHZ_LIST,
+    STATE_SUBGHZ_IMPORT,
+    STATE_SUBGHZ_EXPORT,
 } cmd_state_t;
+
+#define MAX_SUBGHZ_SIGNALS 64
+
+typedef struct {
+    int   idx;
+    char  type[16];
+    float freq;
+    int   bits;
+    char  serial[24];   /* KeeLoq/StarLine */
+    int   btn;
+    int   cnt;
+    char  mf[40];       /* may contain spaces, e.g. "BENINCA TO.GO" */
+    char  id_str[24];   /* generic protocols (HOLTEK, etc.) */
+    int   te;
+    int   proto;
+    bool  is_raw;
+    int   edges;
+} subghz_signal_t;
 
 /**
  * WebSocket broadcast callback -- set by web_server module.
@@ -173,3 +196,38 @@ int cmd_get_wardrive_logs(parsed_portal_file_t *out, int max);
 
 /** Get cached probe list. */
 int cmd_get_probes(parsed_probe_t *out, int max);
+
+/* ---------- Sub-GHz commands ---------- */
+
+/** Start listen on the given frequency (MHz). raw=true selects raw capture. */
+bool cmd_do_subghz_listen(float freq_mhz, bool raw);
+
+/** Start jammer on the given frequency (MHz). */
+bool cmd_do_subghz_jam(float freq_mhz);
+
+/** Transmit a stored signal by 1-based index. */
+bool cmd_do_subghz_tx(int index);
+
+/** Transmit a named preset (e.g. "tesla"). Sets the preset's freq first if known. */
+bool cmd_do_subghz_tx_preset(const char *preset);
+
+/** Delete a stored signal by 1-based index. */
+bool cmd_do_subghz_delete(int index);
+
+/** Clear all stored signals. */
+bool cmd_do_subghz_clear(void);
+
+/** Export all stored signals to SD card. */
+bool cmd_do_subghz_export(void);
+
+/** Import all signals from SD card. */
+bool cmd_do_subghz_import(void);
+
+/** Refresh the cached signals list from the device. */
+bool cmd_do_subghz_list_refresh(void);
+
+/** Get cached SubGHZ signals. */
+int cmd_get_subghz_signals(subghz_signal_t *out, int max);
+
+/** Number of cached SubGHZ signals (cheap getter for sizing buffers). */
+int cmd_get_subghz_count(void);

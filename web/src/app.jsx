@@ -21,6 +21,12 @@ import { Wardrive } from './pages/Wardrive';
 import { Karma } from './pages/Karma';
 import { DeauthDetector } from './pages/DeauthDetector';
 import { Portal } from './pages/Portal';
+import { SubGhz } from './pages/SubGhz';
+import { SubGhzListen } from './pages/subghz/Listen';
+import { SubGhzTransmit } from './pages/subghz/Transmit';
+import { SubGhzManage } from './pages/subghz/Manage';
+import { SubGhzJammer } from './pages/subghz/Jammer';
+import { SubGhzTesla } from './pages/subghz/Tesla';
 
 function normalizeStatus(value) {
   if (!value) return 'idle';
@@ -217,6 +223,12 @@ export function App() {
           <Karma path="/karma" />
           <Portal path="/portal" />
           <DeauthDetector path="/detector" />
+          <SubGhz path="/subghz" />
+          <SubGhzListen path="/subghz/listen" />
+          <SubGhzTransmit path="/subghz/transmit" />
+          <SubGhzManage path="/subghz/manage" />
+          <SubGhzJammer path="/subghz/jammer" />
+          <SubGhzTesla path="/subghz/tesla" />
         </Router>
       </main>
 
