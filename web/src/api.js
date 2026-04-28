@@ -31,6 +31,7 @@ export const api = {
   mitm:           ()          => post('/api/attack/mitm'),
   nmap:           (level, ip) => post('/api/attack/nmap', { level, ip }),
   arp:            ()          => post('/api/attack/arp'),
+  arpBan:         (mac, ip)   => post('/api/attack/arp_ban', { mac, ip: ip || '' }),
   wifiConnect:    (ssid, pw)  => post('/api/wifi/connect', { ssid, password: pw || '' }),
   wifiDisconnect: ()          => post('/api/wifi/disconnect'),
   snifferResults: ()          => get('/api/sniffer/results'),

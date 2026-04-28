@@ -18,6 +18,7 @@ typedef enum {
     STATE_ATTACK_MITM,
     STATE_ATTACK_NMAP,
     STATE_ATTACK_ARP,
+    STATE_ATTACK_ARP_BAN,
     STATE_WIFI_CONNECTING,
     STATE_LISTING_PORTALS,
     STATE_LISTING_PASSWORDS,
@@ -127,6 +128,9 @@ bool cmd_do_nmap(const char *level, const char *target_ip);
 
 /** Start ARP host discovery. */
 bool cmd_do_arp(void);
+
+/** Start ARP ban (poison) for a single host MAC, optionally with IP. */
+bool cmd_do_arp_ban(const char *mac, const char *ip);
 
 /** Connect STA to selected AP SSID. */
 bool cmd_do_wifi_connect(const char *ssid, const char *password);

@@ -128,6 +128,12 @@ void uart_bridge_init(const uart_bridge_config_t *cfg)
     ESP_LOGI(TAG, "UART%d initialized: TX=%d RX=%d @ %d baud",
              s_uart_num, cfg->tx_pin, cfg->rx_pin, cfg->baud_rate);
 
+    /* Stack: 8KB. Original size restored once display_update was throttled
+     * to 10 Hz and the wifi-driver "no need to send deauth" log storm was
+     * suppressed (those two together caused the StoreProhibited panics on
+     * a deeper stack -- root cause is now fixed at the source, so we don't
+     * need to spend an extra 4 KB of internal RAM here. The httpd needs
+     * that headroom to serve the SPA without EAGAIN. */
     xTaskCreate(uart_rx_task, "uart_rx", 8192, NULL, 10, NULL);
 }
 

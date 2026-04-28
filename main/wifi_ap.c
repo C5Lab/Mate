@@ -155,7 +155,10 @@ esp_err_t wifi_ap_start(void)
     ESP_LOGI(TAG, "AP started: SSID='%s' IP=%s", s_ssid, s_ip);
 
     /* Start captive portal DNS server */
-    xTaskCreate(dns_server_task, "dns_srv", 4096, NULL, 5, NULL);
+    /* Stack: 6KB. recvfrom on lwip with 512-byte buffer + sendto can
+     * blow past 4KB under softAP burst traffic (root cause of
+     * recv_udp/vPortYieldFromInt panic seen in production). */
+    xTaskCreate(dns_server_task, "dns_srv", 6144, NULL, 5, NULL);
 
     return ESP_OK;
 }

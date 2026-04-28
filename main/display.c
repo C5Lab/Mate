@@ -16,6 +16,16 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
+
+/* Throttle full-screen redraw to ~10 Hz. UART line rate from C5 can exceed
+ * 100 lines/sec during scans / sniffer / SubGHz; redrawing on every line
+ * starves uart_rx_task and causes stack pressure that has caused
+ * StoreProhibited crashes (see plan: refresh_display @ display.c:109).
+ * Throttled-out updates are dropped on the floor; the very next call after
+ * cooldown will pick up the latest s_last_tx/s_last_rx/s_status_line state. */
+#define DISP_REFRESH_MIN_INTERVAL_US  (100 * 1000)
+static int64_t s_last_refresh_us = 0;
 
 static const char *TAG = "display";
 
@@ -85,7 +95,13 @@ static void render_text_at(int y0, const char *text, uint16_t color)
 
 static void refresh_display(void)
 {
-    if (!s_framebuf) return;
+    /* Defensive: refuse to draw if state is bogus. Crash-loop forensics
+     * showed snprintf called with buf=0x10 via this path under stack
+     * pressure -- guard so a corrupted framebuffer/dimensions never blits. */
+    if (!s_framebuf || s_width <= 0 || s_height <= 0) {
+        return;
+    }
+    s_last_refresh_us = esp_timer_get_time();
 
     /* Clear entire framebuffer to black */
     const size_t total_px = (size_t)s_width * s_height;
@@ -347,6 +363,16 @@ void display_init(void)
     }
 }
 
+/* Decide if we should actually blit now. Caller already holds s_mutex. */
+static void maybe_refresh_display(void)
+{
+    int64_t now = esp_timer_get_time();
+    if (s_last_refresh_us == 0 ||
+        now - s_last_refresh_us >= DISP_REFRESH_MIN_INTERVAL_US) {
+        refresh_display();
+    }
+}
+
 void display_update(const char *tx_cmd, const char *rx_line)
 {
     if (!s_panel || !s_framebuf) return;
@@ -364,7 +390,7 @@ void display_update(const char *tx_cmd, const char *rx_line)
         s_rx_count++;
     }
 
-    refresh_display();
+    maybe_refresh_display();
 
     xSemaphoreGive(s_mutex);
 }
@@ -375,6 +401,7 @@ void display_show_ap_info(const char *ssid, const char *ip)
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     snprintf(s_status_line, sizeof(s_status_line), "AP:%s", ssid ? ssid : "");
+    /* AP info is one-shot at boot; force unthrottled draw. */
     refresh_display();
     xSemaphoreGive(s_mutex);
 }
@@ -390,7 +417,7 @@ void display_set_status(const char *status)
     } else {
         s_status_line[0] = '\0';
     }
-    refresh_display();
+    maybe_refresh_display();
     xSemaphoreGive(s_mutex);
 }
 

@@ -28,6 +28,14 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
+    /* Suppress noisy wifi-driver logs. The softAP driver emits thousands
+     * of "no need to send deauth when softap is sending deauth" warnings
+     * per second under normal client churn -- this floods the console UART
+     * and starves other tasks (root cause for the StoreProhibited crashes
+     * seen in display.c). Errors still propagate. */
+    esp_log_level_set("wifi", ESP_LOG_ERROR);
+    esp_log_level_set("wifi_init", ESP_LOG_WARN);
+
     /* Display (no-op on boards without display) */
     display_init();
 

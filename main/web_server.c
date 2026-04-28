@@ -29,6 +29,18 @@ static int s_ws_fds[MAX_WS_CLIENTS];
 static int s_ws_count = 0;
 static SemaphoreHandle_t s_ws_mutex;
 
+/* Allocate big response/JSON buffers preferentially from PSRAM (when
+ * enabled in sdkconfig). On boards without PSRAM (e.g. XIAO-ESP32-C6)
+ * heap_caps_malloc with MALLOC_CAP_SPIRAM returns NULL, so we fall back
+ * to internal heap. Keeps the 8 KB / 16 KB JSON staging buffers off the
+ * scarce internal RAM pool that wifi/lwip/httpd workers compete for. */
+static void *psram_malloc(size_t bytes)
+{
+    void *p = heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!p) p = malloc(bytes);
+    return p;
+}
+
 /* ---------- WS send queue (decouples UART task from httpd) ---------- */
 
 #define WS_QUEUE_SIZE  16
@@ -188,7 +200,11 @@ static esp_err_t serve_spiffs_file(httpd_req_t *req, const char *filepath)
         return ESP_OK;
     }
 
-    char buf[512];
+    /* 2 KB chunks: cuts httpd_resp_send_chunk count for app.js (96 KB) from
+     * ~188 to ~47, reducing chunked-encoding overhead and lwip pressure
+     * that was producing intermittent EAGAIN under softAP load. The httpd
+     * worker stack is 6 KB so this fits comfortably. */
+    char buf[2048];
     int read_bytes;
     while ((read_bytes = fread(buf, 1, sizeof(buf), f)) > 0) {
         httpd_resp_send_chunk(req, buf, read_bytes);
@@ -248,7 +264,7 @@ static esp_err_t api_scan_results_get(httpd_req_t *req)
 {
     const scan_results_t *r = cmd_get_scan_results();
 
-    char *buf = malloc(8192);
+    char *buf = psram_malloc(8192);
     if (!buf) {
         send_json(req, "{\"ok\":false,\"error\":\"oom\"}");
         return ESP_OK;
@@ -369,6 +385,21 @@ static esp_err_t api_attack_post(httpd_req_t *req)
         json_get_string(body, "\"level\"", level, sizeof(level));
         json_get_string(body, "\"ip\"", target_ip, sizeof(target_ip));
         ok = cmd_do_nmap(level[0] ? level : NULL, target_ip[0] ? target_ip : NULL);
+    }
+    else if (strstr(uri, "/arp_ban")) {
+        char body[160] = {0};
+        if (req->content_len > 0) {
+            int received = httpd_req_recv(req, body, sizeof(body) - 1);
+            if (received < 0) {
+                body[0] = '\0';
+            }
+        }
+
+        char mac[24] = {0};
+        char ip[24] = {0};
+        json_get_string(body, "\"mac\"", mac, sizeof(mac));
+        json_get_string(body, "\"ip\"", ip, sizeof(ip));
+        ok = cmd_do_arp_ban(mac[0] ? mac : NULL, ip[0] ? ip : NULL);
     }
     else if (strstr(uri, "/arp"))        ok = cmd_do_arp();
     else if (strstr(uri, "/rogueap")) {
@@ -560,7 +591,7 @@ static esp_err_t api_passwords_get(httpd_req_t *req)
 static esp_err_t api_sniffer_results_get(httpd_req_t *req)
 {
     const sniffer_results_t *results = cmd_get_sniffer_results();
-    char *buf = malloc(16384);
+    char *buf = psram_malloc(16384);
     if (!buf) {
         send_json(req, "{\"ok\":false,\"error\":\"oom\"}");
         return ESP_OK;
@@ -901,8 +932,8 @@ static esp_err_t api_subghz_list_get(httpd_req_t *req)
     const size_t SIGS_BYTES = sizeof(subghz_signal_t) * (count > 0 ? count : 1);
     const size_t BUF_BYTES  = 4096;
 
-    subghz_signal_t *sigs = malloc(SIGS_BYTES);
-    char            *buf  = malloc(BUF_BYTES);
+    subghz_signal_t *sigs = psram_malloc(SIGS_BYTES);
+    char            *buf  = psram_malloc(BUF_BYTES);
     if (!sigs || !buf) {
         ESP_LOGW(TAG,
                  "subghz_list_get OOM: sigs=%p buf=%p count=%d "
@@ -1024,7 +1055,16 @@ esp_err_t web_server_start(void)
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.uri_match_fn     = httpd_uri_match_wildcard;
-    config.stack_size       = 6144;
+    /* httpd worker stack: 8 KB. cmd_do_* are invoked synchronously from
+     * the HTTP handler, and the chain
+     *   handler -> cmd_do_select -> display_update -> refresh_display
+     *   -> esp_lcd_panel_draw_bitmap -> SPI master + DMA descriptor setup
+     * plus printf/snprintf locals reliably overflows 6 KB. The next ISR
+     * then crashes restoring a corrupted task frame -- StoreProhibited
+     * in vPortYieldFromInt with EXCVADDR=0xffffffa0 and LBEG=strlen ROM
+     * (classic stack-smash signature). 8 KB gives the SPI/LCD path
+     * comfortable headroom. */
+    config.stack_size       = 8192;
     config.max_uri_handlers = 32;
     config.max_open_sockets = 7;
     config.lru_purge_enable = true;
@@ -1053,6 +1093,10 @@ esp_err_t web_server_start(void)
         return ESP_ERR_NO_MEM;
     }
 
+    /* Stack: 3KB. Original size; was bumped to 4K defensively but reverted
+     * to free up internal RAM (we were down to 7 KB free heap after httpd
+     * start, which made serving app.js fail with EAGAIN). 3 KB is enough
+     * for httpd_ws_send_frame_async with our 4-client cap. */
     BaseType_t task_ok = xTaskCreate(ws_sender_task, "ws_send", 3072, NULL, 5, NULL);
     if (task_ok != pdPASS) {
         ESP_LOGE(TAG, "Failed to create WS sender task");

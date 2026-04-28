@@ -45,6 +45,13 @@ static parsed_portal_file_t s_portals[MAX_PORTAL_FILES];
 static int                  s_portal_count = 0;
 static parsed_password_t    s_passwords[MAX_PASSWORDS];
 static int                  s_password_count = 0;
+/* True once we've seen JanOS echo back our `show_pass evil` command. Until
+ * then, any incoming "> " prompt belongs to a *previous* command (commonly
+ * select_networks fired right before us by the MITM flow) and must NOT be
+ * treated as the end of our listing — otherwise STATE_LISTING_PASSWORDS
+ * snaps back to IDLE before any "SSID","password" line arrives, and we
+ * silently drop the entire reply. Reset to false in cmd_do_list_passwords. */
+static bool                 s_passwords_echo_seen = false;
 static bool                 s_portal_header_seen = false;
 static sniffer_results_t    s_sniffer;
 static sniffer_results_t    s_sniffer_build;
@@ -461,9 +468,13 @@ static void on_uart_line(const char *line, void *ctx)
             return;
         }
 
-        /* Monster prompt "> " signals end of output */
+        /* Monster prompt "> " signals end of output. Bug 1 tolerance: even
+         * if we received fewer networks than "Retrieved N" promised (one or
+         * two lines lost in transit), accept the prompt as completion so we
+         * don't get wedged in STATE_SCANNING forever. */
         {
-            if (is_prompt_line(line) && s_scan.count > 0) {
+            if (is_prompt_line(line) &&
+                (s_scan.count > 0 || s_scan_expected >= 0)) {
                 goto scan_done;
             }
         }
@@ -596,13 +607,17 @@ static void on_uart_line(const char *line, void *ctx)
 
     case STATE_ATTACK_MITM: {
         attack_event_t ev = parse_attack_event(line);
-        if (ev.type == ATTACK_EVENT_PCAP_SAVED ||
-            ev.type == ATTACK_EVENT_STOP_ACK ||
-            is_prompt_line(line) ||
-            is_not_connected_line(line)) {
-            if (is_not_connected_line(line)) {
-                mark_sta_disconnected();
-            }
+        bool stop_like = (ev.type == ATTACK_EVENT_PCAP_SAVED ||
+                          ev.type == ATTACK_EVENT_STOP_ACK ||
+                          is_prompt_line(line) ||
+                          is_not_connected_line(line));
+        if (stop_like) {
+            /* Bug 2: JanOS tears down the STA association after stopping
+             * `start_pcap net`, but doesn't always emit a "Wi-Fi:
+             * disconnected" line. Force-mark STA as disconnected so the
+             * UI re-prompts for the password on the next STA-required
+             * attack. */
+            mark_sta_disconnected();
             xSemaphoreTake(s_mutex, portMAX_DELAY);
             s_state = STATE_IDLE;
             xSemaphoreGive(s_mutex);
@@ -613,11 +628,25 @@ static void on_uart_line(const char *line, void *ctx)
 
     case STATE_ATTACK_NMAP: {
         attack_event_t ev = parse_attack_event(line);
-        if (ev.type == ATTACK_EVENT_STOP_ACK ||
-            strstr(line, "(scan stopped by user)") ||
-            (strstr(line, "Scanned ") && strstr(line, "open ports")) ||
-            is_prompt_line(line) ||
-            is_not_connected_line(line)) {
+        bool stop_like = (ev.type == ATTACK_EVENT_STOP_ACK ||
+                          strstr(line, "(scan stopped by user)") ||
+                          (strstr(line, "Scanned ") && strstr(line, "open ports")) ||
+                          is_prompt_line(line) ||
+                          is_not_connected_line(line));
+        if (stop_like) {
+            /* Bug 2: same rationale as MITM -- nmap path also drops STA. */
+            mark_sta_disconnected();
+            xSemaphoreTake(s_mutex, portMAX_DELAY);
+            s_state = STATE_IDLE;
+            xSemaphoreGive(s_mutex);
+            broadcast_json("{\"type\":\"attack_stopped\"}");
+        }
+        break;
+    }
+
+    case STATE_ATTACK_ARP: {
+        /* Discovery only (`list_hosts`); does NOT tear down STA. */
+        if (is_prompt_line(line) || is_not_connected_line(line)) {
             if (is_not_connected_line(line)) {
                 mark_sta_disconnected();
             }
@@ -629,11 +658,14 @@ static void on_uart_line(const char *line, void *ctx)
         break;
     }
 
-    case STATE_ATTACK_ARP: {
-        if (is_prompt_line(line) || is_not_connected_line(line)) {
-            if (is_not_connected_line(line)) {
-                mark_sta_disconnected();
-            }
+    case STATE_ATTACK_ARP_BAN: {
+        attack_event_t ev = parse_attack_event(line);
+        bool stop_like = (ev.type == ATTACK_EVENT_STOP_ACK ||
+                          is_prompt_line(line) ||
+                          is_not_connected_line(line));
+        if (stop_like) {
+            /* Bug 2: arp_ban stop tears down STA on JanOS. */
+            mark_sta_disconnected();
             xSemaphoreTake(s_mutex, portMAX_DELAY);
             s_state = STATE_IDLE;
             xSemaphoreGive(s_mutex);
@@ -738,13 +770,21 @@ static void on_uart_line(const char *line, void *ctx)
     }
 
     case STATE_LISTING_PASSWORDS: {
+        /* Mark "our" command as observed once JanOS echoes it back. Until
+         * then any prompt is a stale one from a prior command and must not
+         * end the listing. JanOS echoes commands as "> show_pass evil". */
+        if (!s_passwords_echo_seen && strstr(line, "show_pass") != NULL) {
+            s_passwords_echo_seen = true;
+            break;
+        }
+
         parsed_password_t pw;
         if (parse_password_line(line, &pw) && s_password_count < MAX_PASSWORDS) {
             s_passwords[s_password_count++] = pw;
             break;
         }
 
-        if (is_prompt_line(line)) {
+        if (is_prompt_line(line) && s_passwords_echo_seen) {
             xSemaphoreTake(s_mutex, portMAX_DELAY);
             s_state = STATE_IDLE;
             xSemaphoreGive(s_mutex);
@@ -978,6 +1018,7 @@ const char *cmd_state_name(cmd_state_t s)
     case STATE_ATTACK_MITM:       return "mitm";
     case STATE_ATTACK_NMAP:       return "nmap";
     case STATE_ATTACK_ARP:        return "arp";
+    case STATE_ATTACK_ARP_BAN:    return "arp_ban";
     case STATE_WIFI_CONNECTING:   return "wifi_connecting";
     case STATE_LISTING_PORTALS:   return "listing_portals";
     case STATE_LISTING_PASSWORDS: return "listing_passwords";
@@ -1034,29 +1075,48 @@ static bool is_listing_state(cmd_state_t s)
            s == STATE_SUBGHZ_EXPORT;
 }
 
+static bool is_recoverable_state(cmd_state_t s)
+{
+    /* Passive states that finish on a UART marker; safe to preempt if C5
+     * has gone silent. STATE_SCANNING is included because the
+     * "Scan results printed" marker can be lost in a UART glitch and
+     * leave Mate stuck (Bug 1). */
+    return is_listing_state(s) || s == STATE_SCANNING;
+}
+
 static bool set_state_if_idle(cmd_state_t new_state)
 {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
 
-    /* Recover from stuck listing states. Listings are passive reads waiting
+    /* Recover from stuck listing/scan states. They are passive reads waiting
      * for a UART prompt; if C5 is silent past the threshold the response
      * was lost and we can safely preempt.
      *
      * SubGHz import/export hit the SD card and can legitimately be silent
      * for longer than e.g. a network scan (large directories, slow cards),
      * so they get a longer fuse before we declare them stuck. */
-    if (s_state != STATE_IDLE && is_listing_state(s_state)) {
+    if (s_state != STATE_IDLE && is_recoverable_state(s_state)) {
         int64_t now_ms = esp_timer_get_time() / 1000;
         int64_t silent_ms = (s_last_uart_ms > 0) ? (now_ms - s_last_uart_ms) : 999999;
         int64_t threshold_ms =
             (s_state == STATE_SUBGHZ_IMPORT || s_state == STATE_SUBGHZ_EXPORT)
                 ? 30000   /* SD I/O */
+            : (s_state == STATE_SCANNING)
+                ? 6000    /* Bug 1: scan stalled past last network line */
                 : 8000;
         if (silent_ms > threshold_ms) {
             ESP_LOGW(TAG, "Recovering stuck %s -> idle (UART silent %lldms)",
                      cmd_state_name(s_state), silent_ms);
             s_probe_resume_state = STATE_IDLE;
             s_sniffer_collecting = false;
+            /* Bug 1: surface whatever networks we already collected so the
+             * frontend isn't left looking at a stale or empty list. */
+            if (s_state == STATE_SCANNING) {
+                s_scan.scan_complete = true;
+                s_scan_expected = -1;
+                broadcast_json("{\"type\":\"scan_complete\",\"count\":%d}",
+                               s_scan.count);
+            }
             s_state = STATE_IDLE;
         }
     }
@@ -1289,6 +1349,24 @@ bool cmd_do_arp(void)
     return true;
 }
 
+bool cmd_do_arp_ban(const char *mac, const char *ip)
+{
+    if (!mac || !mac[0]) return false;
+    if (!set_state_if_idle(STATE_ATTACK_ARP_BAN)) return false;
+
+    char cmd[96];
+    if (ip && ip[0]) {
+        snprintf(cmd, sizeof(cmd), "arp_ban %s %s", mac, ip);
+    } else {
+        snprintf(cmd, sizeof(cmd), "arp_ban %s", mac);
+    }
+
+    if (s_display_cb) s_display_cb(cmd, NULL);
+    uart_bridge_send(cmd);
+    broadcast_json("{\"type\":\"attack_started\",\"attack\":\"arp_ban\"}");
+    return true;
+}
+
 bool cmd_do_wifi_connect(const char *ssid, const char *password)
 {
     if (!ssid || !ssid[0]) return false;
@@ -1329,16 +1407,25 @@ bool cmd_do_stop(void)
 {
     if (s_display_cb) s_display_cb("stop", NULL);
     uart_bridge_send("stop");
-    /* Sub-GHz uses a dedicated stop verb on the C5 side. */
-    uart_bridge_send("subghz_stop");
 
     s_sniffer_collecting = false;
     s_probe_resume_state = STATE_IDLE;
     s_subghz_import_count = 0;
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
+    cmd_state_t prev = s_state;
     s_state = STATE_IDLE;
     xSemaphoreGive(s_mutex);
+
+    /* Bug 2: stopping MITM / NMAP / ARP_BAN on JanOS also tears down the
+     * STA association, but the "Wi-Fi: disconnected" line is not always
+     * emitted. Mark Mate's view of STA as disconnected so the next
+     * STA-required attack re-prompts for the password. */
+    if (prev == STATE_ATTACK_MITM ||
+        prev == STATE_ATTACK_NMAP ||
+        prev == STATE_ATTACK_ARP_BAN) {
+        mark_sta_disconnected();
+    }
 
     broadcast_json("{\"type\":\"attack_stopped\"}");
     return true;
@@ -1369,6 +1456,7 @@ bool cmd_do_list_passwords(void)
 {
     if (!set_state_if_idle(STATE_LISTING_PASSWORDS)) return false;
     s_password_count = 0;
+    s_passwords_echo_seen = false;
     if (s_display_cb) s_display_cb("show_pass evil", NULL);
     uart_bridge_send("show_pass evil");
     return true;

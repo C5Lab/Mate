@@ -481,6 +481,109 @@ F1:2E:71:9F:C8:68  RSSI: -90 dBm  Name: Forerunner 935
 
 ---
 
+## Sub-GHz (CC1101)
+
+The Sub-GHz subsystem drives a CC1101 radio attached to the ESP32C5. All event lines are prefixed with `[SUBGHZ_*]` markers.
+
+### `subghz_freq`
+- **Syntax**: `subghz_freq <MHz>`
+- **Example**: `subghz_freq 433.92`
+- **Description**: Sets the receiver/transmitter frequency in MHz. Must be issued before `subghz_rx`, `subghz_jam`, or `subghz_tx <preset>`.
+
+### `subghz_rx`
+- **Syntax**: `subghz_rx` or `subghz_rx raw`
+- **Description**: Starts receive mode on the current frequency. Without `raw`, signals are decoded into known protocols. With `raw`, every burst is captured as raw edges.
+- **Continuous output**:
+```
+[SUBGHZ_RSSI] -78
+[SUBGHZ_RX] idx=1 type=Princeton freq=433.92 bits=24 id=A1B2C3 te=270 proto=11
+[SUBGHZ_RX] idx=2 type=KeeLoq freq=433.92 bits=64 serial=0x0A1B2C btn=2 cnt=12 mf=BENINCA TO.GO te=400
+[SUBGHZ_RX_DUP] idx=2 type=KeeLoq freq=433.92 serial=0x0A1B2C mf=BENINCA TO.GO
+[SUBGHZ_RX_DUP] idx=1 type=Princeton freq=433.92 id=A1B2C3
+[SUBGHZ_RAW] idx=3 freq=433.92 edges=187
+```
+- **`[SUBGHZ_RSSI]` rate**: ~10 Hz.
+- **`idx`**: 1-based; persists across the session and identifies the captured signal in `subghz_list`/`subghz_tx`/`subghz_delete`.
+- **Two RX schemas** (parsers must handle both):
+  - **KeeLoq / StarLine**: `idx type freq bits serial btn cnt mf te` -- `mf=` is a manufacturer name and **may contain spaces** (e.g. `BENINCA TO.GO`); read it up to ` te=` or end-of-line, not via `%s`.
+  - **Generic** (Princeton, HOLTEK, Came, Nice, etc.): `idx type freq bits id te proto`.
+  - `[SUBGHZ_RX_DUP]` mirrors the same split: KeeLoq variant carries `serial`+`mf`; generic variant carries `id`.
+- **Stop**: Send `subghz_stop` or `stop`.
+
+### `subghz_jam`
+- **Syntax**: `subghz_jam`
+- **Description**: Continuous TX (jammer) on the current frequency.
+- **Stop**: Send `subghz_stop` or `stop`.
+
+### `subghz_stop`
+- **Syntax**: `subghz_stop`
+- **Description**: Stops any active Sub-GHz mode (RX, jam).
+- **Output**: `[SUBGHZ_STOP]` or `subghz: stopped`.
+
+### `subghz_list`
+- **Syntax**: `subghz_list`
+- **Description**: Lists all stored signals captured during the current session (or imported from SD).
+- **Output**:
+```
+[SUBGHZ_LIST] idx=1 type=Princeton freq=433.92 bits=24 id=A1B2C3 te=270
+[SUBGHZ_LIST] idx=2 type=KeeLoq freq=433.92 serial=0x0A1B2C btn=2 cnt=12 mf=BENINCA TO.GO
+[SUBGHZ_LIST] idx=3 type=RAW freq=433.92 edges=187
+[SUBGHZ_LIST_END] count=3
+```
+- **Notes**: Three entry shapes:
+  - Generic decoded: `type/bits/id/te` (no `serial`/`mf`).
+  - KeeLoq/StarLine: `type/serial/btn/cnt/mf` (no `bits`/`te` in LIST output -- present in RX only). `mf` may contain spaces.
+  - Raw: `type=RAW` plus `freq/edges`.
+
+### `subghz_tx`
+- **Syntax**: `subghz_tx <index>` or `subghz_tx <preset>`
+- **Description**: Replays a stored signal by 1-based index, or a built-in preset by name.
+- **Built-in presets**:
+  - `tesla` -- 315 MHz OOK Tesla charge-port opener (auto-sets frequency).
+- **Output**: `[SUBGHZ_TX] idx=<n>` on completion.
+
+### `subghz_delete`
+- **Syntax**: `subghz_delete <index>`
+- **Description**: Removes a stored signal by 1-based index.
+
+### `subghz_clear`
+- **Syntax**: `subghz_clear`
+- **Description**: Clears all stored signals from device memory.
+
+### `subghz_export`
+- **Syntax**: `subghz_export all` or `subghz_export <index>`
+- **Description**: Writes signal(s) to `/sdcard/lab/subghz/*.sub` (Flipper-like text format).
+- **Output**: `[SUBGHZ_EXPORT] file=...` per signal, then `[SUBGHZ_EXPORT_END]`.
+
+### `subghz_import`
+- **Syntax**: `subghz_import all` or `subghz_import <filename>`
+- **Description**: Loads signal(s) from `/sdcard/lab/subghz/`.
+- **Output**:
+```
+[SUBGHZ_IMPORT] file=signal_001.sub
+[SUBGHZ_IMPORT] file=signal_002.sub
+[SUBGHZ_IMPORT_END] count=2
+```
+
+### `subghz_info`
+- **Syntax**: `subghz_info <index>`
+- **Description**: Shows full details (raw edge timings, decoded fields) for a stored signal.
+
+### Event-line summary
+| Marker | When | Payload |
+|--------|------|---------|
+| `[SUBGHZ_RSSI]` | During `subghz_rx` (~10 Hz) | RSSI dBm |
+| `[SUBGHZ_RX]` | New decoded signal | KeeLoq/StarLine: `idx type freq bits serial btn cnt mf te` (mf may have spaces). Generic: `idx type freq bits id te proto`. |
+| `[SUBGHZ_RX_DUP]` | Duplicate of an existing decoded signal | KeeLoq: `idx type freq serial mf`. Generic: `idx type freq id`. |
+| `[SUBGHZ_RAW]` | New raw burst (when `subghz_rx raw`) | `idx freq edges` |
+| `[SUBGHZ_TX]` | TX completed | `idx=<n>` |
+| `[SUBGHZ_LIST]` / `[SUBGHZ_LIST_END]` | `subghz_list` | one row per signal then summary |
+| `[SUBGHZ_IMPORT]` / `[SUBGHZ_IMPORT_END]` | `subghz_import` | one row per file then summary |
+| `[SUBGHZ_EXPORT]` / `[SUBGHZ_EXPORT_END]` | `subghz_export` | one row per file then summary |
+| `[SUBGHZ_STOP]` | `subghz_stop` ack | (none) |
+
+---
+
 ## GPS
 
 ### `gps_set`

@@ -61,6 +61,8 @@ export function Scan() {
   const [monitorAttack, setMonitorAttack] = useState('');
   const [monitorLines, setMonitorLines] = useState([]);
   const [arpRows, setArpRows] = useState([]);
+  const [arpBanTarget, setArpBanTarget] = useState(null); // { ip, mac } currently being banned
+  const [arpBanBusy, setArpBanBusy] = useState(false);
   const [nmapRows, setNmapRows] = useState([]);
   const [nmapLevel, setNmapLevel] = useState('quick');
   const [nmapTargetIp, setNmapTargetIp] = useState('');
@@ -109,6 +111,26 @@ export function Scan() {
         pushLine(msg.data);
         pushMonitorLine(msg.data);
       }
+
+      if (msg.type === 'scan_complete') {
+        // Bug 1: don't wait another poll tick -- pull final results
+        // immediately and stop the local poller so the UI flips out of
+        // "Scanning..." the moment Mate confirms completion.
+        stopPolling();
+        api.scanResults().then((data) => {
+          if (data?.ok) {
+            setState({
+              networks: data.networks || [],
+              scanCount: data.count || 0,
+              status: 'idle',
+              lastScanAt: Date.now(),
+            });
+            showToast(`Scan complete: ${(data.networks || []).length} APs`, 'success');
+          } else {
+            setState({ status: 'idle' });
+          }
+        }).catch(() => setState({ status: 'idle' }));
+      }
     });
 
     return () => {
@@ -132,6 +154,8 @@ export function Scan() {
     setMonitorTitle(title || 'Attack Monitor');
     setMonitorLines([]);
     setArpRows([]);
+    setArpBanTarget(null);
+    setArpBanBusy(false);
     setNmapRows([]);
   }
 
@@ -142,8 +166,32 @@ export function Scan() {
     setMonitorOpen(false);
   }
 
+  async function banArpHost(host) {
+    if (!host || !host.mac) return;
+    setArpBanBusy(true);
+    pushMonitorLine(`Banning host ${host.ip} (${host.mac})...`);
+    const res = await api.arpBan(host.mac, host.ip);
+    setArpBanBusy(false);
+    if (res?.ok) {
+      setArpBanTarget(host);
+      setAttackLive(true);
+      showToast(`ARP poisoning ${host.ip}`, 'success');
+      pushMonitorLine(`arp_ban started for ${host.mac}`);
+    } else {
+      showToast(res?.error || 'arp_ban rejected', 'error');
+      pushMonitorLine(`arp_ban error: ${res?.error || 'rejected'}`);
+    }
+  }
+
   function parseArpLine(line) {
-    const m = line.match(/^\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})\s*->\s*([0-9A-Fa-f:]{17})\s*$/);
+    /* JanOS prints lines like:
+     *   "  192.168.0.1  ->  AC:22:05:84:4F:CC  [ARP]"
+     *   "  192.168.0.247  ->  (MAC unknown)  [ICMP]"
+     * Accept the optional discovery-method tag and skip rows without a MAC
+     * (arp_ban needs a usable MAC anyway). */
+    const m = line.match(
+      /^\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})\s*->\s*([0-9A-Fa-f:]{17})(?:\s+\[[^\]]+\])?\s*$/,
+    );
     if (!m) return;
     const ip = m[1];
     const mac = m[2].toUpperCase();
@@ -313,19 +361,33 @@ export function Scan() {
     return { ok: false, error: softFailure?.error || 'timeout' };
   }
 
-  async function connectAndLaunchPending() {
+  async function connectAndLaunchPending(passwordOverride) {
     const pending = pendingRef.current;
     if (!pending) return;
+
+    // Bug 3: support auto-connect with a known password (from show_pass evil
+    // cache) without going through the popup -- if passwordOverride is
+    // provided we use it directly, otherwise fall back to whatever is in
+    // the popup input.
+    const password = (passwordOverride !== undefined ? passwordOverride : connectPassword).trim();
 
     setConnectBusy(true);
     setConnectError('');
     connectOutcomeRef.current = null;
     setConnectOpen(false);
 
-    openMonitor(pending.id, `${pending.label} Serial`);
+    /* Don't clobber an already-open monitor (e.g. one we opened earlier
+     * during the show_pass evil lookup) -- otherwise the breadcrumb log
+     * the user is watching disappears the moment we connect. */
+    if (!monitorOpenRef.current || monitorAttackRef.current !== pending.id) {
+      openMonitor(pending.id, `${pending.label} Serial`);
+    }
     pushMonitorLine(`Connecting to ${pending.target.ssid}...`);
+    if (passwordOverride !== undefined) {
+      pushMonitorLine('Using cached password from show_pass evil');
+    }
 
-    const connectRes = await api.wifiConnect(pending.target.ssid, connectPassword.trim());
+    const connectRes = await api.wifiConnect(pending.target.ssid, password);
     if (!connectRes.ok) {
       setConnectBusy(false);
       setConnectError(connectRes.error || 'wifi_connect rejected');
@@ -356,6 +418,36 @@ export function Scan() {
       pushMonitorLine(`Attack start failed: ${runRes.error || 'unknown error'}`);
       showToast(runRes.error || 'Failed to start attack', 'error');
     }
+  }
+
+  // Bug 3: look up cached evil-twin password for the given SSID via
+  // /api/passwords (which transparently triggers `show_pass evil` on the
+  // C5 if the cache is empty). Polls a few times because the first call
+  // may return `status: loading`.
+  async function lookupCachedPassword(ssid) {
+    if (!ssid) return null;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      try {
+        const res = await api.passwords();
+        const list = Array.isArray(res?.passwords) ? res.passwords : [];
+        if (list.length) {
+          const match = list.find((pw) => pw && pw.ssid === ssid && pw.password);
+          if (match) return match.password;
+          /* Cache populated but no match -- no point in polling further. */
+          return null;
+        }
+        /* First call returned an empty list -- the C5 has been kicked to
+         * run `show_pass evil` and we have to wait for results. Tell the
+         * user what's happening instead of letting the spinner hang. */
+        if (attempt === 0 && monitorOpenRef.current) {
+          pushMonitorLine('show_pass evil pending, waiting for cache...');
+        }
+      } catch (e) {
+        /* keep polling */
+      }
+      await sleep(700);
+    }
+    return null;
   }
 
   async function launchAttack() {
@@ -426,6 +518,30 @@ export function Scan() {
           runner,
           target,
         };
+
+        /* Open the monitor BEFORE the password lookup so the user sees
+         * what's happening (otherwise the UI freezes silently for up to
+         * ~3 s while we poll show_pass evil results). */
+        openMonitor(attack, `${selectedAttack.label} Serial`);
+        pushMonitorLine(`Looking up cached password for ${target.ssid} (show_pass evil)...`);
+
+        // Bug 3: try the show_pass evil cache first. If we already know
+        // the password for this SSID, skip the popup and connect+attack
+        // automatically.
+        const cachedPw = await lookupCachedPassword(target.ssid);
+        if (cachedPw) {
+          pushMonitorLine('Cached password found, auto-connecting');
+          await connectAndLaunchPending(cachedPw);
+          return;
+        }
+
+        pushMonitorLine('No cached password, prompting user for credentials');
+        /* Close monitor before showing the popup -- otherwise the popup
+         * stacks on top of the monitor and the user has two overlapping
+         * dialogs. The breadcrumbs are preserved if connectAndLaunchPending
+         * is later called -- it re-opens with a fresh log. */
+        closeMonitor();
+
         setConnectSsid(target.ssid);
         setConnectSecurity(target.security || '');
         setConnectPassword('');
@@ -574,7 +690,7 @@ export function Scan() {
             {connectError ? <div class="alert warn">{connectError}</div> : null}
 
             <div class="btn-row">
-              <button class="btn btn-info" disabled={connectBusy} onClick={connectAndLaunchPending}>
+              <button class="btn btn-info" disabled={connectBusy} onClick={() => connectAndLaunchPending()}>
                 {connectBusy ? <span class="spinner" /> : null}
                 Connect & Run
               </button>
@@ -607,29 +723,36 @@ export function Scan() {
             </div>
 
             {monitorAttack === 'arp' ? (
-              <div class="table-wrap">
-                <table class="table">
-                  <thead>
-                    <tr>
-                      <th>IP</th>
-                      <th>MAC</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {!arpRows.length ? (
-                      <tr>
-                        <td colSpan={2}>No hosts discovered yet</td>
-                      </tr>
-                    ) : (
-                      arpRows.map((row) => (
-                        <tr key={`${row.ip}-${row.mac}`}>
-                          <td>{row.ip}</td>
-                          <td>{row.mac}</td>
-                        </tr>
-                      ))
-                    )}
-                  </tbody>
-                </table>
+              <div>
+                <div class="section-head">
+                  <h3 class="section-title">Discovered Hosts</h3>
+                  {arpBanTarget ? (
+                    <span class="badge ok">Poisoning {arpBanTarget.ip}</span>
+                  ) : (
+                    <span class="badge">{arpRows.length} host{arpRows.length === 1 ? '' : 's'}</span>
+                  )}
+                </div>
+                {!arpRows.length ? (
+                  <div class="mini-serial-line empty">No hosts discovered yet</div>
+                ) : (
+                  <div class="attack-picker">
+                    {arpRows.map((row) => {
+                      const isTarget = arpBanTarget && arpBanTarget.mac === row.mac;
+                      return (
+                        <button
+                          key={`${row.ip}-${row.mac}`}
+                          class={`attack-chip ${isTarget ? 'active' : ''}`}
+                          disabled={arpBanBusy || (arpBanTarget && !isTarget)}
+                          onClick={() => banArpHost(row)}
+                          title="arp_ban this host"
+                        >
+                          <strong>{row.ip}</strong>
+                          <span class="chip-mini">{row.mac}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
               </div>
             ) : null}
 
