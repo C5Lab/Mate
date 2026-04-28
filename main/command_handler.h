@@ -4,8 +4,6 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define MAX_ARP_HOSTS 32
-
 typedef struct {
     char ip[16];
     char mac[18];
@@ -42,8 +40,6 @@ typedef enum {
     STATE_SUBGHZ_IMPORT,
     STATE_SUBGHZ_EXPORT,
 } cmd_state_t;
-
-#define MAX_SUBGHZ_SIGNALS 64
 
 typedef struct {
     int   idx;
@@ -173,16 +169,21 @@ bool cmd_do_list_wardrive_logs(void);
 cmd_state_t cmd_get_state(void);
 const char *cmd_state_name(cmd_state_t s);
 
-/** Get cached scan results. */
+/** Get cached scan results. The returned pointer's `networks` array lives
+ *  in PSRAM and has no fixed cap -- iterate `for (i=0; i<r->count; i++)`. */
 const scan_results_t *cmd_get_scan_results(void);
 
-/** Get cached portal file list. */
+/** Copy up to `max` cached portal files into `out`; returns count copied. */
 int cmd_get_portal_files(parsed_portal_file_t *out, int max);
+int cmd_get_portal_files_count(void);
 
-/** Get cached password list. */
+/** Copy up to `max` cached passwords into `out`; returns count copied. */
 int cmd_get_passwords(parsed_password_t *out, int max);
+int cmd_get_passwords_count(void);
 
-/** Get cached network observer results. */
+/** Get cached network observer results. The returned pointer's `aps` array
+ *  is heap-backed; per-AP client MACs live in `aps[i].clients` (flat,
+ *  stride `SNIFFER_CLIENT_LEN`). Use `parsed_sniffer_ap_client(ap, i)`. */
 const sniffer_results_t *cmd_get_sniffer_results(void);
 
 /** Get cached handshake .pcap count from SD card listing. */
@@ -204,14 +205,17 @@ bool cmd_is_sta_connected(void);
 /** Last connected STA SSID, or empty string. */
 const char *cmd_get_sta_ssid(void);
 
-/** Get cached wardrive log file list. */
+/** Copy up to `max` cached wardrive log entries into `out`. */
 int cmd_get_wardrive_logs(parsed_portal_file_t *out, int max);
+int cmd_get_wardrive_logs_count(void);
 
-/** Get cached probe list. */
+/** Copy up to `max` cached probe entries into `out`. */
 int cmd_get_probes(parsed_probe_t *out, int max);
+int cmd_get_probes_count(void);
 
 /** Get cached ARP discovered hosts (from `list_hosts`). Returns count copied. */
 int cmd_get_arp_hosts(arp_host_t *out, int max);
+int cmd_get_arp_hosts_count(void);
 
 /** Monotonic timestamp (ms) when the last ARP host scan completed. 0 if none. */
 uint32_t cmd_get_arp_hosts_at_ms(void);

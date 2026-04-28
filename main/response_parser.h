@@ -2,10 +2,11 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
+
+#include "dynvec.h"
 
 /* ---------- Network scan results ---------- */
-
-#define MAX_NETWORKS  64
 
 typedef struct {
     int  index;
@@ -17,10 +18,13 @@ typedef struct {
     char band[8];
 } parsed_network_t;
 
+/* `networks` is owned by command_handler and lives in PSRAM. Iterate as
+ * `for (int i = 0; i < r->count; i++) ... r->networks[i]`. */
 typedef struct {
-    parsed_network_t networks[MAX_NETWORKS];
-    int              count;
-    bool             scan_complete;
+    parsed_network_t *networks;
+    int               count;
+    int               cap;
+    bool              scan_complete;
 } scan_results_t;
 
 /**
@@ -31,8 +35,6 @@ typedef struct {
 bool parse_network_line(const char *line, parsed_network_t *net);
 
 /* ---------- Password results ---------- */
-
-#define MAX_PASSWORDS 32
 
 typedef struct {
     char ssid[33];
@@ -46,8 +48,6 @@ bool parse_password_line(const char *line, parsed_password_t *pw);
 
 /* ---------- Portal file list ---------- */
 
-#define MAX_PORTAL_FILES 32
-
 typedef struct {
     int  index;
     char filename[64];
@@ -59,8 +59,6 @@ typedef struct {
 bool parse_portal_file_line(const char *line, parsed_portal_file_t *f);
 
 /* ---------- Probe requests ---------- */
-
-#define MAX_PROBES 32
 
 typedef struct {
     int  index;
@@ -74,23 +72,33 @@ bool parse_probe_line(const char *line, parsed_probe_t *p);
 
 /* ---------- Sniffer results ---------- */
 
-#define MAX_SNIFFER_APS      64
-#define MAX_SNIFFER_CLIENTS  24
+#define SNIFFER_CLIENT_LEN 18
 
+/* Per-AP client MACs are stored flat (`client_count * SNIFFER_CLIENT_LEN`
+ * bytes in `clients`). Use `parsed_sniffer_ap_client(ap, i)` instead of
+ * indexing the buffer directly. */
 typedef struct {
-    char ssid[33];
-    int  channel;
-    int  client_total;
-    int  client_count;
-    char clients[MAX_SNIFFER_CLIENTS][18];
+    char  ssid[33];
+    int   channel;
+    int   client_total;
+    int   client_count;
+    int   client_cap;
+    char *clients;
 } parsed_sniffer_ap_t;
 
+static inline char *parsed_sniffer_ap_client(const parsed_sniffer_ap_t *ap, int i)
+{
+    if (!ap || !ap->clients || i < 0 || i >= ap->client_count) return NULL;
+    return ap->clients + (size_t)i * SNIFFER_CLIENT_LEN;
+}
+
 typedef struct {
-    parsed_sniffer_ap_t aps[MAX_SNIFFER_APS];
-    int                 count;
-    int                 packet_count;
-    bool                has_snapshot;
-    bool                empty;
+    parsed_sniffer_ap_t *aps;
+    int                  count;
+    int                  cap;
+    int                  packet_count;
+    bool                 has_snapshot;
+    bool                 empty;
 } sniffer_results_t;
 
 /**

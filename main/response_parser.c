@@ -175,7 +175,12 @@ bool parse_sniffer_ap_line(const char *line, parsed_sniffer_ap_t *ap)
     ap->channel = atoi(ch + 2);
     ap->client_total = atoi(colon + 1);
     if (ap->client_total < 0) ap->client_total = 0;
+
+    /* Caller owns client storage (heap-backed dynvec under the hood); leave
+     * the pointer fields in a defined "no clients yet" state. */
     ap->client_count = 0;
+    ap->client_cap   = 0;
+    ap->clients      = NULL;
 
     return ap->channel > 0;
 }

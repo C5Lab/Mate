@@ -2,6 +2,7 @@
 #include "uart_bridge.h"
 #include "response_parser.h"
 #include "display.h"
+#include "dynvec.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -39,13 +40,17 @@ static void broadcast_json(const char *fmt, ...)
     }
 }
 
-/* Cached data */
+/* Cached data.
+ *
+ * Variable-cardinality lists (scan results, sniffer APs/clients, ARP hosts,
+ * subghz signals, ...) live in PSRAM-backed dynvecs so they have no fixed
+ * upper bound. The historical `static T arr[MAX_*]` caches were both
+ * arbitrary (silently truncated real-world inputs at 32/64 entries) and
+ * expensive (consuming several KB of scarce internal DRAM at boot). */
 static scan_results_t       s_scan;
 static int                  s_scan_expected = -1;
-static parsed_portal_file_t s_portals[MAX_PORTAL_FILES];
-static int                  s_portal_count = 0;
-static parsed_password_t    s_passwords[MAX_PASSWORDS];
-static int                  s_password_count = 0;
+static dynvec_t             s_portals;        /* parsed_portal_file_t */
+static dynvec_t             s_passwords;      /* parsed_password_t */
 /* True once we've seen JanOS echo back our `show_pass evil` command. Until
  * then, any incoming "> " prompt belongs to a *previous* command (commonly
  * select_networks fired right before us by the MITM flow) and must NOT be
@@ -60,12 +65,9 @@ static bool                 s_sniffer_collecting = false;
 static int                  s_sniffer_ap_index = -1;
 static int                  s_handshake_count = -1;
 static bool                 s_handshake_initial_done = false;
-static parsed_portal_file_t s_wardrive_logs[MAX_PORTAL_FILES];
-static int                  s_wardrive_count = 0;
-static parsed_probe_t       s_probes[MAX_PROBES];
-static int                  s_probe_count = 0;
-static parsed_probe_t       s_probes_build[MAX_PROBES];
-static int                  s_probes_build_count = 0;
+static dynvec_t             s_wardrive_logs;  /* parsed_portal_file_t */
+static dynvec_t             s_probes;         /* parsed_probe_t */
+static dynvec_t             s_probes_build;   /* parsed_probe_t */
 static cmd_state_t          s_probe_resume_state = STATE_IDLE;
 static bool                 s_has_last_gps_fix = false;
 static float                s_last_gps_lat = 0.0f;
@@ -77,18 +79,13 @@ static char                 s_wifi_connect_target[33] = {0};
 static bool                 s_wifi_connect_is_disconnect = false;
 static bool                 s_wifi_connect_saw_success = false;
 static bool                 s_wifi_connect_saw_failure = false;
-static subghz_signal_t      s_subghz_signals[MAX_SUBGHZ_SIGNALS];
-static int                  s_subghz_count = 0;
-static subghz_signal_t      s_subghz_build[MAX_SUBGHZ_SIGNALS];
-static int                  s_subghz_build_count = 0;
+static dynvec_t             s_subghz_signals; /* subghz_signal_t */
+static dynvec_t             s_subghz_build;   /* subghz_signal_t */
 static int                  s_subghz_import_count = 0;
 /* Discovered hosts from `list_hosts` (ARP attack). Cached on the device so
  * the web UI can poll for them even if the WS dropped during the discovery
- * burst (e.g. after the softAP channel hops to follow the STA). The buffer
- * is PSRAM-allocated when available so it doesn't eat the scarce internal
- * DRAM that wifi/lwip/httpd workers compete for at boot. */
-static arp_host_t          *s_arp_hosts = NULL;
-static int                  s_arp_host_count = 0;
+ * burst (e.g. after the softAP channel hops to follow the STA). */
+static dynvec_t             s_arp_hosts;      /* arp_host_t */
 static uint32_t             s_arp_hosts_at_ms = 0;
 static bool                 s_arp_hosts_in_block = false;
 
@@ -116,9 +113,124 @@ static void mark_sta_disconnected(void)
     }
 }
 
+/* ---------- Scan / sniffer / arp dynvec helpers ---------- */
+
+/* Tag used by ESP_LOGW to flag drops when PSRAM (or internal heap fallback)
+ * can't satisfy a push. Each call site logs its own list-name. */
+static void log_drop(const char *list)
+{
+    ESP_LOGW(TAG, "dynvec %s: push failed (PSRAM/internal heap exhausted)", list);
+}
+
+static void scan_clear(void)
+{
+    /* Keep the underlying buffer (cap stays) so the next scan reuses it. */
+    if (s_scan.networks == NULL) {
+        dynvec_t v;
+        if (dynvec_init(&v, sizeof(parsed_network_t), 16)) {
+            s_scan.networks = (parsed_network_t *)v.data;
+            s_scan.cap      = (int)v.cap;
+        }
+    }
+    s_scan.count         = 0;
+    s_scan.scan_complete = false;
+}
+
+static bool scan_push(const parsed_network_t *net)
+{
+    /* Mirror s_scan into a transient dynvec to reuse the growth logic; commit
+     * the (possibly new) pointer back. This keeps the public scan_results_t
+     * struct opaque to callers while letting the buffer grow without limit. */
+    dynvec_t v = {
+        .data      = s_scan.networks,
+        .count     = (size_t)s_scan.count,
+        .cap       = (size_t)s_scan.cap,
+        .elem_size = sizeof(parsed_network_t),
+    };
+    void *slot = dynvec_push(&v, net);
+    s_scan.networks = (parsed_network_t *)v.data;
+    s_scan.cap      = (int)v.cap;
+    if (!slot) return false;
+    s_scan.count = (int)v.count;
+    return true;
+}
+
+/* Per-AP client buffer wrapper -- treats `clients` as a flat byte array of
+ * `client_cap * SNIFFER_CLIENT_LEN` bytes managed via dynvec growth rules. */
+static bool sniffer_ap_push_client(parsed_sniffer_ap_t *ap, const char *mac)
+{
+    if (!ap || !mac) return false;
+    dynvec_t v = {
+        .data      = ap->clients,
+        .count     = (size_t)ap->client_count,
+        .cap       = (size_t)ap->client_cap,
+        .elem_size = SNIFFER_CLIENT_LEN,
+    };
+    char slot_buf[SNIFFER_CLIENT_LEN];
+    strncpy(slot_buf, mac, SNIFFER_CLIENT_LEN - 1);
+    slot_buf[SNIFFER_CLIENT_LEN - 1] = '\0';
+    void *slot = dynvec_push(&v, slot_buf);
+    ap->clients    = (char *)v.data;
+    ap->client_cap = (int)v.cap;
+    if (!slot) return false;
+    ap->client_count = (int)v.count;
+    return true;
+}
+
+static void sniffer_ap_free(parsed_sniffer_ap_t *ap)
+{
+    if (!ap) return;
+    free(ap->clients);
+    ap->clients      = NULL;
+    ap->client_count = 0;
+    ap->client_cap   = 0;
+}
+
+static void sniffer_results_clear(sniffer_results_t *r)
+{
+    if (!r) return;
+    if (r->aps) {
+        for (int i = 0; i < r->count; i++) sniffer_ap_free(&r->aps[i]);
+    }
+    /* Keep the AP-array buffer (cap stays); just zero the live count. */
+    r->count        = 0;
+    r->packet_count = 0;
+    r->has_snapshot = false;
+    r->empty        = false;
+}
+
+static void sniffer_results_free_buffers(sniffer_results_t *r)
+{
+    if (!r) return;
+    if (r->aps) {
+        for (int i = 0; i < r->count; i++) sniffer_ap_free(&r->aps[i]);
+        free(r->aps);
+        r->aps = NULL;
+    }
+    r->count = 0;
+    r->cap   = 0;
+}
+
+static bool sniffer_results_push_ap(sniffer_results_t *r, const parsed_sniffer_ap_t *ap)
+{
+    if (!r || !ap) return false;
+    dynvec_t v = {
+        .data      = r->aps,
+        .count     = (size_t)r->count,
+        .cap       = (size_t)r->cap,
+        .elem_size = sizeof(parsed_sniffer_ap_t),
+    };
+    void *slot = dynvec_push(&v, ap);
+    r->aps = (parsed_sniffer_ap_t *)v.data;
+    r->cap = (int)v.cap;
+    if (!slot) return false;
+    r->count = (int)v.count;
+    return true;
+}
+
 static void reset_sniffer_build(void)
 {
-    memset(&s_sniffer_build, 0, sizeof(s_sniffer_build));
+    sniffer_results_clear(&s_sniffer_build);
     s_sniffer_build.packet_count = s_sniffer.packet_count;
     s_sniffer_ap_index = -1;
 }
@@ -144,11 +256,21 @@ static bool parse_single_quoted_value(const char *line, const char *marker, char
 static void finish_sniffer_snapshot(void)
 {
     s_sniffer_build.has_snapshot = true;
-    s_sniffer_build.empty = (s_sniffer_build.count == 0);
+    s_sniffer_build.empty        = (s_sniffer_build.count == 0);
     s_sniffer_build.packet_count = s_sniffer.packet_count;
-    memcpy(&s_sniffer, &s_sniffer_build, sizeof(s_sniffer));
+
+    /* Swap the buffers instead of memcpy so the old s_sniffer.aps (and its
+     * per-AP client allocations) are freed exactly once. After the swap,
+     * s_sniffer_build holds the previous live snapshot which we then clear
+     * so the next collection cycle starts empty without leaking. */
+    sniffer_results_t tmp = s_sniffer;
+    s_sniffer       = s_sniffer_build;
+    s_sniffer_build = tmp;
+    sniffer_results_clear(&s_sniffer_build);
+    s_sniffer_build.packet_count = s_sniffer.packet_count;
+
     s_sniffer_collecting = false;
-    s_sniffer_ap_index = -1;
+    s_sniffer_ap_index   = -1;
 
     if (cmd_get_state() == STATE_LISTING_SNIFFER) {
         xSemaphoreTake(s_mutex, portMAX_DELAY);
@@ -173,10 +295,7 @@ static void begin_sniffer_snapshot(void)
 
 static void arp_hosts_reset_locked(void)
 {
-    s_arp_host_count = 0;
-    if (s_arp_hosts) {
-        memset(s_arp_hosts, 0, sizeof(arp_host_t) * MAX_ARP_HOSTS);
-    }
+    dynvec_clear(&s_arp_hosts);
 }
 
 static void arp_hosts_reset(void)
@@ -244,25 +363,27 @@ static bool parse_arp_host_line(const char *line, arp_host_t *out)
 
 static void broadcast_arp_hosts_locked(void)
 {
-    if (!s_ws_broadcast || !s_arp_hosts) return;
+    if (!s_ws_broadcast) return;
 
-    /* Per host: ~70 bytes JSON. 32 hosts * 70 + envelope ≈ 2.3 KB. Allocate
-     * from PSRAM when available so we don't blow the uart_rx_task stack
-     * (which also runs the cmd_handler line callbacks). */
-    const size_t cap = 3072;
+    /* Per host: ~70 bytes JSON. Size buffer to fit *all* cached hosts (no
+     * silent truncation) and allocate from PSRAM so we don't blow the
+     * uart_rx_task stack (which also runs the cmd_handler line callbacks). */
+    const int    n   = (int)s_arp_hosts.count;
+    const size_t cap = 64 + (size_t)n * 96;
     char *json = heap_caps_malloc(cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!json) json = malloc(cap);
     if (!json) return;
 
     int pos = snprintf(json, cap,
-        "{\"type\":\"arp_hosts\",\"count\":%d,\"hosts\":[", s_arp_host_count);
-    for (int i = 0; i < s_arp_host_count && pos < (int)cap - 96; i++) {
+        "{\"type\":\"arp_hosts\",\"count\":%d,\"hosts\":[", n);
+    for (int i = 0; i < n && pos < (int)cap - 96; i++) {
+        const arp_host_t *h = (const arp_host_t *)dynvec_at(&s_arp_hosts, (size_t)i);
+        if (!h) break;
         pos += snprintf(json + pos, cap - pos,
             "%s{\"ip\":\"%s\",\"mac\":\"%s\",\"icmp_only\":%s}",
             i > 0 ? "," : "",
-            s_arp_hosts[i].ip,
-            s_arp_hosts[i].mac,
-            s_arp_hosts[i].icmp_only ? "true" : "false");
+            h->ip, h->mac,
+            h->icmp_only ? "true" : "false");
     }
     pos += snprintf(json + pos, cap - pos, "]}");
     s_ws_broadcast(json, pos);
@@ -298,9 +419,7 @@ static void handle_arp_discovery_line(const char *line)
         arp_host_t host;
         if (parse_arp_host_line(line, &host)) {
             xSemaphoreTake(s_mutex, portMAX_DELAY);
-            if (s_arp_hosts && s_arp_host_count < MAX_ARP_HOSTS) {
-                s_arp_hosts[s_arp_host_count++] = host;
-            }
+            if (!dynvec_push(&s_arp_hosts, &host)) log_drop("arp_hosts");
             xSemaphoreGive(s_mutex);
         }
     }
@@ -385,15 +504,14 @@ static void cache_subghz_signal(const subghz_signal_t *s)
 {
     if (!s || s->idx <= 0) return;
 
-    for (int i = 0; i < s_subghz_count; i++) {
-        if (s_subghz_signals[i].idx == s->idx) {
-            s_subghz_signals[i] = *s;
+    for (size_t i = 0; i < s_subghz_signals.count; i++) {
+        subghz_signal_t *cur = (subghz_signal_t *)dynvec_at(&s_subghz_signals, i);
+        if (cur && cur->idx == s->idx) {
+            *cur = *s;
             return;
         }
     }
-    if (s_subghz_count < MAX_SUBGHZ_SIGNALS) {
-        s_subghz_signals[s_subghz_count++] = *s;
-    }
+    if (!dynvec_push(&s_subghz_signals, s)) log_drop("subghz_signals");
 }
 
 static bool handle_subghz_event_line(const char *line)
@@ -484,18 +602,16 @@ static bool handle_subghz_event_line(const char *line)
      * silently drop the list response and leave the page showing
      * "No stored signals" even though JanOS had returned data. */
     if ((m = strstr(line, "[SUBGHZ_LIST] ")) != NULL) {
-        if (s_subghz_build_count < MAX_SUBGHZ_SIGNALS) {
-            subghz_signal_t *s = &s_subghz_build[s_subghz_build_count];
-            parse_subghz_rx_fields(m + 14, s);
-            /* For RAW entries, surface "Ne" in mf so the legacy UI still
-             * has something to show in the manufacturer column. */
-            if (s->is_raw && s->mf[0] == '\0') {
-                snprintf(s->mf, sizeof(s->mf), "%de", s->edges);
-            }
-            s_subghz_build_count++;
+        subghz_signal_t s;
+        parse_subghz_rx_fields(m + 14, &s);
+        /* For RAW entries, surface "Ne" in mf so the legacy UI still
+         * has something to show in the manufacturer column. */
+        if (s.is_raw && s.mf[0] == '\0') {
+            snprintf(s.mf, sizeof(s.mf), "%de", s.edges);
         }
+        if (!dynvec_push(&s_subghz_build, &s)) log_drop("subghz_build");
         broadcast_json("{\"type\":\"subghz_list_item\",\"count\":%d}",
-                       s_subghz_build_count);
+                       (int)s_subghz_build.count);
         return true;
     }
 
@@ -508,17 +624,19 @@ static bool handle_subghz_event_line(const char *line)
          * in Listen) is almost always a race or transient JanOS keystore
          * issue — wiping the Mate cache in that case would make the
          * user's signals "vanish" from Transmit/Manage. */
-        if (s_subghz_build_count > 0) {
-            memcpy(s_subghz_signals, s_subghz_build,
-                   sizeof(subghz_signal_t) * s_subghz_build_count);
-            s_subghz_count = s_subghz_build_count;
+        if (s_subghz_build.count > 0) {
+            /* Swap pointers so we don't leak the previous live cache and
+             * don't pay for an O(N) memcpy of variable-length data. */
+            dynvec_t tmp = s_subghz_signals;
+            s_subghz_signals = s_subghz_build;
+            s_subghz_build   = tmp;
+            dynvec_clear(&s_subghz_build);
         }
 
         ESP_LOGI(TAG, "SUBGHZ list refresh: parsed=%d reported=%d cached=%d",
-                 s_subghz_build_count, reported, s_subghz_count);
+                 (int)s_subghz_signals.count, reported, (int)s_subghz_signals.count);
 
-        /* Reset the build buffer so the next refresh starts clean. */
-        s_subghz_build_count = 0;
+        dynvec_clear(&s_subghz_build);
 
         /* Best-effort FSM recovery: if we happened to be in SUBGHZ_LIST,
          * drop back to IDLE so the next command can run. */
@@ -529,7 +647,7 @@ static bool handle_subghz_event_line(const char *line)
         xSemaphoreGive(s_mutex);
 
         broadcast_json("{\"type\":\"subghz_list_end\",\"count\":%d}",
-                       s_subghz_count);
+                       (int)s_subghz_signals.count);
         return true;
     }
 
@@ -601,9 +719,7 @@ static void on_uart_line(const char *line, void *ctx)
 
         parsed_network_t net;
         if (parse_network_line(line, &net)) {
-            if (s_scan.count < MAX_NETWORKS) {
-                s_scan.networks[s_scan.count++] = net;
-            }
+            if (!scan_push(&net)) log_drop("scan_networks");
             /* Only send structured event, skip raw uart_line to save queue space */
             broadcast_json(
                 "{\"type\":\"scan_network\",\"network\":"
@@ -722,7 +838,7 @@ static void on_uart_line(const char *line, void *ctx)
 
         if (s_sniffer_collecting) {
             parsed_sniffer_ap_t ap;
-            char client[18];
+            char client[SNIFFER_CLIENT_LEN];
 
             if (parse_sniffer_empty_line(line)) {
                 finish_sniffer_snapshot();
@@ -730,20 +846,26 @@ static void on_uart_line(const char *line, void *ctx)
             }
 
             if (parse_sniffer_ap_line(line, &ap)) {
-                if (s_sniffer_build.count < MAX_SNIFFER_APS) {
-                    s_sniffer_ap_index = s_sniffer_build.count;
-                    s_sniffer_build.aps[s_sniffer_build.count++] = ap;
+                /* parse_sniffer_ap_line zeroes the inline-array layout; we
+                 * own client storage now, so reset the heap-pointer fields
+                 * before pushing the AP into the build buffer. */
+                ap.clients      = NULL;
+                ap.client_count = 0;
+                ap.client_cap   = 0;
+                if (sniffer_results_push_ap(&s_sniffer_build, &ap)) {
+                    s_sniffer_ap_index = s_sniffer_build.count - 1;
+                } else {
+                    log_drop("sniffer_aps");
                 }
                 break;
             }
 
             if (parse_sniffer_client_line(line, client, sizeof(client))) {
                 if (s_sniffer_ap_index >= 0) {
-                    parsed_sniffer_ap_t *cur = &s_sniffer_build.aps[s_sniffer_ap_index];
-                    if (cur->client_count < MAX_SNIFFER_CLIENTS) {
-                        strncpy(cur->clients[cur->client_count], client, sizeof(cur->clients[cur->client_count]) - 1);
-                        cur->clients[cur->client_count][sizeof(cur->clients[cur->client_count]) - 1] = '\0';
-                        cur->client_count++;
+                    parsed_sniffer_ap_t *cur =
+                        &s_sniffer_build.aps[s_sniffer_ap_index];
+                    if (!sniffer_ap_push_client(cur, client)) {
+                        log_drop("sniffer_clients");
                     }
                 }
                 break;
@@ -897,8 +1019,8 @@ static void on_uart_line(const char *line, void *ctx)
             s_portal_header_seen = true;
         } else if (s_portal_header_seen) {
             parsed_portal_file_t f;
-            if (parse_portal_file_line(line, &f) && s_portal_count < MAX_PORTAL_FILES) {
-                s_portals[s_portal_count++] = f;
+            if (parse_portal_file_line(line, &f)) {
+                if (!dynvec_push(&s_portals, &f)) log_drop("portals");
             } else {
                 /* End of list (non-parseable line or empty) */
                 xSemaphoreTake(s_mutex, portMAX_DELAY);
@@ -906,16 +1028,26 @@ static void on_uart_line(const char *line, void *ctx)
                 xSemaphoreGive(s_mutex);
                 s_portal_header_seen = false;
 
-                /* Build JSON array of portal files */
-                char json[1024] = "{\"type\":\"portals\",\"files\":[";
-                int pos = strlen(json);
-                for (int i = 0; i < s_portal_count; i++) {
-                    pos += snprintf(json + pos, sizeof(json) - pos,
+                /* Build JSON in a buffer sized to hold *all* cached entries
+                 * (no silent truncation). PSRAM-preferred so the
+                 * uart_rx_task stack doesn't grow unbounded. */
+                const int    n   = (int)s_portals.count;
+                const size_t cap = 64 + (size_t)n * 96;
+                char *json = heap_caps_malloc(cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                if (!json) json = malloc(cap);
+                if (!json) break;
+                int pos = snprintf(json, cap, "{\"type\":\"portals\",\"files\":[");
+                for (int i = 0; i < n && pos < (int)cap - 96; i++) {
+                    const parsed_portal_file_t *pf =
+                        (const parsed_portal_file_t *)dynvec_at(&s_portals, (size_t)i);
+                    if (!pf) break;
+                    pos += snprintf(json + pos, cap - pos,
                         "%s{\"index\":%d,\"name\":\"%s\"}",
-                        i > 0 ? "," : "", s_portals[i].index, s_portals[i].filename);
+                        i > 0 ? "," : "", pf->index, pf->filename);
                 }
-                pos += snprintf(json + pos, sizeof(json) - pos, "]}");
+                pos += snprintf(json + pos, cap - pos, "]}");
                 if (s_ws_broadcast) s_ws_broadcast(json, pos);
+                free(json);
             }
         }
         break;
@@ -931,8 +1063,8 @@ static void on_uart_line(const char *line, void *ctx)
         }
 
         parsed_password_t pw;
-        if (parse_password_line(line, &pw) && s_password_count < MAX_PASSWORDS) {
-            s_passwords[s_password_count++] = pw;
+        if (parse_password_line(line, &pw)) {
+            if (!dynvec_push(&s_passwords, &pw)) log_drop("passwords");
             break;
         }
 
@@ -963,21 +1095,24 @@ static void on_uart_line(const char *line, void *ctx)
 
         parsed_sniffer_ap_t ap;
         if (parse_sniffer_ap_line(line, &ap)) {
-            if (s_sniffer_build.count < MAX_SNIFFER_APS) {
-                s_sniffer_ap_index = s_sniffer_build.count;
-                s_sniffer_build.aps[s_sniffer_build.count++] = ap;
+            ap.clients      = NULL;
+            ap.client_count = 0;
+            ap.client_cap   = 0;
+            if (sniffer_results_push_ap(&s_sniffer_build, &ap)) {
+                s_sniffer_ap_index = s_sniffer_build.count - 1;
+            } else {
+                log_drop("sniffer_aps");
             }
             break;
         }
 
-        char client[18];
+        char client[SNIFFER_CLIENT_LEN];
         if (parse_sniffer_client_line(line, client, sizeof(client))) {
             if (s_sniffer_ap_index >= 0) {
-                parsed_sniffer_ap_t *cur = &s_sniffer_build.aps[s_sniffer_ap_index];
-                if (cur->client_count < MAX_SNIFFER_CLIENTS) {
-                    strncpy(cur->clients[cur->client_count], client, sizeof(cur->clients[cur->client_count]) - 1);
-                    cur->clients[cur->client_count][sizeof(cur->clients[cur->client_count]) - 1] = '\0';
-                    cur->client_count++;
+                parsed_sniffer_ap_t *cur =
+                    &s_sniffer_build.aps[s_sniffer_ap_index];
+                if (!sniffer_ap_push_client(cur, client)) {
+                    log_drop("sniffer_clients");
                 }
             }
             break;
@@ -1009,8 +1144,8 @@ static void on_uart_line(const char *line, void *ctx)
 
     case STATE_LISTING_WARDRIVE: {
         parsed_portal_file_t f;
-        if (parse_portal_file_line(line, &f) && s_wardrive_count < MAX_PORTAL_FILES) {
-            s_wardrive_logs[s_wardrive_count++] = f;
+        if (parse_portal_file_line(line, &f)) {
+            if (!dynvec_push(&s_wardrive_logs, &f)) log_drop("wardrive_logs");
             break;
         }
 
@@ -1094,21 +1229,25 @@ static void on_uart_line(const char *line, void *ctx)
 
     case STATE_LISTING_PROBES: {
         parsed_probe_t pr;
-        if (parse_probe_line(line, &pr) && s_probes_build_count < MAX_PROBES) {
-            s_probes_build[s_probes_build_count++] = pr;
+        if (parse_probe_line(line, &pr)) {
+            if (!dynvec_push(&s_probes_build, &pr)) log_drop("probes_build");
             break;
         }
 
         if (is_prompt_line(line)) {
-            memcpy(s_probes, s_probes_build, sizeof(s_probes));
-            s_probe_count = s_probes_build_count;
+            /* Swap so we don't leak the previous live cache; clear build. */
+            dynvec_t tmp = s_probes;
+            s_probes       = s_probes_build;
+            s_probes_build = tmp;
+            dynvec_clear(&s_probes_build);
 
             xSemaphoreTake(s_mutex, portMAX_DELAY);
             s_state = s_probe_resume_state;
             xSemaphoreGive(s_mutex);
             s_probe_resume_state = STATE_IDLE;
 
-            broadcast_json("{\"type\":\"probes_updated\",\"count\":%d}", s_probe_count);
+            broadcast_json("{\"type\":\"probes_updated\",\"count\":%d}",
+                           (int)s_probes.count);
         }
         break;
     }
@@ -1130,15 +1269,23 @@ void cmd_handler_init(void)
     s_mutex = xSemaphoreCreateMutex();
     memset(&s_scan, 0, sizeof(s_scan));
     memset(&s_sniffer, 0, sizeof(s_sniffer));
-    reset_sniffer_build();
+    memset(&s_sniffer_build, 0, sizeof(s_sniffer_build));
 
-    /* Cache the ARP hosts table in PSRAM when available so it doesn't eat
-     * the ~50 KB of internal DRAM that wifi/lwip/httpd workers fight over
-     * at boot. Falls back to internal heap on boards without PSRAM. */
-    s_arp_hosts = heap_caps_malloc(sizeof(arp_host_t) * MAX_ARP_HOSTS,
-                                   MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!s_arp_hosts) s_arp_hosts = malloc(sizeof(arp_host_t) * MAX_ARP_HOSTS);
-    if (s_arp_hosts) memset(s_arp_hosts, 0, sizeof(arp_host_t) * MAX_ARP_HOSTS);
+    /* All variable-cardinality caches live in PSRAM (with internal-heap
+     * fallback) so they grow without an arbitrary cap and don't burn the
+     * scarce internal DRAM that wifi/lwip/httpd compete for at boot.
+     * Initial capacities are small but enough for the most common cases;
+     * dynvec_push doubles on demand. */
+    scan_clear();
+    dynvec_init(&s_portals,        sizeof(parsed_portal_file_t), 8);
+    dynvec_init(&s_passwords,      sizeof(parsed_password_t),    8);
+    dynvec_init(&s_wardrive_logs,  sizeof(parsed_portal_file_t), 8);
+    dynvec_init(&s_probes,         sizeof(parsed_probe_t),       8);
+    dynvec_init(&s_probes_build,   sizeof(parsed_probe_t),       8);
+    dynvec_init(&s_subghz_signals, sizeof(subghz_signal_t),      8);
+    dynvec_init(&s_subghz_build,   sizeof(subghz_signal_t),      8);
+    dynvec_init(&s_arp_hosts,      sizeof(arp_host_t),           8);
+    reset_sniffer_build();
 
     uart_bridge_register_line_cb(on_uart_line, NULL);
     ESP_LOGI(TAG, "Command handler initialized");
@@ -1204,16 +1351,26 @@ const scan_results_t *cmd_get_scan_results(void)
 
 int cmd_get_portal_files(parsed_portal_file_t *out, int max)
 {
-    int n = s_portal_count < max ? s_portal_count : max;
-    memcpy(out, s_portals, n * sizeof(parsed_portal_file_t));
+    int n = (int)s_portals.count < max ? (int)s_portals.count : max;
+    if (n > 0 && out) memcpy(out, s_portals.data, n * sizeof(parsed_portal_file_t));
     return n;
+}
+
+int cmd_get_portal_files_count(void)
+{
+    return (int)s_portals.count;
 }
 
 int cmd_get_passwords(parsed_password_t *out, int max)
 {
-    int n = s_password_count < max ? s_password_count : max;
-    memcpy(out, s_passwords, n * sizeof(parsed_password_t));
+    int n = (int)s_passwords.count < max ? (int)s_passwords.count : max;
+    if (n > 0 && out) memcpy(out, s_passwords.data, n * sizeof(parsed_password_t));
     return n;
+}
+
+int cmd_get_passwords_count(void)
+{
+    return (int)s_passwords.count;
 }
 
 const sniffer_results_t *cmd_get_sniffer_results(void)
@@ -1295,8 +1452,7 @@ static bool set_state_if_idle(cmd_state_t new_state)
 bool cmd_do_scan(void)
 {
     if (!set_state_if_idle(STATE_SCANNING)) return false;
-    s_scan.count = 0;
-    s_scan.scan_complete = false;
+    scan_clear();
     s_scan_expected = -1;
     if (s_display_cb) s_display_cb("scan_networks", NULL);
     uart_bridge_send("scan_networks");
@@ -1378,7 +1534,7 @@ bool cmd_do_handshake(void)
 bool cmd_do_sniffer(void)
 {
     if (!set_state_if_idle(STATE_ATTACK_SNIFFER)) return false;
-    memset(&s_sniffer, 0, sizeof(s_sniffer));
+    sniffer_results_clear(&s_sniffer);
     reset_sniffer_build();
     s_sniffer_collecting = false;
     if (s_display_cb) s_display_cb("start_sniffer", NULL);
@@ -1390,7 +1546,7 @@ bool cmd_do_sniffer(void)
 bool cmd_do_sniffer_noscan(void)
 {
     if (!set_state_if_idle(STATE_ATTACK_SNIFFER)) return false;
-    memset(&s_sniffer, 0, sizeof(s_sniffer));
+    sniffer_results_clear(&s_sniffer);
     reset_sniffer_build();
     s_sniffer_collecting = false;
     if (s_display_cb) s_display_cb("start_sniffer_noscan", NULL);
@@ -1424,7 +1580,7 @@ bool cmd_do_list_probes(void)
     s_state = STATE_LISTING_PROBES;
     xSemaphoreGive(s_mutex);
 
-    s_probes_build_count = 0;
+    dynvec_clear(&s_probes_build);
     if (s_display_cb) s_display_cb("list_probes", NULL);
     uart_bridge_send("list_probes");
     return true;
@@ -1597,7 +1753,7 @@ bool cmd_do_stop(void)
 bool cmd_do_list_portals(void)
 {
     if (!set_state_if_idle(STATE_LISTING_PORTALS)) return false;
-    s_portal_count = 0;
+    dynvec_clear(&s_portals);
     s_portal_header_seen = false;
     if (s_display_cb) s_display_cb("list_sd", NULL);
     uart_bridge_send("list_sd");
@@ -1618,7 +1774,7 @@ bool cmd_do_select_portal(int index)
 bool cmd_do_list_passwords(void)
 {
     if (!set_state_if_idle(STATE_LISTING_PASSWORDS)) return false;
-    s_password_count = 0;
+    dynvec_clear(&s_passwords);
     s_passwords_echo_seen = false;
     if (s_display_cb) s_display_cb("show_pass evil", NULL);
     uart_bridge_send("show_pass evil");
@@ -1669,7 +1825,7 @@ bool cmd_do_list_handshake_count(void)
 bool cmd_do_list_wardrive_logs(void)
 {
     if (!set_state_if_idle(STATE_LISTING_WARDRIVE)) return false;
-    s_wardrive_count = 0;
+    dynvec_clear(&s_wardrive_logs);
     if (s_display_cb) s_display_cb("list_dir /sdcard/lab/wardrives", NULL);
     uart_bridge_send("list_dir /sdcard/lab/wardrives");
     return true;
@@ -1712,26 +1868,41 @@ const char *cmd_get_sta_ssid(void)
 
 int cmd_get_wardrive_logs(parsed_portal_file_t *out, int max)
 {
-    int n = s_wardrive_count < max ? s_wardrive_count : max;
-    memcpy(out, s_wardrive_logs, n * sizeof(parsed_portal_file_t));
+    int n = (int)s_wardrive_logs.count < max ? (int)s_wardrive_logs.count : max;
+    if (n > 0 && out) memcpy(out, s_wardrive_logs.data, n * sizeof(parsed_portal_file_t));
     return n;
+}
+
+int cmd_get_wardrive_logs_count(void)
+{
+    return (int)s_wardrive_logs.count;
 }
 
 int cmd_get_probes(parsed_probe_t *out, int max)
 {
-    int n = s_probe_count < max ? s_probe_count : max;
-    memcpy(out, s_probes, n * sizeof(parsed_probe_t));
+    int n = (int)s_probes.count < max ? (int)s_probes.count : max;
+    if (n > 0 && out) memcpy(out, s_probes.data, n * sizeof(parsed_probe_t));
     return n;
+}
+
+int cmd_get_probes_count(void)
+{
+    return (int)s_probes.count;
 }
 
 int cmd_get_arp_hosts(arp_host_t *out, int max)
 {
     if (!out || max <= 0) return 0;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
-    int n = s_arp_hosts ? (s_arp_host_count < max ? s_arp_host_count : max) : 0;
-    if (n > 0) memcpy(out, s_arp_hosts, n * sizeof(arp_host_t));
+    int n = (int)s_arp_hosts.count < max ? (int)s_arp_hosts.count : max;
+    if (n > 0) memcpy(out, s_arp_hosts.data, n * sizeof(arp_host_t));
     xSemaphoreGive(s_mutex);
     return n;
+}
+
+int cmd_get_arp_hosts_count(void)
+{
+    return (int)s_arp_hosts.count;
 }
 
 uint32_t cmd_get_arp_hosts_at_ms(void)
@@ -1805,7 +1976,7 @@ bool cmd_do_subghz_clear(void)
 {
     if (s_display_cb) s_display_cb("subghz_clear", NULL);
     uart_bridge_send("subghz_clear");
-    s_subghz_count = 0;
+    dynvec_clear(&s_subghz_signals);
     return true;
 }
 
@@ -1852,7 +2023,7 @@ bool cmd_do_subghz_list_refresh(void)
         return false;
     }
 
-    s_subghz_build_count = 0;
+    dynvec_clear(&s_subghz_build);
     if (s_display_cb) s_display_cb("subghz_list", NULL);
     uart_bridge_send("subghz_list");
     return true;
@@ -1860,12 +2031,12 @@ bool cmd_do_subghz_list_refresh(void)
 
 int cmd_get_subghz_signals(subghz_signal_t *out, int max)
 {
-    int n = s_subghz_count < max ? s_subghz_count : max;
-    memcpy(out, s_subghz_signals, n * sizeof(subghz_signal_t));
+    int n = (int)s_subghz_signals.count < max ? (int)s_subghz_signals.count : max;
+    if (n > 0 && out) memcpy(out, s_subghz_signals.data, n * sizeof(subghz_signal_t));
     return n;
 }
 
 int cmd_get_subghz_count(void)
 {
-    return s_subghz_count;
+    return (int)s_subghz_signals.count;
 }

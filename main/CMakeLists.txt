@@ -6,6 +6,7 @@ set(srcs
     "command_handler.c"
     "response_parser.c"
     "display.c"
+    "dynvec.c"
 )
 
 idf_component_register(
