@@ -815,6 +815,52 @@ static esp_err_t api_arp_hosts_get(httpd_req_t *req)
     return cw_finish(&cw);
 }
 
+static esp_err_t api_nmap_results_get(httpd_req_t *req)
+{
+    nmap_state_t st;
+    cmd_get_nmap_state(&st);
+
+    int n = cmd_get_nmap_hosts_count();
+    nmap_host_t *hosts = NULL;
+    if (n > 0) {
+        hosts = psram_malloc((size_t)n * sizeof(*hosts));
+        if (!hosts) {
+            send_json(req, "{\"ok\":false,\"error\":\"oom\"}");
+            return ESP_OK;
+        }
+        n = cmd_get_nmap_hosts(hosts, n);
+    }
+
+    chunked_writer_t cw;
+    cw_init(&cw, req);
+    cw_printf(&cw,
+        "{\"ok\":true,\"at\":%u,\"level\":\"%s\",\"total_hosts\":%d,"
+        "\"open_ports\":%d,\"done\":%s,\"scanning\":\"%s\","
+        "\"port_current\":%d,\"port_total\":%d,\"count\":%d,\"hosts\":[",
+        (unsigned)st.at_ms, st.level, st.total_hosts,
+        st.open_ports, st.done ? "true" : "false", st.scanning_ip,
+        st.port_current, st.port_total, n);
+    for (int i = 0; i < n; i++) {
+        cw_printf(&cw,
+            "%s{\"ip\":\"%s\",\"mac\":\"%s\",\"done\":%s,"
+            "\"no_open_ports\":%s,\"ports\":[",
+            i > 0 ? "," : "",
+            hosts[i].ip, hosts[i].mac,
+            hosts[i].done ? "true" : "false",
+            hosts[i].no_open_ports ? "true" : "false");
+        for (int p = 0; p < hosts[i].port_count; p++) {
+            cw_printf(&cw, "%s{\"port\":%d,\"service\":\"%s\"}",
+                      p > 0 ? "," : "",
+                      hosts[i].ports[p].port,
+                      hosts[i].ports[p].service);
+        }
+        cw_printf(&cw, "]}");
+    }
+    cw_printf(&cw, "]}");
+    free(hosts);
+    return cw_finish(&cw);
+}
+
 static esp_err_t api_status_get(httpd_req_t *req)
 {
     const char *sta_ssid = cmd_get_sta_ssid();
@@ -1247,6 +1293,7 @@ esp_err_t web_server_start(void)
     REGISTER_URI("/api/probes",          HTTP_GET,  api_probes_get);
     REGISTER_URI("/api/probes",          HTTP_POST, api_probes_refresh_post);
     REGISTER_URI("/api/arp/hosts",       HTTP_GET,  api_arp_hosts_get);
+    REGISTER_URI("/api/nmap/results",    HTTP_GET,  api_nmap_results_get);
     REGISTER_URI("/api/status",        HTTP_GET,  api_status_get);
     REGISTER_URI("/api/dashboard",     HTTP_GET,  api_dashboard_get);
     REGISTER_URI("/api/subghz/list",   HTTP_GET,  api_subghz_list_get);

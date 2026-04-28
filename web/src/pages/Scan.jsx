@@ -11,6 +11,8 @@ let pollTimer = null;
 let pollTimeout = null;
 let arpPollTimer = null;
 let arpPollInFlight = false;
+let nmapPollTimer = null;
+let nmapPollInFlight = false;
 
 function stopArpPolling() {
   if (arpPollTimer) {
@@ -42,6 +44,21 @@ function startArpPolling() {
    * back into the monitor after a reload). */
   fetchArpHosts();
   arpPollTimer = setInterval(fetchArpHosts, 1500);
+}
+
+/* Nmap polling. The on-device cache (`/api/nmap/results`) is the source of
+ * truth: heavy scans take minutes during which the softAP channel hops to
+ * track the STA, and the WS to the phone routinely drops mid-scan. With
+ * polling the UI reconverges as soon as the WS comes back and never
+ * silently misses a discovery. The component installs/uninstalls the
+ * polling fetch via the helpers below; the timer is module-scoped so the
+ * teardown hook can stop it even if the component unmounts mid-tick. */
+function stopNmapPolling() {
+  if (nmapPollTimer) {
+    clearInterval(nmapPollTimer);
+    nmapPollTimer = null;
+  }
+  nmapPollInFlight = false;
 }
 
 const ATTACK_OPTIONS = [
@@ -99,13 +116,24 @@ export function Scan() {
   const [arpBanBusy, setArpBanBusy] = useState(false);
   const [nmapRows, setNmapRows] = useState([]);
   const [nmapLevel, setNmapLevel] = useState('quick');
-  const [nmapTargetIp, setNmapTargetIp] = useState('');
+  const [nmapStats, setNmapStats] = useState({
+    level: '',
+    totalHosts: 0,
+    scanningHost: '',
+    portTotal: 0,
+    portCurrent: 0,
+    summary: '',
+    done: false,
+  });
+  const [nmapSetupOpen, setNmapSetupOpen] = useState(false);
+  const [nmapSetupBusy, setNmapSetupBusy] = useState(false);
+  const [nmapSetupError, setNmapSetupError] = useState('');
 
   const pendingRef = useRef(null);
   const connectOutcomeRef = useRef(null);
   const monitorAttackRef = useRef('');
   const monitorOpenRef = useRef(false);
-  const currentNmapHostRef = useRef('');
+  const nmapDiscoveryActiveRef = useRef(false);
 
   const st = getState();
   const scanning = st.status === 'scanning' || st.status === 'scan';
@@ -140,6 +168,12 @@ export function Scan() {
            * long as the monitor is still open in case the user re-runs. */
           fetchArpHosts();
         }
+        if (nmapDiscoveryActiveRef.current) {
+          /* list_hosts finished while the nmap setup popup is open. Flip
+           * out of busy so the user can pick a target (or ALL). */
+          fetchArpHosts();
+          setNmapSetupBusy(false);
+        }
       }
 
       if (msg.type === 'wifi_connecting') {
@@ -163,6 +197,14 @@ export function Scan() {
       if (msg.type === 'uart_line' && msg.data) {
         pushLine(msg.data);
         pushMonitorLine(msg.data);
+      }
+
+      if (msg.type === 'nmap_results') {
+        /* Instant update from the device-side incremental broadcast. The
+         * polling fetch is the safety net for when this event is dropped
+         * (which routinely happens during heavy scans because the softAP
+         * channel hops to track the STA). */
+        applyNmapResults(msg);
       }
 
       if (msg.type === 'scan_complete') {
@@ -189,6 +231,7 @@ export function Scan() {
     return () => {
       stopPolling();
       stopArpPolling();
+      stopNmapPolling();
       removeWs();
     };
   }, []);
@@ -202,7 +245,6 @@ export function Scan() {
   function openMonitor(nextAttack, title) {
     monitorOpenRef.current = true;
     monitorAttackRef.current = nextAttack;
-    currentNmapHostRef.current = '';
     setMonitorOpen(true);
     setMonitorAttack(nextAttack);
     setMonitorTitle(title || 'Attack Monitor');
@@ -219,14 +261,149 @@ export function Scan() {
     setArpBanTarget(null);
     setArpBanBusy(false);
     setNmapRows([]);
+    setNmapStats({
+      level: '',
+      totalHosts: 0,
+      scanningHost: '',
+      portTotal: 0,
+      portCurrent: 0,
+      summary: '',
+      done: false,
+    });
   }
 
   function closeMonitor() {
     monitorOpenRef.current = false;
     monitorAttackRef.current = '';
-    currentNmapHostRef.current = '';
     setMonitorOpen(false);
     stopArpPolling();
+    stopNmapPolling();
+  }
+
+  function openNmapSetup() {
+    /* Discover hosts on the LAN before launching the scan: this mirrors the
+     * ARP attack flow and lets the user pick a single target (or ALL = full
+     * subnet). We rely on api.arp() to send `list_hosts`, which populates
+     * `arpHosts` in the global store via the WS `arp_hosts` event (with a
+     * polling fallback). */
+    nmapDiscoveryActiveRef.current = true;
+    clearArpHosts();
+    setNmapSetupError('');
+    setNmapSetupBusy(true);
+    setNmapSetupOpen(true);
+    startArpPolling();
+
+    return api.arp().then((res) => {
+      if (!res?.ok) {
+        setNmapSetupBusy(false);
+        setNmapSetupError(res?.error || 'list_hosts rejected');
+      }
+      return res;
+    }).catch(() => {
+      setNmapSetupBusy(false);
+      setNmapSetupError('list_hosts request failed');
+      return { ok: false };
+    });
+  }
+
+  function closeNmapSetup() {
+    nmapDiscoveryActiveRef.current = false;
+    setNmapSetupOpen(false);
+    setNmapSetupBusy(false);
+    stopArpPolling();
+  }
+
+  async function pickNmapTarget(targetIp) {
+    /* targetIp = '' → ALL (entire subnet). The C handler treats an empty
+     * IP as "no host argument" → JanOS scans the whole subnet. */
+    nmapDiscoveryActiveRef.current = false;
+    setNmapSetupOpen(false);
+    setNmapSetupBusy(false);
+    stopArpPolling();
+
+    openMonitor('nmap', `Nmap Serial`);
+    setNmapStats((s) => ({ ...s, level: nmapLevel }));
+    pushMonitorLine(
+      `Starting start_nmap ${nmapLevel}${targetIp ? ` ${targetIp}` : ''} ` +
+      `(${targetIp ? `single host ${targetIp}` : 'whole subnet'})...`
+    );
+
+    /* Start polling the device-side nmap cache (`/api/nmap/results`).
+     * Heavy scans drop the WS for tens of seconds at a time, so we treat
+     * the polled snapshot as the source of truth for the results table. */
+    startNmapPolling();
+
+    const res = await api.nmap(nmapLevel, targetIp);
+    if (res?.ok) {
+      setAttackLive(true);
+      showToast(`nmap ${nmapLevel} started`, 'success');
+    } else {
+      pushMonitorLine(`Error: ${res?.error || 'nmap rejected'}`);
+      showToast(res?.error || 'nmap failed', 'error');
+      stopNmapPolling();
+    }
+  }
+
+  function applyNmapResults(payload) {
+    if (!payload) return;
+    /* `count === 0` happens when the device has just been booted (or right
+     * after `cmd_do_nmap` reset the cache and before the first port-scan
+     * line came back) -- we still need to push the scan-level state in
+     * (level, total_hosts, scanning, port progress) so the badges update. */
+    setNmapRows(
+      Array.isArray(payload.hosts)
+        ? payload.hosts.map((h) => ({
+            ip: h.ip,
+            mac: h.mac || '',
+            done: !!h.done,
+            scanning: !h.done && h.ip === payload.scanning,
+            noOpenPorts: !!h.no_open_ports,
+            ports: Array.isArray(h.ports)
+              ? h.ports.map((p) => ({ port: p.port, service: p.service || '' }))
+              : [],
+          }))
+        : []
+    );
+    setNmapStats((prev) => ({
+      ...prev,
+      level: payload.level || prev.level,
+      totalHosts: payload.total_hosts || prev.totalHosts,
+      scanningHost: payload.scanning || '',
+      portCurrent: payload.port_current || 0,
+      portTotal: payload.port_total || prev.portTotal,
+      done: !!payload.done,
+      summary: payload.done
+        ? `Scanned ${payload.total_hosts || (payload.hosts || []).length} ` +
+          `host${(payload.total_hosts || 0) === 1 ? '' : 's'}, ` +
+          `${payload.open_ports || 0} open port` +
+          `${(payload.open_ports || 0) === 1 ? '' : 's'}`
+        : prev.summary,
+    }));
+
+    /* Once the device reports completion we can stop polling -- there
+     * won't be any more updates for this scan. */
+    if (payload.done) {
+      stopNmapPolling();
+    }
+  }
+
+  async function fetchNmapResults() {
+    if (nmapPollInFlight) return;
+    nmapPollInFlight = true;
+    try {
+      const res = await api.nmapResults();
+      if (res?.ok) applyNmapResults(res);
+    } catch (e) {
+      /* transient WS/HTTP failure -- next tick will retry */
+    } finally {
+      nmapPollInFlight = false;
+    }
+  }
+
+  function startNmapPolling() {
+    if (nmapPollTimer) return;
+    fetchNmapResults();
+    nmapPollTimer = setInterval(fetchNmapResults, 1500);
   }
 
   async function banArpHost(host) {
@@ -250,49 +427,6 @@ export function Scan() {
    * captured even if the Scan monitor isn't open (or if the user is on
    * another page). The Scan ARP panel reads from `getState().arpHosts`. */
 
-  function upsertNmapHost(ip, mac) {
-    setNmapRows((prev) => {
-      const idx = prev.findIndex((row) => row.ip === ip);
-      if (idx >= 0) {
-        const next = [...prev];
-        next[idx] = { ...next[idx], mac: mac || next[idx].mac };
-        return next;
-      }
-      return [...prev, { ip, mac: mac || 'MAC unknown', ports: [] }];
-    });
-  }
-
-  function addNmapPort(ip, port, service) {
-    setNmapRows((prev) => {
-      const idx = prev.findIndex((row) => row.ip === ip);
-      if (idx < 0) return prev;
-      const exists = prev[idx].ports.some((p) => p.port === port);
-      if (exists) return prev;
-      const next = [...prev];
-      next[idx] = {
-        ...next[idx],
-        ports: [...next[idx].ports, { port, service }],
-      };
-      return next;
-    });
-  }
-
-  function parseNmapLine(line) {
-    const host = line.match(/^Host:\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})\s+\(([^)]+)\)\s*$/i);
-    if (host) {
-      const ip = host[1];
-      const mac = host[2];
-      currentNmapHostRef.current = ip;
-      upsertNmapHost(ip, mac);
-      return;
-    }
-
-    const port = line.match(/^\s*(\d+)\/tcp\s+open\s+([A-Za-z0-9_.-]+)\s*$/i);
-    if (port && currentNmapHostRef.current) {
-      addNmapPort(currentNmapHostRef.current, Number(port[1]), port[2]);
-    }
-  }
-
   function pushMonitorLine(text) {
     if (!monitorOpenRef.current) return;
     const trimmed = String(text || '').trim();
@@ -300,11 +434,13 @@ export function Scan() {
 
     setMonitorLines((prev) => [...prev, trimmed].slice(-240));
 
-    if (monitorAttackRef.current === 'nmap') {
-      parseNmapLine(trimmed);
-    }
-    /* ARP host parsing is global (see app.jsx wsAddListener) so it works
-     * whether or not the monitor is open. */
+    /* Nmap results are populated by `applyNmapResults` from the
+     * polled `/api/nmap/results` snapshot (and the structured
+     * `nmap_results` WS event when the WS is up); we don't parse the raw
+     * UART lines here because the device-side cache already does that
+     * and survives the WS dropping mid-scan. ARP host parsing is global
+     * (see app.jsx wsAddListener) so it works whether or not the monitor
+     * is open. */
   }
 
   function pickStrongestSelectedNetwork(selectedIndices) {
@@ -357,12 +493,19 @@ export function Scan() {
   }
 
   async function runAttackWithMonitor(attackId, label, runner) {
-    openMonitor(attackId, `${label} Serial`);
+    /* Nmap opens its own setup popup (host picker + mode picker) before the
+     * real scan starts, so we deliberately don't open the standard monitor
+     * here -- it would stack on top of the setup overlay. */
+    if (attackId !== 'nmap') {
+      openMonitor(attackId, `${label} Serial`);
+    }
     const res = await runner();
     if (res.ok) {
-      showToast(`${attackId} started`, 'success');
-      setAttackLive(true);
-      pushLine(`${attackId} started`);
+      if (attackId !== 'nmap') {
+        showToast(`${attackId} started`, 'success');
+        setAttackLive(true);
+        pushLine(`${attackId} started`);
+      }
       if (attackId === 'sniffer') route('/sniffer');
     } else {
       pushMonitorLine(`Error: ${res.error || 'failed to start attack'}`);
@@ -427,8 +570,11 @@ export function Scan() {
 
     /* Don't clobber an already-open monitor (e.g. one we opened earlier
      * during the show_pass evil lookup) -- otherwise the breadcrumb log
-     * the user is watching disappears the moment we connect. */
-    if (!monitorOpenRef.current || monitorAttackRef.current !== pending.id) {
+     * the user is watching disappears the moment we connect.
+     * Nmap is special: it opens a setup popup (not the streaming monitor)
+     * after WiFi connects, so we don't open the monitor here for it. */
+    if (pending.id !== 'nmap' &&
+        (!monitorOpenRef.current || monitorAttackRef.current !== pending.id)) {
       openMonitor(pending.id, `${pending.label} Serial`);
     }
     pushMonitorLine(`Connecting to ${pending.target.ssid}...`);
@@ -461,8 +607,13 @@ export function Scan() {
     pendingRef.current = null;
 
     if (runRes.ok) {
-      setAttackLive(true);
-      showToast(`${pending.id} started`, 'success');
+      /* Nmap reports "started" later (in pickNmapTarget) once the user has
+       * picked a host and the actual `start_nmap` command has fired. Don't
+       * mislead them by claiming nmap is live just because list_hosts ran. */
+      if (pending.id !== 'nmap') {
+        setAttackLive(true);
+        showToast(`${pending.id} started`, 'success');
+      }
     } else {
       pushMonitorLine(`Attack start failed: ${runRes.error || 'unknown error'}`);
       showToast(runRes.error || 'Failed to start attack', 'error');
@@ -536,7 +687,11 @@ export function Scan() {
       sae: api.sae,
       sniffer: api.sniffer,
       mitm: api.mitm,
-      nmap: () => api.nmap(nmapLevel, nmapTargetIp.trim()),
+      /* Nmap is two-phase: first discover hosts, then ask the user to pick
+       * a target (or ALL = whole subnet) and a profile, then send
+       * `start_nmap [level] [IP]`. The "runner" here just opens the setup
+       * popup; the actual `api.nmap()` call happens in `pickNmapTarget`. */
+      nmap: async () => openNmapSetup(),
       arp: api.arp,
     }[attack];
 
@@ -672,26 +827,9 @@ export function Scan() {
           ))}
         </div>
         {attack === 'nmap' ? (
-          <div class="field">
-            <label class="field-label">Nmap Profile</label>
-            <div class="attack-picker">
-              {NMAP_LEVELS.map((level) => (
-                <button
-                  key={level}
-                  class={`attack-chip ${nmapLevel === level ? 'active' : ''}`}
-                  onClick={() => setNmapLevel(level)}
-                >
-                  {level}
-                </button>
-              ))}
-            </div>
-            <input
-              class="input"
-              value={nmapTargetIp}
-              onInput={(e) => setNmapTargetIp(e.target.value)}
-              placeholder="Optional host IP (e.g. 192.168.1.10)"
-              inputMode="decimal"
-            />
+          <div class="alert info">
+            After launch you'll pick a profile (quick / medium / heavy) and a host
+            (or ALL = full subnet) once host discovery finishes.
           </div>
         ) : null}
         <button class="btn btn-primary" onClick={launchAttack} disabled={!st.selected.size || scanning}>
@@ -806,35 +944,63 @@ export function Scan() {
             ) : null}
 
             {monitorAttack === 'nmap' ? (
-              <div class="table-wrap">
-                <table class="table">
-                  <thead>
-                    <tr>
-                      <th>Host</th>
-                      <th>MAC</th>
-                      <th>Open Ports</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {!nmapRows.length ? (
-                      <tr>
-                        <td colSpan={3}>No hosts detected yet</td>
-                      </tr>
-                    ) : (
-                      nmapRows.map((row) => (
-                        <tr key={row.ip}>
-                          <td>{row.ip}</td>
-                          <td>{row.mac}</td>
-                          <td>
-                            {row.ports.length
-                              ? row.ports.map((p) => `${p.port}/${p.service}`).join(', ')
-                              : '-'}
-                          </td>
-                        </tr>
-                      ))
-                    )}
-                  </tbody>
-                </table>
+              <div class="nmap-results">
+                <div class="nmap-summary">
+                  {nmapStats.level ? (
+                    <span class="badge info">profile: {nmapStats.level}</span>
+                  ) : null}
+                  {nmapStats.totalHosts ? (
+                    <span class="badge">hosts: {nmapStats.totalHosts}</span>
+                  ) : null}
+                  {nmapStats.scanningHost ? (
+                    <span class="badge ok">
+                      <span class="spinner" /> {nmapStats.scanningHost}
+                      {nmapStats.portTotal
+                        ? ` (${nmapStats.portCurrent}/${nmapStats.portTotal})`
+                        : ''}
+                    </span>
+                  ) : null}
+                  {nmapStats.done && nmapStats.summary ? (
+                    <span class="badge ok">{nmapStats.summary}</span>
+                  ) : null}
+                </div>
+                {!nmapRows.length ? (
+                  <div class="empty-state">
+                    {nmapStats.done ? 'No hosts found.' : 'Waiting for hosts...'}
+                  </div>
+                ) : (
+                  <div class="nmap-host-grid">
+                    {nmapRows.map((row) => (
+                      <div
+                        key={row.ip}
+                        class={`nmap-host-card ${row.scanning ? 'scanning' : ''} ${row.done ? 'done' : ''}`}
+                      >
+                        <div class="nmap-host-head">
+                          <strong>{row.ip}</strong>
+                          {row.scanning ? <span class="spinner" /> : null}
+                          {row.done && !row.scanning ? (
+                            <span class="badge ok">done</span>
+                          ) : null}
+                        </div>
+                        <div class="nmap-host-mac">{row.mac || 'MAC unknown'}</div>
+                        {row.ports.length ? (
+                          <div class="nmap-port-row">
+                            {row.ports.map((p) => (
+                              <span class="nmap-port-chip" key={p.port} title={p.service}>
+                                <strong>{p.port}</strong>
+                                <span class="nmap-port-svc">{p.service}</span>
+                              </span>
+                            ))}
+                          </div>
+                        ) : row.noOpenPorts ? (
+                          <div class="nmap-host-empty">No open ports</div>
+                        ) : (
+                          <div class="nmap-host-empty">Scanning...</div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             ) : null}
 
@@ -844,6 +1010,83 @@ export function Scan() {
               </button>
               <button class="btn btn-secondary" onClick={closeMonitor}>
                 Close
+              </button>
+            </div>
+          </section>
+        </div>
+      ) : null}
+
+      {nmapSetupOpen ? (
+        <div class="scan-modal-overlay">
+          <section class="glass-card scan-modal scan-modal-compact">
+            <div class="scan-modal-head">
+              <h3 class="section-title">Nmap Setup</h3>
+              <span class={`badge ${nmapSetupBusy ? '' : 'ok'}`}>
+                {nmapSetupBusy ? 'Discovering hosts...' : `${arpRows.length} host${arpRows.length === 1 ? '' : 's'}`}
+              </span>
+            </div>
+
+            <div class="field">
+              <label class="field-label">Profile</label>
+              <div class="attack-picker">
+                {NMAP_LEVELS.map((level) => (
+                  <button
+                    key={level}
+                    class={`attack-chip ${nmapLevel === level ? 'active' : ''}`}
+                    onClick={() => setNmapLevel(level)}
+                  >
+                    {level}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div class="field">
+              <label class="field-label">Target</label>
+              {nmapSetupBusy && !arpRows.length ? (
+                <div class="empty-state">
+                  <span class="spinner" /> Running list_hosts...
+                </div>
+              ) : null}
+
+              {nmapSetupError ? (
+                <div class="alert warn">{nmapSetupError}</div>
+              ) : null}
+
+              <div class="attack-picker">
+                <button
+                  class="attack-chip"
+                  onClick={() => pickNmapTarget('')}
+                  title="Scan whole subnet (no IP arg)"
+                >
+                  <strong>ALL</strong>
+                  <span class="chip-mini">whole subnet</span>
+                </button>
+                {arpRows.map((row) => (
+                  <button
+                    key={`${row.ip}-${row.mac}`}
+                    class="attack-chip"
+                    onClick={() => pickNmapTarget(row.ip)}
+                    title={`start_nmap ${nmapLevel} ${row.ip}`}
+                  >
+                    <strong>{row.ip}</strong>
+                    <span class="chip-mini">{row.mac || 'icmp'}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div class="btn-row">
+              <button class="btn btn-secondary" onClick={closeNmapSetup}>
+                Cancel
+              </button>
+              <button
+                class="btn btn-info"
+                disabled={nmapSetupBusy}
+                onClick={() => openNmapSetup()}
+                title="Re-run list_hosts"
+              >
+                Rediscover
               </button>
             </div>
           </section>

@@ -1272,6 +1272,101 @@ button {
   color: var(--text-muted);
 }
 
+.nmap-results {
+  display: grid;
+  gap: 10px;
+}
+
+.nmap-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.nmap-summary .spinner {
+  width: 10px;
+  height: 10px;
+  margin-right: 4px;
+  vertical-align: middle;
+}
+
+.nmap-host-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 8px;
+  max-height: 38vh;
+  overflow-y: auto;
+}
+
+.nmap-host-card {
+  border-radius: 12px;
+  border: 1px solid var(--border-soft);
+  background: rgba(18, 24, 33, 0.7);
+  padding: 10px;
+  display: grid;
+  gap: 6px;
+}
+
+.nmap-host-card.scanning {
+  border-color: rgba(255, 46, 136, 0.46);
+  background: rgba(255, 46, 136, 0.08);
+}
+
+.nmap-host-card.done {
+  border-color: rgba(78, 222, 128, 0.4);
+}
+
+.nmap-host-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--text-primary);
+}
+
+.nmap-host-mac {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.nmap-port-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.nmap-port-chip {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  padding: 3px 7px;
+  border-radius: 999px;
+  background: rgba(78, 222, 128, 0.15);
+  border: 1px solid rgba(78, 222, 128, 0.4);
+  font-size: 11px;
+  color: #c8f7d8;
+}
+
+.nmap-port-chip strong {
+  color: #4ede80;
+  font-weight: 700;
+}
+
+.nmap-port-svc {
+  color: var(--text-secondary);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.nmap-host-empty {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-style: italic;
+}
+
 .toast {
   border-radius: 14px;
   border: 1px solid var(--border-soft);

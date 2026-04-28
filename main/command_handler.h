@@ -10,6 +10,33 @@ typedef struct {
     bool icmp_only;
 } arp_host_t;
 
+#define NMAP_MAX_PORTS_PER_HOST 64
+
+typedef struct {
+    int  port;
+    char service[16];
+} nmap_port_t;
+
+typedef struct {
+    char        ip[16];
+    char        mac[18];
+    bool        no_open_ports;
+    bool        done;
+    int         port_count;
+    nmap_port_t ports[NMAP_MAX_PORTS_PER_HOST];
+} nmap_host_t;
+
+typedef struct {
+    char     level[16];
+    int      total_hosts;     /* from "Total: N hosts discovered" or "Scanning N host(s)" */
+    int      open_ports;      /* from final "Scanned X hosts, found Y open ports" */
+    bool     done;
+    char     scanning_ip[16]; /* host currently being probed */
+    int      port_current;
+    int      port_total;
+    uint32_t at_ms;           /* monotonic timestamp of last update */
+} nmap_state_t;
+
 typedef enum {
     STATE_IDLE = 0,
     STATE_SCANNING,
@@ -219,6 +246,14 @@ int cmd_get_arp_hosts_count(void);
 
 /** Monotonic timestamp (ms) when the last ARP host scan completed. 0 if none. */
 uint32_t cmd_get_arp_hosts_at_ms(void);
+
+/** Get cached Nmap results. Returns count of hosts copied (capped at `max`). */
+int cmd_get_nmap_hosts(nmap_host_t *out, int max);
+int cmd_get_nmap_hosts_count(void);
+
+/** Snapshot the scan-level Nmap state (level, total hosts, currently-scanning IP,
+ *  port progress, completion flag, last-update timestamp). */
+void cmd_get_nmap_state(nmap_state_t *out);
 
 /* ---------- Sub-GHz commands ---------- */
 

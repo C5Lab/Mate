@@ -89,6 +89,17 @@ static dynvec_t             s_arp_hosts;      /* arp_host_t */
 static uint32_t             s_arp_hosts_at_ms = 0;
 static bool                 s_arp_hosts_in_block = false;
 
+/* Nmap results cache. Same rationale as the ARP cache: heavy `start_nmap`
+ * runs can take minutes, during which the softAP channel hops to track the
+ * STA's channel and the WS to the phone routinely drops. The phone polls
+ * `/api/nmap/results` against this cache so per-port discoveries survive
+ * WS reconnects. State-independent because the FSM flips back to IDLE on
+ * the very first prompt echo (`> start_nmap`). */
+static dynvec_t             s_nmap_hosts;     /* nmap_host_t */
+static nmap_state_t         s_nmap_state = {0};
+static int                  s_nmap_current_idx = -1; /* index into s_nmap_hosts */
+static bool                 s_nmap_active = false;   /* set by cmd_do_nmap, cleared on completion */
+
 static bool is_prompt_line(const char *line)
 {
     if (!line) return false;
@@ -425,6 +436,331 @@ static void handle_arp_discovery_line(const char *line)
     }
 }
 
+/* ---------- Nmap result cache ---------- */
+
+static void nmap_reset_locked(void)
+{
+    dynvec_clear(&s_nmap_hosts);
+    memset(&s_nmap_state, 0, sizeof(s_nmap_state));
+    s_nmap_current_idx = -1;
+}
+
+static void nmap_reset(void)
+{
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    nmap_reset_locked();
+    xSemaphoreGive(s_mutex);
+}
+
+/* Append a host or update the existing entry that matches `ip`. Returns the
+ * index in s_nmap_hosts (or -1 on OOM). Caller must hold s_mutex. */
+static int nmap_upsert_host_locked(const char *ip, const char *mac)
+{
+    for (size_t i = 0; i < s_nmap_hosts.count; i++) {
+        nmap_host_t *h = (nmap_host_t *)dynvec_at(&s_nmap_hosts, i);
+        if (h && strcmp(h->ip, ip) == 0) {
+            if (mac && mac[0] && strcmp(mac, "MAC unknown") != 0) {
+                strncpy(h->mac, mac, sizeof(h->mac) - 1);
+                h->mac[sizeof(h->mac) - 1] = '\0';
+            }
+            return (int)i;
+        }
+    }
+
+    nmap_host_t fresh = {0};
+    strncpy(fresh.ip, ip, sizeof(fresh.ip) - 1);
+    if (mac && mac[0] && strcmp(mac, "MAC unknown") != 0) {
+        strncpy(fresh.mac, mac, sizeof(fresh.mac) - 1);
+    }
+    if (!dynvec_push(&s_nmap_hosts, &fresh)) {
+        log_drop("nmap_hosts");
+        return -1;
+    }
+    return (int)s_nmap_hosts.count - 1;
+}
+
+static void nmap_add_port_locked(int host_idx, int port, const char *service)
+{
+    if (host_idx < 0 || host_idx >= (int)s_nmap_hosts.count) return;
+    nmap_host_t *h = (nmap_host_t *)dynvec_at(&s_nmap_hosts, (size_t)host_idx);
+    if (!h) return;
+
+    /* Dedup -- the per-port progress lines can re-print earlier batches in
+     * some firmware revs, and a duplicate entry would be confusing in the
+     * UI. */
+    for (int i = 0; i < h->port_count; i++) {
+        if (h->ports[i].port == port) return;
+    }
+    if (h->port_count >= NMAP_MAX_PORTS_PER_HOST) {
+        log_drop("nmap_ports");
+        return;
+    }
+    h->ports[h->port_count].port = port;
+    strncpy(h->ports[h->port_count].service, service ? service : "",
+            sizeof(h->ports[h->port_count].service) - 1);
+    h->ports[h->port_count].service[sizeof(h->ports[h->port_count].service) - 1] = '\0';
+    h->port_count++;
+}
+
+/* Build the JSON payload representing the current nmap snapshot. Allocates
+ * from PSRAM so we can safely emit large payloads (heavy scans with many
+ * open ports) without blowing the uart_rx_task stack. */
+static void broadcast_nmap_results_locked(void)
+{
+    if (!s_ws_broadcast) return;
+
+    const int n = (int)s_nmap_hosts.count;
+    /* ~80 bytes overhead per host + ~32 bytes per port */
+    const size_t cap = 256 + (size_t)n * 96 + (size_t)n * NMAP_MAX_PORTS_PER_HOST * 32;
+    char *json = heap_caps_malloc(cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!json) json = malloc(cap);
+    if (!json) return;
+
+    int pos = snprintf(json, cap,
+        "{\"type\":\"nmap_results\",\"level\":\"%s\",\"total_hosts\":%d,"
+        "\"open_ports\":%d,\"done\":%s,\"scanning\":\"%s\","
+        "\"port_current\":%d,\"port_total\":%d,\"at\":%u,\"hosts\":[",
+        s_nmap_state.level,
+        s_nmap_state.total_hosts,
+        s_nmap_state.open_ports,
+        s_nmap_state.done ? "true" : "false",
+        s_nmap_state.scanning_ip,
+        s_nmap_state.port_current,
+        s_nmap_state.port_total,
+        (unsigned)s_nmap_state.at_ms);
+
+    for (int i = 0; i < n && pos < (int)cap - 96; i++) {
+        const nmap_host_t *h = (const nmap_host_t *)dynvec_at(&s_nmap_hosts, (size_t)i);
+        if (!h) break;
+        pos += snprintf(json + pos, cap - pos,
+            "%s{\"ip\":\"%s\",\"mac\":\"%s\",\"done\":%s,"
+            "\"no_open_ports\":%s,\"ports\":[",
+            i > 0 ? "," : "",
+            h->ip, h->mac,
+            h->done ? "true" : "false",
+            h->no_open_ports ? "true" : "false");
+        for (int p = 0; p < h->port_count && pos < (int)cap - 32; p++) {
+            pos += snprintf(json + pos, cap - pos,
+                "%s{\"port\":%d,\"service\":\"%s\"}",
+                p > 0 ? "," : "",
+                h->ports[p].port, h->ports[p].service);
+        }
+        pos += snprintf(json + pos, cap - pos, "]}");
+    }
+    pos += snprintf(json + pos, cap - pos, "]}");
+    s_ws_broadcast(json, pos);
+    free(json);
+}
+
+static void mark_nmap_dirty_locked(void)
+{
+    s_nmap_state.at_ms = (uint32_t)(esp_timer_get_time() / 1000);
+}
+
+/* State-independent nmap parser. Mirrors the JS parser in Scan.jsx and
+ * keeps a structured cache that the web UI polls via /api/nmap/results. */
+static void handle_nmap_line(const char *line)
+{
+    if (!line) return;
+
+    /* "[MEM] start_nmap: ..." → fresh scan starting (defensive: also
+     * catches resumes where cmd_do_nmap reset didn't happen for some
+     * reason, e.g. the UART line callback fires before the REST handler
+     * returned). */
+    if (strstr(line, "[MEM] start_nmap")) {
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        nmap_reset_locked();
+        s_nmap_active = true;
+        mark_nmap_dirty_locked();
+        xSemaphoreGive(s_mutex);
+        return;
+    }
+
+    if (!s_nmap_active) return;
+
+    /* "Scan level: heavy (100 ports)" */
+    {
+        const char *p = strstr(line, "Scan level:");
+        if (p) {
+            char level[16] = {0};
+            int  ports = 0;
+            if (sscanf(p, "Scan level: %15s (%d ports)", level, &ports) >= 1) {
+                xSemaphoreTake(s_mutex, portMAX_DELAY);
+                strncpy(s_nmap_state.level, level, sizeof(s_nmap_state.level) - 1);
+                if (ports > 0) s_nmap_state.port_total = ports;
+                mark_nmap_dirty_locked();
+                xSemaphoreGive(s_mutex);
+            }
+            return;
+        }
+    }
+
+    /* "Total: 5 hosts discovered (4 ARP + 1 ICMP)" */
+    {
+        const char *p = strstr(line, "Total:");
+        if (p) {
+            int total = 0;
+            if (sscanf(p, "Total: %d hosts discovered", &total) == 1 ||
+                sscanf(p, "Total: %d host discovered",  &total) == 1) {
+                xSemaphoreTake(s_mutex, portMAX_DELAY);
+                s_nmap_state.total_hosts = total;
+                mark_nmap_dirty_locked();
+                broadcast_nmap_results_locked();
+                xSemaphoreGive(s_mutex);
+            }
+            return;
+        }
+    }
+
+    /* "Scanning 5 host(s), 100 ports each (heavy)..." */
+    {
+        const char *p = strstr(line, "Scanning ");
+        if (p && (strstr(p, "host(s),") || strstr(p, "hosts,"))) {
+            int hosts = 0, ports = 0;
+            char level[16] = {0};
+            if (sscanf(p, "Scanning %d host%*[s()], %d ports each (%15[^)])",
+                       &hosts, &ports, level) >= 2) {
+                xSemaphoreTake(s_mutex, portMAX_DELAY);
+                if (hosts > 0)  s_nmap_state.total_hosts = hosts;
+                if (ports > 0)  s_nmap_state.port_total = ports;
+                if (level[0])   strncpy(s_nmap_state.level, level, sizeof(s_nmap_state.level) - 1);
+                mark_nmap_dirty_locked();
+                xSemaphoreGive(s_mutex);
+            }
+            return;
+        }
+    }
+
+    /* "Host: 192.168.0.1  (AC:22:05:84:4F:CC)" or "(MAC unknown)" */
+    {
+        const char *p = strstr(line, "Host: ");
+        if (p) {
+            char ip[16] = {0};
+            char mac[24] = {0};
+            /* Trim trailing CR/LF before sscanf to avoid trailing-junk in mac. */
+            if (sscanf(p, "Host: %15s (%23[^)])", ip, mac) >= 1 && ip[0]) {
+                xSemaphoreTake(s_mutex, portMAX_DELAY);
+                /* Mark the previous host as done now that scanning has
+                 * advanced. */
+                if (s_nmap_current_idx >= 0 &&
+                    s_nmap_current_idx < (int)s_nmap_hosts.count) {
+                    nmap_host_t *prev = (nmap_host_t *)dynvec_at(
+                        &s_nmap_hosts, (size_t)s_nmap_current_idx);
+                    if (prev) prev->done = true;
+                }
+                int idx = nmap_upsert_host_locked(ip, mac);
+                if (idx >= 0) {
+                    s_nmap_current_idx = idx;
+                    strncpy(s_nmap_state.scanning_ip, ip, sizeof(s_nmap_state.scanning_ip) - 1);
+                    s_nmap_state.port_current = 0;
+                }
+                mark_nmap_dirty_locked();
+                broadcast_nmap_results_locked();
+                xSemaphoreGive(s_mutex);
+            }
+            return;
+        }
+    }
+
+    /* "  Scanning 192.168.0.1 ports 21-143 [1/100] ..." */
+    {
+        const char *p = strstr(line, "Scanning ");
+        if (p && strstr(p, "ports ") && strchr(p, '[') && strchr(p, '/')) {
+            char  scan_ip[16] = {0};
+            int   from = 0, to = 0, current = 0, total = 0;
+            if (sscanf(p, "Scanning %15s ports %d-%d [%d/%d]",
+                       scan_ip, &from, &to, &current, &total) >= 5) {
+                xSemaphoreTake(s_mutex, portMAX_DELAY);
+                strncpy(s_nmap_state.scanning_ip, scan_ip, sizeof(s_nmap_state.scanning_ip) - 1);
+                s_nmap_state.port_current = current;
+                if (total > 0) s_nmap_state.port_total = total;
+                mark_nmap_dirty_locked();
+                xSemaphoreGive(s_mutex);
+            }
+            return;
+        }
+    }
+
+    /* "     53/tcp  open  DNS" */
+    {
+        int port = 0;
+        char service[16] = {0};
+        const char *p = line;
+        while (*p == ' ') p++;
+        if (sscanf(p, "%d/tcp open %15s", &port, service) == 2 && port > 0) {
+            xSemaphoreTake(s_mutex, portMAX_DELAY);
+            if (s_nmap_current_idx >= 0) {
+                nmap_add_port_locked(s_nmap_current_idx, port, service);
+            }
+            mark_nmap_dirty_locked();
+            broadcast_nmap_results_locked();
+            xSemaphoreGive(s_mutex);
+            return;
+        }
+    }
+
+    /* "  (no open ports)" */
+    if (strstr(line, "(no open ports)")) {
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        if (s_nmap_current_idx >= 0 &&
+            s_nmap_current_idx < (int)s_nmap_hosts.count) {
+            nmap_host_t *h = (nmap_host_t *)dynvec_at(
+                &s_nmap_hosts, (size_t)s_nmap_current_idx);
+            if (h) h->no_open_ports = true;
+        }
+        mark_nmap_dirty_locked();
+        xSemaphoreGive(s_mutex);
+        return;
+    }
+
+    /* "Scanned 5 hosts, found 2 open ports" */
+    {
+        const char *p = strstr(line, "Scanned ");
+        if (p && strstr(p, "open ports")) {
+            int hosts = 0, ports = 0;
+            if (sscanf(p, "Scanned %d hosts, found %d open ports",
+                       &hosts, &ports) == 2 ||
+                sscanf(p, "Scanned %d host, found %d open ports",
+                       &hosts, &ports) == 2) {
+                xSemaphoreTake(s_mutex, portMAX_DELAY);
+                s_nmap_state.open_ports = ports;
+                if (hosts > 0) s_nmap_state.total_hosts = hosts;
+                s_nmap_state.done = true;
+                s_nmap_state.scanning_ip[0] = '\0';
+                if (s_nmap_current_idx >= 0 &&
+                    s_nmap_current_idx < (int)s_nmap_hosts.count) {
+                    nmap_host_t *h = (nmap_host_t *)dynvec_at(
+                        &s_nmap_hosts, (size_t)s_nmap_current_idx);
+                    if (h) h->done = true;
+                }
+                s_nmap_active = false;
+                mark_nmap_dirty_locked();
+                broadcast_nmap_results_locked();
+                xSemaphoreGive(s_mutex);
+            }
+            return;
+        }
+    }
+
+    /* "(scan stopped by user)" */
+    if (strstr(line, "(scan stopped by user)")) {
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        s_nmap_state.done = true;
+        s_nmap_state.scanning_ip[0] = '\0';
+        if (s_nmap_current_idx >= 0 &&
+            s_nmap_current_idx < (int)s_nmap_hosts.count) {
+            nmap_host_t *h = (nmap_host_t *)dynvec_at(
+                &s_nmap_hosts, (size_t)s_nmap_current_idx);
+            if (h) h->done = true;
+        }
+        s_nmap_active = false;
+        mark_nmap_dirty_locked();
+        broadcast_nmap_results_locked();
+        xSemaphoreGive(s_mutex);
+        return;
+    }
+}
+
 /* ---------- UART line callback ---------- */
 
 static void broadcast_uart_line(const char *line)
@@ -671,6 +1007,11 @@ static void on_uart_line(const char *line, void *ctx)
      * time JanOS prints them, the state has already flipped back to IDLE on
      * the `> list_hosts` echo. */
     handle_arp_discovery_line(line);
+
+    /* Same story for nmap: the FSM flips to IDLE on the `> start_nmap`
+     * echo (long before the actual scan results arrive), so we accumulate
+     * `Host:`/`port/tcp open` rows in a state-independent helper. */
+    handle_nmap_line(line);
 
     /* Update display if available */
     if (s_display_cb) {
@@ -1285,6 +1626,7 @@ void cmd_handler_init(void)
     dynvec_init(&s_subghz_signals, sizeof(subghz_signal_t),      8);
     dynvec_init(&s_subghz_build,   sizeof(subghz_signal_t),      8);
     dynvec_init(&s_arp_hosts,      sizeof(arp_host_t),           8);
+    dynvec_init(&s_nmap_hosts,     sizeof(nmap_host_t),          8);
     reset_sniffer_build();
 
     uart_bridge_register_line_cb(on_uart_line, NULL);
@@ -1621,6 +1963,20 @@ bool cmd_do_nmap(const char *level, const char *target_ip)
 {
     if (!set_state_if_idle(STATE_ATTACK_NMAP)) return false;
 
+    /* Wipe the previous scan's cache before sending the new command so the
+     * web UI doesn't briefly show stale "done" results from the previous
+     * run while waiting for the first incremental update. Arm the
+     * state-independent parser too. */
+    nmap_reset();
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    s_nmap_active = true;
+    if (level && level[0]) {
+        strncpy(s_nmap_state.level, level, sizeof(s_nmap_state.level) - 1);
+    }
+    mark_nmap_dirty_locked();
+    broadcast_nmap_results_locked();
+    xSemaphoreGive(s_mutex);
+
     char cmd[96];
     snprintf(cmd, sizeof(cmd), "start_nmap");
 
@@ -1908,6 +2264,29 @@ int cmd_get_arp_hosts_count(void)
 uint32_t cmd_get_arp_hosts_at_ms(void)
 {
     return s_arp_hosts_at_ms;
+}
+
+int cmd_get_nmap_hosts(nmap_host_t *out, int max)
+{
+    if (!out || max <= 0) return 0;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    int n = (int)s_nmap_hosts.count < max ? (int)s_nmap_hosts.count : max;
+    if (n > 0) memcpy(out, s_nmap_hosts.data, n * sizeof(nmap_host_t));
+    xSemaphoreGive(s_mutex);
+    return n;
+}
+
+int cmd_get_nmap_hosts_count(void)
+{
+    return (int)s_nmap_hosts.count;
+}
+
+void cmd_get_nmap_state(nmap_state_t *out)
+{
+    if (!out) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    *out = s_nmap_state;
+    xSemaphoreGive(s_mutex);
 }
 
 /* ---------- Sub-GHz commands ---------- */
