@@ -37,6 +37,11 @@ let state = {
   gpsLon: 0,
   sdFreeGb: -1,
   sdTotalGb: -1,
+  /* Discovered hosts from `list_hosts` (ARP attack). Populated globally so
+   * the data survives navigation and is captured even when the Scan ARP
+   * monitor isn't open at the moment the lines arrive over UART. */
+  arpHosts: [],
+  arpHostsAt: 0,
 };
 
 let listeners = [];
@@ -68,6 +73,40 @@ export function setAllNetworks(selectAll) {
   const next = new Set();
   if (selectAll) state.networks.forEach((n) => next.add(n.index));
   setState({ selected: next });
+}
+
+export function clearArpHosts() {
+  setState({ arpHosts: [], arpHostsAt: 0 });
+}
+
+export function addArpHost(ip, mac) {
+  if (!ip || !mac) return;
+  const macUp = mac.toUpperCase();
+  if (state.arpHosts.some((row) => row.ip === ip && row.mac === macUp)) return;
+  setState({
+    arpHosts: [...state.arpHosts, { ip, mac: macUp }],
+    arpHostsAt: Date.now(),
+  });
+}
+
+/* Replace the discovered-host list with an authoritative snapshot from the
+ * device (delivered as a structured WS `arp_hosts` event or pulled via the
+ * `/api/arp/hosts` poll). Hosts without a usable MAC (`icmp_only`) are kept
+ * in the store so the UI can show them, but `arp_ban` callers will skip
+ * them because the MAC is empty. */
+export function setArpHosts(hosts, atMs) {
+  const list = Array.isArray(hosts) ? hosts : [];
+  const next = list
+    .map((row) => ({
+      ip: String(row?.ip || ''),
+      mac: String(row?.mac || '').toUpperCase(),
+      icmp_only: !!row?.icmp_only,
+    }))
+    .filter((row) => row.ip);
+  setState({
+    arpHosts: next,
+    arpHostsAt: typeof atMs === 'number' && atMs > 0 ? atMs : Date.now(),
+  });
 }
 
 export function setQuickActions(actions) {

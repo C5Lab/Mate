@@ -2,7 +2,15 @@ import Router from 'preact-router';
 import { useEffect, useState } from 'preact/hooks';
 import { api } from './api';
 import { wsAddListener, wsConnect } from './ws';
-import { getState, setQuickActions, setState, subscribe } from './store';
+import {
+  addArpHost,
+  clearArpHosts,
+  getState,
+  setArpHosts,
+  setQuickActions,
+  setState,
+  subscribe,
+} from './store';
 import { ToastContainer } from './components/Toast';
 import { QUICK_ACTION_OPTIONS } from './quickActions';
 
@@ -143,6 +151,33 @@ export function App() {
 
       if (msg.type === 'wifi_disconnected' || msg.type === 'wifi_connect_failed') {
         setState({ staConnected: false, staSsid: '' });
+      }
+
+      /* Preferred fast path: the firmware sends a single structured
+       * `arp_hosts` event when `list_hosts` finishes. One frame is much
+       * harder to lose than the original 7-line raw burst. */
+      if (msg.type === 'arp_hosts') {
+        setArpHosts(msg.hosts || [], Date.now());
+      }
+
+      /* Fallback: capture `list_hosts` raw lines globally in case the
+       * structured event got dropped (e.g. WS still re-handshaking when
+       * the burst arrives). The Scan ARP panel reads from
+       * `getState().arpHosts` regardless of which page is mounted.
+       * JanOS prints each host as:
+       *   "  192.168.0.1  ->  AC:22:05:84:4F:CC  [ARP]"
+       *   "  192.168.0.247  ->  (MAC unknown)  [ICMP]"
+       * We skip the ICMP-only rows because arp_ban needs a usable MAC. */
+      if (msg.type === 'uart_line' && typeof msg.data === 'string') {
+        const line = msg.data;
+        if (line.includes('=== Discovered Hosts ===')) {
+          clearArpHosts();
+        } else {
+          const m = line.match(
+            /^\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})\s*->\s*([0-9A-Fa-f:]{17})(?:\s+\[[^\]]+\])?\s*$/,
+          );
+          if (m) addArpHost(m[1], m[2]);
+        }
       }
     });
 

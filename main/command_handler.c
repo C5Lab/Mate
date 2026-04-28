@@ -11,6 +11,7 @@
 #include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
 
 static const char *TAG = "cmd_handler";
 
@@ -81,6 +82,15 @@ static int                  s_subghz_count = 0;
 static subghz_signal_t      s_subghz_build[MAX_SUBGHZ_SIGNALS];
 static int                  s_subghz_build_count = 0;
 static int                  s_subghz_import_count = 0;
+/* Discovered hosts from `list_hosts` (ARP attack). Cached on the device so
+ * the web UI can poll for them even if the WS dropped during the discovery
+ * burst (e.g. after the softAP channel hops to follow the STA). The buffer
+ * is PSRAM-allocated when available so it doesn't eat the scarce internal
+ * DRAM that wifi/lwip/httpd workers compete for at boot. */
+static arp_host_t          *s_arp_hosts = NULL;
+static int                  s_arp_host_count = 0;
+static uint32_t             s_arp_hosts_at_ms = 0;
+static bool                 s_arp_hosts_in_block = false;
 
 static bool is_prompt_line(const char *line)
 {
@@ -157,6 +167,143 @@ static void begin_sniffer_snapshot(void)
 {
     reset_sniffer_build();
     s_sniffer_collecting = true;
+}
+
+/* ---------- ARP host cache helpers ---------- */
+
+static void arp_hosts_reset_locked(void)
+{
+    s_arp_host_count = 0;
+    if (s_arp_hosts) {
+        memset(s_arp_hosts, 0, sizeof(arp_host_t) * MAX_ARP_HOSTS);
+    }
+}
+
+static void arp_hosts_reset(void)
+{
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    arp_hosts_reset_locked();
+    xSemaphoreGive(s_mutex);
+}
+
+/* Parse one of:
+ *   "  192.168.0.1  ->  AC:22:05:84:4F:CC  [ARP]"
+ *   "  192.168.0.247  ->  (MAC unknown)  [ICMP]"
+ * Returns true if the line matches and fills `out`. */
+static bool parse_arp_host_line(const char *line, arp_host_t *out)
+{
+    if (!line || !out) return false;
+    while (*line == ' ') line++;
+    if (*line < '0' || *line > '9') return false;
+
+    const char *arrow = strstr(line, "->");
+    if (!arrow) return false;
+
+    int ip_len = 0;
+    while (line + ip_len < arrow && line[ip_len] != ' ') ip_len++;
+    if (ip_len < 7 || ip_len > 15) return false;
+
+    int dots = 0;
+    for (int i = 0; i < ip_len; i++) {
+        char c = line[i];
+        if (c == '.') dots++;
+        else if (c < '0' || c > '9') return false;
+    }
+    if (dots != 3) return false;
+
+    memset(out, 0, sizeof(*out));
+    memcpy(out->ip, line, ip_len);
+    out->ip[ip_len] = '\0';
+
+    const char *p = arrow + 2;
+    while (*p == ' ') p++;
+
+    if (*p == '(') {
+        out->icmp_only = true;
+        out->mac[0] = '\0';
+    } else {
+        int mac_len = 0;
+        while (p[mac_len] && p[mac_len] != ' ' && mac_len < (int)sizeof(out->mac) - 1) {
+            char c = p[mac_len];
+            if (!((c >= '0' && c <= '9') ||
+                  (c >= 'A' && c <= 'F') ||
+                  (c >= 'a' && c <= 'f') ||
+                  c == ':')) {
+                return false;
+            }
+            out->mac[mac_len] = (c >= 'a' && c <= 'f') ? (c - 32) : c;
+            mac_len++;
+        }
+        if (mac_len != 17) return false;
+        out->mac[mac_len] = '\0';
+        out->icmp_only = false;
+    }
+
+    return true;
+}
+
+static void broadcast_arp_hosts_locked(void)
+{
+    if (!s_ws_broadcast || !s_arp_hosts) return;
+
+    /* Per host: ~70 bytes JSON. 32 hosts * 70 + envelope ≈ 2.3 KB. Allocate
+     * from PSRAM when available so we don't blow the uart_rx_task stack
+     * (which also runs the cmd_handler line callbacks). */
+    const size_t cap = 3072;
+    char *json = heap_caps_malloc(cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!json) json = malloc(cap);
+    if (!json) return;
+
+    int pos = snprintf(json, cap,
+        "{\"type\":\"arp_hosts\",\"count\":%d,\"hosts\":[", s_arp_host_count);
+    for (int i = 0; i < s_arp_host_count && pos < (int)cap - 96; i++) {
+        pos += snprintf(json + pos, cap - pos,
+            "%s{\"ip\":\"%s\",\"mac\":\"%s\",\"icmp_only\":%s}",
+            i > 0 ? "," : "",
+            s_arp_hosts[i].ip,
+            s_arp_hosts[i].mac,
+            s_arp_hosts[i].icmp_only ? "true" : "false");
+    }
+    pos += snprintf(json + pos, cap - pos, "]}");
+    s_ws_broadcast(json, pos);
+    free(json);
+}
+
+/* Inspect any UART line for ARP discovery markers, regardless of cmd state.
+ * The state-machine flips to STATE_IDLE on the very first prompt echo
+ * (`> list_hosts`), long before the host rows appear, so we cannot rely on
+ * STATE_ATTACK_ARP being active here. */
+static void handle_arp_discovery_line(const char *line)
+{
+    if (!line) return;
+
+    if (strstr(line, "=== Discovered Hosts ===")) {
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        arp_hosts_reset_locked();
+        s_arp_hosts_in_block = true;
+        xSemaphoreGive(s_mutex);
+        return;
+    }
+
+    if (s_arp_hosts_in_block) {
+        if (strstr(line, "========================")) {
+            xSemaphoreTake(s_mutex, portMAX_DELAY);
+            s_arp_hosts_in_block = false;
+            s_arp_hosts_at_ms = (uint32_t)(esp_timer_get_time() / 1000);
+            broadcast_arp_hosts_locked();
+            xSemaphoreGive(s_mutex);
+            return;
+        }
+
+        arp_host_t host;
+        if (parse_arp_host_line(line, &host)) {
+            xSemaphoreTake(s_mutex, portMAX_DELAY);
+            if (s_arp_hosts && s_arp_host_count < MAX_ARP_HOSTS) {
+                s_arp_hosts[s_arp_host_count++] = host;
+            }
+            xSemaphoreGive(s_mutex);
+        }
+    }
 }
 
 /* ---------- UART line callback ---------- */
@@ -401,6 +548,11 @@ static void on_uart_line(const char *line, void *ctx)
     if (handle_subghz_event_line(line)) {
         return;
     }
+
+    /* ARP `list_hosts` rows must be cached regardless of FSM state: by the
+     * time JanOS prints them, the state has already flipped back to IDLE on
+     * the `> list_hosts` echo. */
+    handle_arp_discovery_line(line);
 
     /* Update display if available */
     if (s_display_cb) {
@@ -979,6 +1131,15 @@ void cmd_handler_init(void)
     memset(&s_scan, 0, sizeof(s_scan));
     memset(&s_sniffer, 0, sizeof(s_sniffer));
     reset_sniffer_build();
+
+    /* Cache the ARP hosts table in PSRAM when available so it doesn't eat
+     * the ~50 KB of internal DRAM that wifi/lwip/httpd workers fight over
+     * at boot. Falls back to internal heap on boards without PSRAM. */
+    s_arp_hosts = heap_caps_malloc(sizeof(arp_host_t) * MAX_ARP_HOSTS,
+                                   MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_arp_hosts) s_arp_hosts = malloc(sizeof(arp_host_t) * MAX_ARP_HOSTS);
+    if (s_arp_hosts) memset(s_arp_hosts, 0, sizeof(arp_host_t) * MAX_ARP_HOSTS);
+
     uart_bridge_register_line_cb(on_uart_line, NULL);
     ESP_LOGI(TAG, "Command handler initialized");
 }
@@ -1343,6 +1504,8 @@ bool cmd_do_nmap(const char *level, const char *target_ip)
 bool cmd_do_arp(void)
 {
     if (!set_state_if_idle(STATE_ATTACK_ARP)) return false;
+    arp_hosts_reset();
+    s_arp_hosts_in_block = false;
     if (s_display_cb) s_display_cb("list_hosts", NULL);
     uart_bridge_send("list_hosts");
     broadcast_json("{\"type\":\"attack_started\",\"attack\":\"arp\"}");
@@ -1559,6 +1722,21 @@ int cmd_get_probes(parsed_probe_t *out, int max)
     int n = s_probe_count < max ? s_probe_count : max;
     memcpy(out, s_probes, n * sizeof(parsed_probe_t));
     return n;
+}
+
+int cmd_get_arp_hosts(arp_host_t *out, int max)
+{
+    if (!out || max <= 0) return 0;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    int n = s_arp_hosts ? (s_arp_host_count < max ? s_arp_host_count : max) : 0;
+    if (n > 0) memcpy(out, s_arp_hosts, n * sizeof(arp_host_t));
+    xSemaphoreGive(s_mutex);
+    return n;
+}
+
+uint32_t cmd_get_arp_hosts_at_ms(void)
+{
+    return s_arp_hosts_at_ms;
 }
 
 /* ---------- Sub-GHz commands ---------- */

@@ -3,12 +3,46 @@ import { useEffect, useRef, useState } from 'preact/hooks';
 import { Layout } from '../components/Layout';
 import { NetworkList } from '../components/NetworkList';
 import { api } from '../api';
-import { getState, setAllNetworks, setState, toggleNetwork } from '../store';
+import { clearArpHosts, getState, setAllNetworks, setArpHosts, setState, subscribe, toggleNetwork } from '../store';
 import { showToast } from '../components/Toast';
 import { wsAddListener } from '../ws';
 
 let pollTimer = null;
 let pollTimeout = null;
+let arpPollTimer = null;
+let arpPollInFlight = false;
+
+function stopArpPolling() {
+  if (arpPollTimer) {
+    clearInterval(arpPollTimer);
+    arpPollTimer = null;
+  }
+  arpPollInFlight = false;
+}
+
+async function fetchArpHosts() {
+  if (arpPollInFlight) return;
+  arpPollInFlight = true;
+  try {
+    const res = await api.arpHosts();
+    if (res?.ok && Array.isArray(res.hosts)) {
+      setArpHosts(res.hosts, res.at || Date.now());
+    }
+  } catch (e) {
+    /* transient network failure -- next tick will retry */
+  } finally {
+    arpPollInFlight = false;
+  }
+}
+
+function startArpPolling() {
+  if (arpPollTimer) return;
+  /* Kick once immediately so the UI doesn't wait the first 1.5 s before
+   * showing what's already cached on the device (e.g. when navigating
+   * back into the monitor after a reload). */
+  fetchArpHosts();
+  arpPollTimer = setInterval(fetchArpHosts, 1500);
+}
 
 const ATTACK_OPTIONS = [
   { id: 'deauth', label: 'Deauth', available: true },
@@ -60,7 +94,7 @@ export function Scan() {
   const [monitorTitle, setMonitorTitle] = useState('');
   const [monitorAttack, setMonitorAttack] = useState('');
   const [monitorLines, setMonitorLines] = useState([]);
-  const [arpRows, setArpRows] = useState([]);
+  const [, forceArpRender] = useState(0);
   const [arpBanTarget, setArpBanTarget] = useState(null); // { ip, mac } currently being banned
   const [arpBanBusy, setArpBanBusy] = useState(false);
   const [nmapRows, setNmapRows] = useState([]);
@@ -76,17 +110,36 @@ export function Scan() {
   const st = getState();
   const scanning = st.status === 'scanning' || st.status === 'scan';
   const selectedAttack = ATTACK_OPTIONS.find((opt) => opt.id === attack);
+  const arpRows = st.arpHosts || [];
+
+  /* Re-render whenever the global store updates so newly-discovered ARP
+   * hosts appear in the panel even if they arrived while the monitor was
+   * still being opened (or before this page was mounted). */
+  useEffect(() => subscribe(() => forceArpRender((n) => n + 1)), []);
 
   useEffect(() => {
     const removeWs = wsAddListener((msg) => {
       if (msg.type === 'attack_started') {
         setAttackLive(true);
         pushLine(`${msg.attack || 'operation'} started`);
+        if (msg.attack === 'arp') {
+          /* Make sure we're polling -- covers the case where the monitor
+           * was opened before this listener was wired up and also gives
+           * us a head-start for fetching the cache. */
+          startArpPolling();
+          fetchArpHosts();
+        }
       }
 
       if (msg.type === 'attack_stopped') {
         setAttackLive(false);
         pushLine('operation stopped');
+        if (monitorAttackRef.current === 'arp') {
+          /* One last fetch so we don't miss hosts that landed between the
+           * previous tick and the stop event, then keep polling for as
+           * long as the monitor is still open in case the user re-runs. */
+          fetchArpHosts();
+        }
       }
 
       if (msg.type === 'wifi_connecting') {
@@ -135,6 +188,7 @@ export function Scan() {
 
     return () => {
       stopPolling();
+      stopArpPolling();
       removeWs();
     };
   }, []);
@@ -153,7 +207,15 @@ export function Scan() {
     setMonitorAttack(nextAttack);
     setMonitorTitle(title || 'Attack Monitor');
     setMonitorLines([]);
-    setArpRows([]);
+    if (nextAttack === 'arp') {
+      clearArpHosts();
+      /* Start polling /api/arp/hosts so the table populates even if the
+       * `arp_hosts` WS event was lost (softAP channel hop right after STA
+       * joins the victim AP routinely drops the WS for a few seconds). */
+      startArpPolling();
+    } else {
+      stopArpPolling();
+    }
     setArpBanTarget(null);
     setArpBanBusy(false);
     setNmapRows([]);
@@ -164,6 +226,7 @@ export function Scan() {
     monitorAttackRef.current = '';
     currentNmapHostRef.current = '';
     setMonitorOpen(false);
+    stopArpPolling();
   }
 
   async function banArpHost(host) {
@@ -183,23 +246,9 @@ export function Scan() {
     }
   }
 
-  function parseArpLine(line) {
-    /* JanOS prints lines like:
-     *   "  192.168.0.1  ->  AC:22:05:84:4F:CC  [ARP]"
-     *   "  192.168.0.247  ->  (MAC unknown)  [ICMP]"
-     * Accept the optional discovery-method tag and skip rows without a MAC
-     * (arp_ban needs a usable MAC anyway). */
-    const m = line.match(
-      /^\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})\s*->\s*([0-9A-Fa-f:]{17})(?:\s+\[[^\]]+\])?\s*$/,
-    );
-    if (!m) return;
-    const ip = m[1];
-    const mac = m[2].toUpperCase();
-    setArpRows((prev) => {
-      if (prev.some((row) => row.ip === ip && row.mac === mac)) return prev;
-      return [...prev, { ip, mac }];
-    });
-  }
+  /* parseArpLine moved to a global WS handler in app.jsx so hosts are
+   * captured even if the Scan monitor isn't open (or if the user is on
+   * another page). The Scan ARP panel reads from `getState().arpHosts`. */
 
   function upsertNmapHost(ip, mac) {
     setNmapRows((prev) => {
@@ -251,11 +300,11 @@ export function Scan() {
 
     setMonitorLines((prev) => [...prev, trimmed].slice(-240));
 
-    if (monitorAttackRef.current === 'arp') {
-      parseArpLine(trimmed);
-    } else if (monitorAttackRef.current === 'nmap') {
+    if (monitorAttackRef.current === 'nmap') {
       parseNmapLine(trimmed);
     }
+    /* ARP host parsing is global (see app.jsx wsAddListener) so it works
+     * whether or not the monitor is open. */
   }
 
   function pickStrongestSelectedNetwork(selectedIndices) {

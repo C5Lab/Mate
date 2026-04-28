@@ -689,6 +689,32 @@ static esp_err_t api_probes_refresh_post(httpd_req_t *req)
     return ESP_OK;
 }
 
+static esp_err_t api_arp_hosts_get(httpd_req_t *req)
+{
+    arp_host_t hosts[MAX_ARP_HOSTS];
+    int n = cmd_get_arp_hosts(hosts, MAX_ARP_HOSTS);
+    uint32_t at = cmd_get_arp_hosts_at_ms();
+
+    char buf[2048];
+    int pos = snprintf(buf, sizeof(buf),
+        "{\"ok\":true,\"at\":%u,\"count\":%d,\"hosts\":[",
+        (unsigned)at, n);
+
+    for (int i = 0; i < n && pos < (int)sizeof(buf) - 96; i++) {
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            "%s{\"ip\":\"%s\",\"mac\":\"%s\",\"icmp_only\":%s}",
+            i > 0 ? "," : "",
+            hosts[i].ip,
+            hosts[i].mac,
+            hosts[i].icmp_only ? "true" : "false");
+    }
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "]}");
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, buf, pos);
+    return ESP_OK;
+}
+
 static esp_err_t api_status_get(httpd_req_t *req)
 {
     const char *sta_ssid = cmd_get_sta_ssid();
@@ -1145,6 +1171,7 @@ esp_err_t web_server_start(void)
     REGISTER_URI("/api/sniffer/results", HTTP_POST, api_sniffer_refresh_post);
     REGISTER_URI("/api/probes",          HTTP_GET,  api_probes_get);
     REGISTER_URI("/api/probes",          HTTP_POST, api_probes_refresh_post);
+    REGISTER_URI("/api/arp/hosts",       HTTP_GET,  api_arp_hosts_get);
     REGISTER_URI("/api/status",        HTTP_GET,  api_status_get);
     REGISTER_URI("/api/dashboard",     HTTP_GET,  api_dashboard_get);
     REGISTER_URI("/api/subghz/list",   HTTP_GET,  api_subghz_list_get);

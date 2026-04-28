@@ -2,6 +2,15 @@
 
 #include "response_parser.h"
 #include <stdbool.h>
+#include <stdint.h>
+
+#define MAX_ARP_HOSTS 32
+
+typedef struct {
+    char ip[16];
+    char mac[18];
+    bool icmp_only;
+} arp_host_t;
 
 typedef enum {
     STATE_IDLE = 0,
@@ -200,6 +209,12 @@ int cmd_get_wardrive_logs(parsed_portal_file_t *out, int max);
 
 /** Get cached probe list. */
 int cmd_get_probes(parsed_probe_t *out, int max);
+
+/** Get cached ARP discovered hosts (from `list_hosts`). Returns count copied. */
+int cmd_get_arp_hosts(arp_host_t *out, int max);
+
+/** Monotonic timestamp (ms) when the last ARP host scan completed. 0 if none. */
+uint32_t cmd_get_arp_hosts_at_ms(void);
 
 /* ---------- Sub-GHz commands ---------- */
 
