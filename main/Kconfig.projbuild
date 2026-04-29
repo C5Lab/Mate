@@ -10,6 +10,10 @@ menu "JanOS Web Client Configuration"
             bool "XIAO ESP32-C6 (no display)"
             depends on IDF_TARGET_ESP32C6
 
+        config JANOS_BOARD_NANOC6
+            bool "M5Stack NanoC6 (no display)"
+            depends on IDF_TARGET_ESP32C6
+
         config JANOS_BOARD_CORES3
             bool "M5Stack CoreS3 SE (ILI9342C 320x240)"
             depends on IDF_TARGET_ESP32S3
@@ -26,6 +30,7 @@ menu "JanOS Web Client Configuration"
     config JANOS_HAS_DISPLAY
         bool
         default n if JANOS_BOARD_XIAO_C6
+        default n if JANOS_BOARD_NANOC6
         default y
 
     menu "UART Configuration (Monster connection)"
@@ -33,6 +38,7 @@ menu "JanOS Web Client Configuration"
         config JANOS_UART_TX_PIN
             int "UART TX GPIO pin"
             default 21 if JANOS_BOARD_XIAO_C6
+            default 2  if JANOS_BOARD_NANOC6
             default 2  if JANOS_BOARD_CORES3
             default 32 if JANOS_BOARD_STICKC_PLUS2
             default 5  if JANOS_BOARD_ATOMS3R
@@ -43,6 +49,7 @@ menu "JanOS Web Client Configuration"
         config JANOS_UART_RX_PIN
             int "UART RX GPIO pin"
             default 20 if JANOS_BOARD_XIAO_C6
+            default 1  if JANOS_BOARD_NANOC6
             default 1  if JANOS_BOARD_CORES3
             default 33 if JANOS_BOARD_STICKC_PLUS2
             default 6  if JANOS_BOARD_ATOMS3R
