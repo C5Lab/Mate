@@ -1,34 +1,12 @@
-# M5StickC PLUS2 specific
+# ESP32-PICO-D4 / original ESP32 specific
 CONFIG_IDF_TARGET="esp32"
-CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
-CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_8mb.csv"
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_4mb.csv"
 
-# Min chip rev 3 (Plus2 ships ESP32-PICO-V3-02 chip rev v3.x).
-# Required to enable PSRAM cache safely without IRAM workarounds.
-CONFIG_ESP32_REV_MIN_3=y
+# ESP32-PICO-D4 reports as chip revision v1.0. Do not require the v3.x
+# bootloader range used by ESP32-PICO-V3-02 boards.
+CONFIG_ESP32_REV_MIN_1=y
 
-# 2 MB Quad PSRAM in ESP32-PICO-V3-02. PSRAM is initialized at boot and
-# made available to the heap allocator, but ONLY through explicit
-# heap_caps_malloc(MALLOC_CAP_SPIRAM) calls (see psram_malloc() in
-# main/web_server.c). Plain malloc() and wifi/lwip stay in internal RAM.
-#
-# Why so conservative: on the original ESP32 (not S3) wifi DMA and lwip
-# TCP receive paths have a hard dependency on DMA-capable internal RAM.
-# Letting them allocate from PSRAM (CONFIG_SPIRAM_USE_MALLOC=y +
-# TRY_ALLOCATE_WIFI_LWIP=y) reliably crashes with stack corruption /
-# StoreProhibited under network load even on chip rev 3+ (the cache
-# workaround is flaky). ESP32-S3 has hardware PSRAM-DMA and can use
-# the broader settings -- see sdkconfig.defaults.esp32s3.
-CONFIG_SPIRAM=y
-CONFIG_SPIRAM_MODE_QUAD=y
-CONFIG_SPIRAM_TYPE_AUTO=y
-CONFIG_SPIRAM_SPEED_40M=y
-CONFIG_SPIRAM_BOOT_INIT=y
-# Critical: PSRAM is in a "choice" group (USE_MALLOC | USE_CAPS_ALLOC |
-# USE_MEMMAP) where USE_MALLOC is the DEFAULT when SPIRAM=y. We need
-# CAPS_ALLOC explicitly so plain malloc() always returns internal RAM
-# and PSRAM is reachable only via heap_caps_malloc(MALLOC_CAP_SPIRAM)
-# (i.e. our psram_malloc() in main/web_server.c). This isolates wifi
-# buffers, lwip pbufs, FreeRTOS task stacks, and every random caller
-# from PSRAM, which on ESP32 (not S3) crashes under DMA.
-CONFIG_SPIRAM_USE_CAPS_ALLOC=y
+# ESP32-PICO-D4 has embedded flash but no embedded PSRAM. Keep PSRAM off;
+# heap_caps_malloc(MALLOC_CAP_SPIRAM) callers already fall back gracefully.
+# CONFIG_SPIRAM is not set

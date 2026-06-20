@@ -53,6 +53,15 @@ function WifiMetricIcon({ connected }) {
   );
 }
 
+function SettingsIcon() {
+  return (
+    <svg class="metric-icon" viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M12 8.2a3.8 3.8 0 1 1 0 7.6 3.8 3.8 0 0 1 0-7.6Z" />
+      <path d="m19.4 15-.9 1.6 1 2.1-2 2-2.1-1-1.7 1H10.3l-1.7-1-2.1 1-2-2 1-2.1L4.6 15V9l.9-1.6-1-2.1 2-2 2.1 1 1.7-1h3.4l1.7 1 2.1-1 2 2-1 2.1.9 1.6v6Z" />
+    </svg>
+  );
+}
+
 export function App() {
   const [, forceUpdate] = useState(0);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -108,7 +117,6 @@ export function App() {
     syncStatus();
     syncDashboard();
     const pollStatusId = setInterval(syncStatus, 12000);
-    const pollDashId = setInterval(syncDashboard, 12000);
 
     const removeWs = wsAddListener((msg) => {
       const st = getState();
@@ -185,14 +193,12 @@ export function App() {
 
     return () => {
       clearInterval(pollStatusId);
-      clearInterval(pollDashId);
       removeWs();
       removeSub();
     };
   }, []);
 
   const st = getState();
-  const heapMb = (st.heapFree / (1024 * 1024)).toFixed(1);
   const wifiLabel = st.staConnected ? (st.staSsid || 'Connected') : 'Disconnected';
 
   function updateQuickAction(slot, value) {
@@ -204,34 +210,29 @@ export function App() {
   return (
     <div class="app-shell">
       <header class="glass-card topbar reveal">
-        <div class="topbar-main compact">
+        <div class="topbar-main">
           <div class="topbar-copy">
-            <h1 class="brand-logo">LAB5</h1>
-            <div class="brand-subtitle">{st.deviceName}</div>
+            <div class="eyebrow">Dashboard</div>
+            <h1 class="brand-logo">JanOS</h1>
           </div>
-          <button class="settings-btn compact" onClick={() => setSettingsOpen(true)}>
-            ⚙
+          <button class="settings-btn" onClick={() => setSettingsOpen(true)} aria-label="Open settings">
+            <SettingsIcon />
           </button>
         </div>
 
-        <div class="topbar-metrics compact">
-          <div class="chip compact chip-graphic">
+        <div class="topbar-metrics">
+          <div class="chip chip-graphic">
             <span class={`chip-dot ${st.c5Connected ? 'ok' : 'bad'}`} />
             <span class="chip-glyph">C5</span>
             <span class="chip-value">{st.c5Connected ? 'Connected' : 'No Link'}</span>
           </div>
 
-          <div class="chip compact chip-graphic">
+          <div class="chip chip-graphic">
             <span class="chip-glyph">AP</span>
             <span class="chip-value">{st.apClients} clients</span>
           </div>
 
-          <div class="chip compact chip-graphic">
-            <span class="chip-glyph">RAM</span>
-            <span class="chip-value">{heapMb} MB</span>
-          </div>
-
-          <div class="chip compact chip-graphic">
+          <div class="chip chip-graphic">
             <span class="chip-glyph chip-glyph-icon">
               <WifiMetricIcon connected={!!st.staConnected} />
             </span>

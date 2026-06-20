@@ -2,16 +2,15 @@ import { route } from 'preact-router';
 import { api } from '../api';
 import { getState } from '../store';
 import { showToast } from '../components/Toast';
-import { quickActionById } from '../quickActions';
 
 const MODULES = [
-  { id: 'scan', title: 'Scan', icon: 'wifi', path: '/scan' },
-  { id: 'attacks', title: 'Attacks', icon: 'radar', path: '/global' },
-  { id: 'subghz', title: 'SubGHZ', icon: 'radio', path: '/subghz' },
-  { id: 'observer', title: 'Observer', icon: 'eye', path: '/sniffer' },
-  { id: 'wardrive', title: 'Wardrive', icon: 'map', path: '/wardrive' },
-  { id: 'bluetooth', title: 'Bluetooth', icon: 'bt', path: '/bluetooth' },
-  { id: 'data', title: 'Data', icon: 'disk', path: '/sddata' },
+  { id: 'scan', title: 'Scan APs', note: 'WiFi scan', icon: 'wifi', path: '/scan', accent: 'blue' },
+  { id: 'attacks', title: 'Attacks', note: 'Controls', icon: 'radar', path: '/global', accent: 'red' },
+  { id: 'subghz', title: 'SubGHZ', note: 'RF tools', icon: 'radio', path: '/subghz', accent: 'violet' },
+  { id: 'observer', title: 'Observer', note: 'Telemetry', icon: 'eye', path: '/sniffer', accent: 'slate' },
+  { id: 'wardrive', title: 'Wardrive', note: 'GPS logs', icon: 'map', path: '/wardrive', accent: 'yellow' },
+  { id: 'bluetooth', title: 'Bluetooth', note: 'BT scan', icon: 'bt', path: '/bluetooth', accent: 'green' },
+  { id: 'data', title: 'Data', note: 'Files', icon: 'disk', path: '/sddata', accent: 'cyan' },
 ];
 
 function Glyph({ name }) {
@@ -115,6 +114,32 @@ function formatLastNet(st) {
   return `${strongest.ssid || '[Hidden]'} ${strongest.rssi} dBm`;
 }
 
+function operationLabel(status) {
+  const labels = {
+    idle: 'Chillin',
+    scanning: 'AP Scan',
+    deauth: 'Deauth',
+    blackout: 'Blackout',
+    handshaker: 'Handshake Capture',
+    handshake: 'Handshake Capture',
+    sniffer: 'Observer',
+    mitm: 'MITM',
+    nmap: 'Nmap',
+    arp: 'ARP',
+    karma: 'Karma',
+    portal: 'Portal',
+    subghz: 'SubGHz',
+  };
+  return labels[status] || String(status || 'Chillin');
+}
+
+function operationMeta(st) {
+  if (st.status === 'idle') return 'Ready';
+  if (st.status === 'scanning') return `${st.scanCount || st.networks.length || 0} APs discovered`;
+  if (st.packetCount) return `${st.packetCount} packets captured`;
+  return 'Operation running';
+}
+
 function freeRatio(st) {
   if (st.sdTotalGb <= 0 || st.sdFreeGb < 0) return 0;
   return Math.max(0, Math.min(1, st.sdFreeGb / st.sdTotalGb));
@@ -122,113 +147,79 @@ function freeRatio(st) {
 
 export function Home() {
   const st = getState();
-  const quick = (st.quickActions || ['scan', 'blackout', 'stop']).map((id) => quickActionById(id));
 
-  async function triggerQuickAction(item) {
-    if (item.id === 'scan') {
-      route('/scan');
-      return;
-    }
-    if (item.id === 'stop') {
-      await api.stop();
-      showToast('Stop signal sent', 'warning');
-      return;
-    }
-    if (item.id === 'blackout') {
-      const res = await api.blackout();
-      if (res.ok) showToast('Blackout started', 'success');
-      else showToast(res.error || 'Blackout failed', 'error');
-      return;
-    }
-    if (item.id === 'observer') {
-      route('/sniffer');
-      return;
-    }
-    if (item.id === 'deauth') {
-      route('/deauth');
-      return;
-    }
-    if (item.id === 'eviltwin') {
-      route('/eviltwin');
-      return;
-    }
-    if (item.id === 'mitm') {
-      const res = await api.mitm();
-      if (res.ok) showToast('MITM started', 'success');
-      else showToast(res.error || 'MITM failed', 'error');
-      return;
-    }
-    if (item.id === 'nmap') {
-      const res = await api.nmap();
-      if (res.ok) showToast('Nmap started', 'success');
-      else showToast(res.error || 'Nmap failed', 'error');
-      return;
-    }
-    if (item.id === 'arp') {
-      const res = await api.arp();
-      if (res.ok) showToast('ARP started', 'success');
-      else showToast(res.error || 'ARP failed', 'error');
-    }
+  async function stopOperation() {
+    await api.stop();
+    showToast('Stop signal sent', 'warning');
   }
 
   const ratio = freeRatio(st);
   const ringDeg = Math.round(ratio * 360);
   const sdLabel = st.sdTotalGb > 0 ? `${st.sdFreeGb}/${st.sdTotalGb} GB free` : 'n/a';
+  const isBusy = st.status && st.status !== 'idle';
 
   return (
     <section class="module-page reveal">
-      <section class="glass-card card-body">
-        <div class="section-head">
-          <h3 class="section-title">Modules</h3>
+      <section class={`operation-focus glass-card ${isBusy ? 'active' : ''}`}>
+        <div class={`operation-icon accent-${isBusy ? 'green' : 'slate'}`}>
+          <Glyph name={isBusy ? 'wifi' : 'radar'} />
         </div>
-        <div class="module-grid">
-          {MODULES.map((module) => (
-            <button key={module.id} class="module-tile action-accent-cyan" onClick={() => route(module.path)}>
-              <span class="module-icon plain"><Glyph name={module.icon} /></span>
-              <span class="module-tile-title">{module.title}</span>
-            </button>
-          ))}
+        <div class="operation-inline">
+          <div class="eyebrow">Current Operation</div>
+          <div class="operation-name">{operationLabel(st.status)}</div>
+          <div class="operation-caption">{operationMeta(st)}</div>
         </div>
+        <button class="btn btn-danger operation-stop" onClick={stopOperation}>
+          <Glyph name="stop" />
+          Stop
+        </button>
       </section>
 
       <section class="glass-card card-body">
         <div class="section-head">
-          <h3 class="section-title">Quick Actions</h3>
+          <h3 class="section-title">Monster Stats</h3>
         </div>
-        <div class="quick-grid quick-grid-compact">
-          {quick.map((item) => (
-            <button key={item.id} class={`quick-action-mini action-accent-${item.id === 'stop' ? 'red' : 'cyan'}`} onClick={() => triggerQuickAction(item)}>
-              <span class="action-icon plain"><Glyph name={item.icon} /></span>
-              <span class="action-title">{item.label}</span>
-            </button>
-          ))}
-        </div>
-      </section>
-
-      <section class="glass-card card-body">
-        <div class="section-head">
-          <h3 class="section-title">Stats</h3>
-        </div>
-        <div class="stats-grid stats-grid-compact">
-          <article class="stat-card">
-            <div class="stat-label">Handshakes</div>
+        <div class="stats-strip monster-stats">
+          <article class="stat-card accent-yellow">
+            <Glyph name="radar" />
             <div class="stat-value">{st.handshakeLoading ? '...' : st.handshakeCount}</div>
+            <div class="stat-label">Handshakes</div>
           </article>
-          <article class="stat-card">
-            <div class="stat-label">GPS</div>
+          <article class="stat-card accent-blue">
+            <Glyph name="map" />
             <div class="stat-value stat-value-mini">{formatGps(st)}</div>
+            <div class="stat-label">GPS</div>
           </article>
-          <article class="stat-card">
-            <div class="stat-label">Last Net</div>
+          <article class="stat-card accent-green">
+            <Glyph name="wifi" />
             <div class="stat-value stat-value-mini">{formatLastNet(st)}</div>
+            <div class="stat-label">Last Net</div>
           </article>
-          <article class="stat-card stat-card-ring">
-            <div class="stat-label">SD Space</div>
+          <article class="stat-card stat-card-ring accent-violet">
             <div class="ring-wrap" style={`--ring-deg:${ringDeg}deg`}>
               <div class="ring-core" />
             </div>
             <div class="stat-value stat-value-mini">{sdLabel}</div>
+            <div class="stat-label">SD Space</div>
           </article>
+        </div>
+      </section>
+
+      <section class="glass-card card-body">
+        <div class="section-head">
+          <h3 class="section-title">Modules</h3>
+        </div>
+        <div class="module-list">
+          {MODULES.map((module) => (
+            <button key={module.id} class={`module-entry accent-${module.accent}`} onClick={() => route(module.path)}>
+              <span class="module-icon"><Glyph name={module.icon} /></span>
+              <span class="module-copy">
+                <span class="module-title">{module.title}</span>
+                <span class="module-note">{module.note}</span>
+              </span>
+              <span class="module-arrow">›</span>
+            </button>
+          ))}
         </div>
       </section>
     </section>
