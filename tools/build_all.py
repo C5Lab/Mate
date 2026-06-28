@@ -17,6 +17,7 @@ Output layout:
     cores3/ ...
     atoms3r/ ...
     stickc-plus2/ ...
+    sticks3/ ...
     atom-lite/ ...
 
 Usage:
@@ -38,6 +39,18 @@ BOARDS = {
     "xiao-c6": {
         "idf_target":         "esp32c6",
         "sdkconfig_defaults": "sdkconfig.defaults;sdkconfig.defaults.esp32c6",
+        "chip":               "esp32c6",
+        "flash_size":         "4MB",
+        "flash_mode":         "dio",
+        "flash_freq":         "80m",
+        "boot_offset":        "0x0",
+        "ptable_offset":      "0x8000",
+        "app_offset":         "0x10000",
+        "spiffs_offset":      "0x1D0000",  # 0x10000 + 0x1C0000 (partitions_4mb.csv)
+    },
+    "nanoc6": {
+        "idf_target":         "esp32c6",
+        "sdkconfig_defaults": "sdkconfig.defaults;sdkconfig.defaults.nanoc6",
         "chip":               "esp32c6",
         "flash_size":         "4MB",
         "flash_mode":         "dio",
@@ -71,6 +84,30 @@ BOARDS = {
         "app_offset":         "0x10000",
         "spiffs_offset":      "0x3D0000",  # 0x10000 + 0x3C0000 (partitions_8mb.csv)
     },
+    "atoms3": {
+        "idf_target":         "esp32s3",
+        "sdkconfig_defaults": "sdkconfig.defaults;sdkconfig.defaults.atoms3",
+        "chip":               "esp32s3",
+        "flash_size":         "8MB",
+        "flash_mode":         "dio",
+        "flash_freq":         "80m",
+        "boot_offset":        "0x0",
+        "ptable_offset":      "0x8000",
+        "app_offset":         "0x10000",
+        "spiffs_offset":      "0x3D0000",  # 0x10000 + 0x3C0000 (partitions_8mb.csv)
+    },
+    "atoms3-lite": {
+        "idf_target":         "esp32s3",
+        "sdkconfig_defaults": "sdkconfig.defaults;sdkconfig.defaults.atoms3-lite",
+        "chip":               "esp32s3",
+        "flash_size":         "8MB",
+        "flash_mode":         "dio",
+        "flash_freq":         "80m",
+        "boot_offset":        "0x0",
+        "ptable_offset":      "0x8000",
+        "app_offset":         "0x10000",
+        "spiffs_offset":      "0x3D0000",  # 0x10000 + 0x3C0000 (partitions_8mb.csv)
+    },
     "stickc-plus2": {
         "idf_target":         "esp32",
         "sdkconfig_defaults": "sdkconfig.defaults;sdkconfig.defaults.esp32",
@@ -83,17 +120,29 @@ BOARDS = {
         "app_offset":         "0x10000",
         "spiffs_offset":      "0x3D0000",  # 0x10000 + 0x3C0000 (partitions_8mb.csv)
     },
+    "sticks3": {
+        "idf_target":         "esp32s3",
+        "sdkconfig_defaults": "sdkconfig.defaults;sdkconfig.defaults.sticks3",
+        "chip":               "esp32s3",
+        "flash_size":         "8MB",
+        "flash_mode":         "dio",
+        "flash_freq":         "80m",
+        "boot_offset":        "0x0",
+        "ptable_offset":      "0x8000",
+        "app_offset":         "0x10000",
+        "spiffs_offset":      "0x3D0000",  # 0x10000 + 0x3C0000 (partitions_8mb.csv)
+    },
     "atom-lite": {
         "idf_target":         "esp32",
-        "sdkconfig_defaults": "sdkconfig.defaults;sdkconfig.defaults.esp32",
+        "sdkconfig_defaults": "sdkconfig.defaults;sdkconfig.defaults.atom-lite",
         "chip":               "esp32",
-        "flash_size":         "8MB",
+        "flash_size":         "4MB",
         "flash_mode":         "dio",
         "flash_freq":         "40m",
         "boot_offset":        "0x1000",
         "ptable_offset":      "0x8000",
         "app_offset":         "0x10000",
-        "spiffs_offset":      "0x3D0000",  # 0x10000 + 0x3C0000 (partitions_8mb.csv)
+        "spiffs_offset":      "0x1D0000",  # 0x10000 + 0x1C0000 (partitions_4mb.csv)
     },
 }
 
@@ -138,9 +187,16 @@ def build_board(board: str, keep_build: bool, out_root: Path) -> None:
     for stale in (REPO_ROOT / "build", build_dir):
         shutil.rmtree(stale, ignore_errors=True)
 
+    # Apply the board's sdkconfig.defaults authoritatively via -D (not just the
+    # env var) and use a single per-board build dir for BOTH set-target and
+    # build. This guarantees the generated sdkconfig is rebuilt from THIS
+    # board's defaults every time, so nothing (e.g. PSRAM from a prior board)
+    # can bleed across builds. Single-quote the value to protect the ';'.
+    defaults = cfg["sdkconfig_defaults"]
     idf_cmd = (
         ". /opt/esp/idf/export.sh >/dev/null 2>&1"
-        f" && idf.py set-target {cfg['idf_target']}"
+        f" && idf.py -B build-{board} -D SDKCONFIG_DEFAULTS='{defaults}'"
+        f" set-target {cfg['idf_target']}"
         f" && idf.py -B build-{board} build"
     )
 
@@ -156,11 +212,43 @@ def build_board(board: str, keep_build: bool, out_root: Path) -> None:
     ]
 
     run(docker_cmd)
+    _verify_config(board, cfg)
     _collect_artifacts(board, build_dir, out_dir)
     generate_flasher(board, out_dir)
 
     if not keep_build:
         shutil.rmtree(build_dir, ignore_errors=True)
+
+
+def _verify_config(board: str, cfg: dict) -> None:
+    """Assert the generated sdkconfig honors every explicit setting from the
+    board's own defaults file. Catches a stale/leaked config (e.g. PSRAM
+    enabled on a no-PSRAM module) and fails loudly instead of shipping a
+    binary that bootloops on real hardware."""
+    sdkconfig = REPO_ROOT / "sdkconfig"
+    if not sdkconfig.exists():
+        sys.exit(f"Config check failed for {board}: no sdkconfig was generated")
+    text = sdkconfig.read_text(encoding="utf-8", errors="ignore").splitlines()
+    have = set(line.rstrip() for line in text)
+
+    # The board-specific file is the last entry in the defaults chain.
+    board_defaults = REPO_ROOT / cfg["sdkconfig_defaults"].split(";")[-1]
+    if not board_defaults.exists():
+        return
+
+    missing = []
+    for raw in board_defaults.read_text(encoding="utf-8", errors="ignore").splitlines():
+        s = raw.strip()
+        # An explicit "CONFIG_X=..." assignment, or a "# CONFIG_X is not set".
+        is_assign = s.startswith("CONFIG_") and "=" in s
+        is_disable = s.startswith("# CONFIG_") and s.endswith("is not set")
+        if (is_assign or is_disable) and s not in have:
+            missing.append(s)
+
+    if missing:
+        detail = "\n  ".join(missing)
+        sys.exit(f"Config check failed for {board}: generated sdkconfig does not "
+                 f"match board defaults (stale/leaked config?). Expected:\n  {detail}")
 
 
 def _collect_artifacts(board: str, build_dir: Path, out_dir: Path) -> None:
@@ -340,24 +428,24 @@ def erase(port, baud):
         print(f"{{RED}}Erase failed ({{r.returncode}}).{{RESET}}")
         sys.exit(r.returncode)
 
-def flash(port, baud):
+def flash(port, baud, no_stub=False):
     cmd = [sys.executable, "-m", "esptool",
            "-p", port, "-b", str(baud),
            "--chip", CHIP,
-           "--before", "default-reset", "--after", "hard-reset",
-           "write-flash",
-           "--flash-mode", FLASH_MODE,
-           "--flash-freq", FLASH_FREQ,
-           "--flash-size", FLASH_SIZE]
+           "--before", "default-reset", "--after", "hard-reset"]
+    if no_stub:
+        cmd.append("--no-stub")
+    cmd += ["write-flash",
+            "--flash-mode", FLASH_MODE,
+            "--flash-freq", FLASH_FREQ,
+            "--flash-size", FLASH_SIZE]
     for _, (offset, fname) in FILES.items():
         full = os.path.join(SCRIPT_DIR, fname)
         if os.path.exists(full):
             cmd += [offset, full]
-    print(f"{{CYAN}}Flashing {board}...{{RESET}}")
-    r = subprocess.run(cmd)
-    if r.returncode:
-        print(f"{{RED}}Flash failed ({{r.returncode}}).{{RESET}}")
-        sys.exit(r.returncode)
+    mode = " (--no-stub @ %d)" % baud if no_stub else ""
+    print(f"{{CYAN}}Flashing {board}{{mode}}...{{RESET}}")
+    return subprocess.run(cmd).returncode
 
 def reset_to_app(port):
     try:
@@ -390,6 +478,7 @@ def main():
     ap.add_argument("--baud",    type=int, default=DEFAULT_BAUD)
     ap.add_argument("--erase",   action="store_true", help="Full erase before flashing")
     ap.add_argument("--monitor", action="store_true", help="Serial monitor after flash")
+    ap.add_argument("--no-stub", action="store_true", help="Flash without the stub (slower, robust for finicky ESP32 modules)")
     args = ap.parse_args()
 
     check_files()
@@ -404,7 +493,15 @@ def main():
     if args.erase:
         erase(port, args.baud)
 
-    flash(port, args.baud)
+    rc = flash(port, args.baud, no_stub=args.no_stub)
+    if rc and not args.no_stub:
+        # Some ESP32 modules (e.g. ESP32-PICO-D4 on Atom Lite) drop the stub
+        # when the baud is bumped. Fall back to a robust no-stub @ 115200 pass.
+        print(f"{{YELLOW}}Flash failed at {{args.baud}} baud — retrying with --no-stub @ 115200 (slower but robust)...{{RESET}}")
+        rc = flash(port, 115200, no_stub=True)
+    if rc:
+        print(f"{{RED}}Flash failed ({{rc}}).{{RESET}}")
+        sys.exit(rc)
     reset_to_app(port)
 
     if args.monitor:

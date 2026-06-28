@@ -10,6 +10,7 @@
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "lwip/sockets.h"
+#include "display.h"
 
 static const char *TAG = "wifi_ap";
 
@@ -101,10 +102,12 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
         wifi_event_ap_staconnected_t *e = data;
         s_client_count++;
         ESP_LOGI(TAG, "Client connected: " MACSTR, MAC2STR(e->mac));
+        display_set_client_count(s_client_count);
     } else if (id == WIFI_EVENT_AP_STADISCONNECTED) {
         wifi_event_ap_stadisconnected_t *e = data;
         if (s_client_count > 0) s_client_count--;
         ESP_LOGI(TAG, "Client disconnected: " MACSTR, MAC2STR(e->mac));
+        display_set_client_count(s_client_count);
     }
 }
 

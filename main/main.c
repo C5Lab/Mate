@@ -11,6 +11,7 @@
 #include "web_server.h"
 #include "command_handler.h"
 #include "display.h"
+#include "power_sticks3.h"
 
 static const char *TAG = "janos_wc";
 
@@ -36,6 +37,14 @@ void app_main(void)
     esp_log_level_set("wifi", ESP_LOG_ERROR);
     esp_log_level_set("wifi_init", ESP_LOG_WARN);
 
+    /* StickS3: enable M5PM1 PMIC 5V boost so Grove PORT.A is powered
+     * (no-op on other boards). Must run BEFORE display_init: switching on
+     * the SY7088 boost causes an inrush dip on the shared VBUS_L0 rail that
+     * also feeds the LCD's 3V3 chain, which corrupts an already-initialized
+     * ST7789 and leaves the panel blank. Power first, settle, then init LCD. */
+    power_sticks3_init();
+    vTaskDelay(pdMS_TO_TICKS(50));
+
     /* Display (no-op on boards without display) */
     display_init();
 
@@ -57,7 +66,7 @@ void app_main(void)
 
     /* WiFi Access Point */
     ESP_ERROR_CHECK(wifi_ap_start());
-    display_show_ap_info(wifi_ap_get_ssid(), wifi_ap_get_ip());
+    display_show_ap_info(wifi_ap_get_ssid(), wifi_ap_get_ip(), CONFIG_JANOS_AP_PASSWORD);
 
     ESP_LOGI(TAG, "WiFi AP: %s  IP: %s", wifi_ap_get_ssid(), wifi_ap_get_ip());
 
