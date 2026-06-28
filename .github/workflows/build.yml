@@ -1,0 +1,170 @@
+name: Build firmware
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Optional tag name to upload assets to a release (example 'v1.2.3')"
+        required: false
+  push:
+    branches: [main]
+    paths:
+      - 'main/**'
+      - 'web/**'
+      - 'sdkconfig*'
+      - 'partitions_*.csv'
+      - 'CMakeLists.txt'
+      - '.github/scripts/**'
+      - '.github/workflows/build.yml'
+  release:
+    types: [published, edited]
+
+jobs:
+  build:
+    name: ${{ matrix.board }}
+    permissions:
+      contents: write
+    runs-on: ubuntu-24.04
+    container:
+      image: espressif/idf:release-v6.0
+    outputs:
+      wc_version: ${{ steps.version.outputs.wc_version }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - board: xiao-c6
+            idf_target: esp32c6
+            sdkconfig_extra: sdkconfig.defaults.esp32c6
+
+          - board: cores3
+            idf_target: esp32s3
+            sdkconfig_extra: sdkconfig.defaults.cores3
+
+          - board: atoms3r
+            idf_target: esp32s3
+            sdkconfig_extra: sdkconfig.defaults.atoms3r
+
+          - board: stickc-plus2
+            idf_target: esp32
+            sdkconfig_extra: sdkconfig.defaults.esp32
+
+          - board: atom-lite
+            idf_target: esp32
+            sdkconfig_extra: sdkconfig.defaults.esp32
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read firmware version
+        id: version
+        run: |
+          ver=$(grep -oP '(?<=JANOS_WC_VERSION ")[^"]+' main/main.c)
+          echo "wc_version=$ver" >> "$GITHUB_OUTPUT"
+
+      - name: Cache ESP-IDF artifacts
+        uses: actions/cache@v4
+        with:
+          path: /root/.espressif
+          key: espidf-release-v6.0-${{ matrix.board }}-${{ hashFiles('sdkconfig.defaults', 'dependencies.lock') }}
+          restore-keys: |
+            espidf-release-v6.0-${{ matrix.board }}-
+            espidf-release-v6.0-
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install web dependencies
+        run: npm ci
+        working-directory: web
+
+      - name: Build web UI
+        run: npm run build
+        working-directory: web
+
+      - name: Build firmware (${{ matrix.board }})
+        env:
+          BOARD: ${{ matrix.board }}
+          IDF_TARGET: ${{ matrix.idf_target }}
+          SDKCONFIG_DEFAULTS: "sdkconfig.defaults;${{ matrix.sdkconfig_extra }}"
+          BUILD_DIR: build-${{ matrix.board }}
+        run: bash .github/scripts/container_build.sh --no-docker
+
+      - name: Collect binaries
+        run: |
+          set -e
+          mkdir -p artifacts/${{ matrix.board }}
+          cp build-${{ matrix.board }}/janos-web-client.bin              artifacts/${{ matrix.board }}/mate-${{ matrix.board }}.bin
+          cp build-${{ matrix.board }}/partition_table/partition-table.bin artifacts/${{ matrix.board }}/partition-table-${{ matrix.board }}.bin
+          cp build-${{ matrix.board }}/bootloader/bootloader.bin          artifacts/${{ matrix.board }}/bootloader-${{ matrix.board }}.bin
+          cp build-${{ matrix.board }}/storage.bin                        artifacts/${{ matrix.board }}/storage-${{ matrix.board }}.bin
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ matrix.board }}
+          path: artifacts/${{ matrix.board }}/
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    if: github.ref == 'refs/heads/main' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release_artifacts/
+
+      - name: Resolve release tag
+        id: meta
+        env:
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.release_tag }}
+          WC_VERSION: ${{ needs.build.outputs.wc_version }}
+        run: |
+          TAG="${EVENT_TAG:-}"
+          if [ -z "$TAG" ]; then TAG="${INPUT_TAG:-}"; fi
+          if [ -z "$TAG" ]; then TAG="v${WC_VERSION}"; fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Using tag: $TAG"
+
+      - name: Build release notes
+        run: |
+          printf 'Auto-build from commit %s\n\nBoards:\n' "${{ github.sha }}" > release_notes.md
+          printf -- '- mate-xiao-c6.bin      -> XIAO ESP32-C6\n' >> release_notes.md
+          printf -- '- mate-cores3.bin       -> M5Stack CoreS3 SE\n' >> release_notes.md
+          printf -- '- mate-atoms3r.bin      -> AtomS3R Dev Kit\n' >> release_notes.md
+          printf -- '- mate-stickc-plus2.bin -> M5StickC PLUS2\n' >> release_notes.md
+          printf -- '- mate-atom-lite.bin    -> Atom Lite\n' >> release_notes.md
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          files=()
+          while IFS= read -r -d '' f; do
+            files+=("$f")
+          done < <(find release_artifacts -name "*.bin" -print0)
+
+          gh release delete "$TAG" -R "$GITHUB_REPOSITORY" --yes 2>/dev/null || true
+
+          gh release create "$TAG" -R "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Mate $TAG" \
+            --notes-file release_notes.md \
+            "${files[@]}"
