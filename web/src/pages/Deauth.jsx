@@ -1,54 +1,70 @@
-import { useState } from 'preact/hooks';
+import { useEffect, useState } from 'preact/hooks';
 import { Layout } from '../components/Layout';
-import { AttackMonitor } from '../components/AttackMonitor';
 import { api } from '../api';
 import { getState } from '../store';
 import { showToast } from '../components/Toast';
+import { wsAddListener } from '../ws';
 
 export function Deauth() {
   const [running, setRunning] = useState(false);
   const st = getState();
 
+  useEffect(() => wsAddListener((msg) => {
+    if (msg.type === 'attack_started' && msg.attack === 'deauth') setRunning(true);
+    if (msg.type === 'attack_stopped') setRunning(false);
+  }), []);
+
   async function start() {
-    if (st.selected.size === 0) {
-      showToast('Select networks first', 'warning');
+    if (!st.selected.size) {
+      showToast('Select targets in WiFi Scan first', 'warning');
       return;
     }
+
     await api.select(Array.from(st.selected));
     const res = await api.deauth();
     if (res.ok) {
       setRunning(true);
+      showToast('Deauth started', 'success');
     } else {
-      showToast(res.error || 'Failed', 'error');
+      showToast(res.error || 'Failed to start', 'error');
     }
   }
 
   async function stop() {
     await api.stop();
     setRunning(false);
+    showToast('Stopped', 'warning');
   }
 
   return (
-    <Layout title="Deauth Attack" back="/">
-      <div style="margin-bottom:12px;font-size:13px;color:var(--muted)">
-        Targets: {st.selected.size} network(s) selected
-      </div>
-
-      <div class="btn-row" style="margin-top:0;margin-bottom:14px">
-        {!running ? (
-          <button class="btn btn-red" onClick={start} disabled={st.selected.size === 0}>
-            {'\u{1F4A5}'} Start Deauth
-          </button>
-        ) : (
-          <button class="btn btn-red" onClick={stop}>
-            {'\u{26D4}'} Stop
-          </button>
-        )}
-      </div>
-
-      <AttackMonitor title="Deauth Monitor" attackType="deauth" onEvent={(msg) => {
-        if (msg.type === 'attack_stopped') setRunning(false);
-      }} />
+    <Layout
+      title="Deauth Attack"
+      subtitle="High-impact disruption. Use only with explicit authorization in a legal test environment."
+      back="/"
+    >
+      <section class="glass-card card-body reveal">
+        <div class="kv">
+          <div class="kv-row">
+            <span class="kv-key">Selected targets</span>
+            <span class="kv-val">{st.selected.size}</span>
+          </div>
+          <div class="kv-row">
+            <span class="kv-key">Mode</span>
+            <span class="kv-val">Targeted deauthentication</span>
+          </div>
+        </div>
+        <div class="btn-row">
+          {!running ? (
+            <button class="btn btn-danger" onClick={start} disabled={!st.selected.size}>
+              Start Deauth
+            </button>
+          ) : (
+            <button class="btn btn-danger" onClick={stop}>
+              Stop Attack
+            </button>
+          )}
+        </div>
+      </section>
     </Layout>
   );
 }

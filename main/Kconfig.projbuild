@@ -10,6 +10,10 @@ menu "JanOS Web Client Configuration"
             bool "XIAO ESP32-C6 (no display)"
             depends on IDF_TARGET_ESP32C6
 
+        config JANOS_BOARD_NANOC6
+            bool "M5Stack NanoC6 (no display)"
+            depends on IDF_TARGET_ESP32C6
+
         config JANOS_BOARD_CORES3
             bool "M5Stack CoreS3 SE (ILI9342C 320x240)"
             depends on IDF_TARGET_ESP32S3
@@ -18,14 +22,33 @@ menu "JanOS Web Client Configuration"
             bool "AtomS3R Dev Kit (GC9107 128x128)"
             depends on IDF_TARGET_ESP32S3
 
+        config JANOS_BOARD_ATOMS3
+            bool "M5Stack AtomS3 (GC9107 128x128)"
+            depends on IDF_TARGET_ESP32S3
+
+        config JANOS_BOARD_ATOMS3_LITE
+            bool "M5Stack AtomS3 Lite (no display)"
+            depends on IDF_TARGET_ESP32S3
+
         config JANOS_BOARD_STICKC_PLUS2
             bool "M5StickC PLUS2 (ST7789V2 135x240)"
+            depends on IDF_TARGET_ESP32
+
+        config JANOS_BOARD_STICKS3
+            bool "M5StickC S3 / StickS3 (ST7789P3 135x240)"
+            depends on IDF_TARGET_ESP32S3
+
+        config JANOS_BOARD_ATOM_LITE
+            bool "M5Stack Atom Lite (no display)"
             depends on IDF_TARGET_ESP32
     endchoice
 
     config JANOS_HAS_DISPLAY
         bool
         default n if JANOS_BOARD_XIAO_C6
+        default n if JANOS_BOARD_NANOC6
+        default n if JANOS_BOARD_ATOM_LITE
+        default n if JANOS_BOARD_ATOMS3_LITE
         default y
 
     menu "UART Configuration (Monster connection)"
@@ -33,9 +56,14 @@ menu "JanOS Web Client Configuration"
         config JANOS_UART_TX_PIN
             int "UART TX GPIO pin"
             default 21 if JANOS_BOARD_XIAO_C6
+            default 2  if JANOS_BOARD_NANOC6
             default 2  if JANOS_BOARD_CORES3
             default 32 if JANOS_BOARD_STICKC_PLUS2
             default 5  if JANOS_BOARD_ATOMS3R
+            default 9  if JANOS_BOARD_STICKS3
+            default 26 if JANOS_BOARD_ATOM_LITE
+            default 2  if JANOS_BOARD_ATOMS3
+            default 2  if JANOS_BOARD_ATOMS3_LITE
             help
                 GPIO pin for UART TX to Monster. For M5Stack boards
                 this is typically the Grove port yellow wire.
@@ -43,9 +71,14 @@ menu "JanOS Web Client Configuration"
         config JANOS_UART_RX_PIN
             int "UART RX GPIO pin"
             default 20 if JANOS_BOARD_XIAO_C6
+            default 1  if JANOS_BOARD_NANOC6
             default 1  if JANOS_BOARD_CORES3
             default 33 if JANOS_BOARD_STICKC_PLUS2
             default 6  if JANOS_BOARD_ATOMS3R
+            default 10 if JANOS_BOARD_STICKS3
+            default 32 if JANOS_BOARD_ATOM_LITE
+            default 1  if JANOS_BOARD_ATOMS3
+            default 1  if JANOS_BOARD_ATOMS3_LITE
             help
                 GPIO pin for UART RX from Monster. For M5Stack boards
                 this is typically the Grove port white wire.

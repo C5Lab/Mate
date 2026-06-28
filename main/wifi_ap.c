@@ -10,11 +10,13 @@
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "lwip/sockets.h"
+#include "display.h"
 
 static const char *TAG = "wifi_ap";
 
 static char s_ssid[33];
 static const char *s_ip = "192.168.4.1";
+static int s_client_count = 0;
 
 /* ---------- Captive Portal DNS ----------
  * Minimal DNS server: responds to every A-record query
@@ -98,10 +100,14 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
 {
     if (id == WIFI_EVENT_AP_STACONNECTED) {
         wifi_event_ap_staconnected_t *e = data;
+        s_client_count++;
         ESP_LOGI(TAG, "Client connected: " MACSTR, MAC2STR(e->mac));
+        display_set_client_count(s_client_count);
     } else if (id == WIFI_EVENT_AP_STADISCONNECTED) {
         wifi_event_ap_stadisconnected_t *e = data;
+        if (s_client_count > 0) s_client_count--;
         ESP_LOGI(TAG, "Client disconnected: " MACSTR, MAC2STR(e->mac));
+        display_set_client_count(s_client_count);
     }
 }
 
@@ -152,7 +158,10 @@ esp_err_t wifi_ap_start(void)
     ESP_LOGI(TAG, "AP started: SSID='%s' IP=%s", s_ssid, s_ip);
 
     /* Start captive portal DNS server */
-    xTaskCreate(dns_server_task, "dns_srv", 4096, NULL, 5, NULL);
+    /* Stack: 6KB. recvfrom on lwip with 512-byte buffer + sendto can
+     * blow past 4KB under softAP burst traffic (root cause of
+     * recv_udp/vPortYieldFromInt panic seen in production). */
+    xTaskCreate(dns_server_task, "dns_srv", 6144, NULL, 5, NULL);
 
     return ESP_OK;
 }
@@ -165,4 +174,9 @@ const char *wifi_ap_get_ssid(void)
 const char *wifi_ap_get_ip(void)
 {
     return s_ip;
+}
+
+int wifi_ap_get_client_count(void)
+{
+    return s_client_count;
 }

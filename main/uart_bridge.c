@@ -72,7 +72,7 @@ static void uart_rx_task(void *arg)
             continue;
         }
 
-        ESP_LOGI(TAG, "RX got %d bytes", len);
+        ESP_LOGD(TAG, "RX got %d bytes", len);
         idle_count = 0;
         s_last_rx_ms = millis();
 
@@ -82,7 +82,12 @@ static void uart_rx_task(void *arg)
             if (c == '\n' || c == '\r') {
                 if (s_line_pos > 0) {
                     s_line_buf[s_line_pos] = '\0';
-                    ESP_LOGI(TAG, "RX line: %s", s_line_buf);
+                    /* Mirror the TX log so the user sees both sides of the
+                     * conversation in the Mate console. INFO level by design
+                     * — JanOS lines are sparse enough that this isn't spammy
+                     * during normal operation, and seeing the raw RX is
+                     * essential for diagnosing parser issues. */
+                    ESP_LOGI(TAG, "RX: %s", s_line_buf);
                     dispatch_line(s_line_buf);
                     s_line_pos = 0;
                 }
@@ -92,6 +97,7 @@ static void uart_rx_task(void *arg)
                 } else if (s_line_pos == UART_BRIDGE_LINE_MAX - 1) {
                     s_line_buf[s_line_pos] = '\0';
                     ESP_LOGW(TAG, "Line too long, truncating: %.40s...", s_line_buf);
+                    ESP_LOGI(TAG, "RX (truncated): %s", s_line_buf);
                     dispatch_line(s_line_buf);
                     s_line_pos = 0;
                 }
@@ -122,6 +128,12 @@ void uart_bridge_init(const uart_bridge_config_t *cfg)
     ESP_LOGI(TAG, "UART%d initialized: TX=%d RX=%d @ %d baud",
              s_uart_num, cfg->tx_pin, cfg->rx_pin, cfg->baud_rate);
 
+    /* Stack: 8KB. Original size restored once display_update was throttled
+     * to 10 Hz and the wifi-driver "no need to send deauth" log storm was
+     * suppressed (those two together caused the StoreProhibited panics on
+     * a deeper stack -- root cause is now fixed at the source, so we don't
+     * need to spend an extra 4 KB of internal RAM here. The httpd needs
+     * that headroom to serve the SPA without EAGAIN. */
     xTaskCreate(uart_rx_task, "uart_rx", 8192, NULL, 10, NULL);
 }
 

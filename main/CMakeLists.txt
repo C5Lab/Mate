@@ -6,6 +6,8 @@ set(srcs
     "command_handler.c"
     "response_parser.c"
     "display.c"
+    "dynvec.c"
+    "power_sticks3.c"
 )
 
 idf_component_register(
@@ -16,6 +18,7 @@ idf_component_register(
         esp_driver_uart
         esp_driver_spi
         esp_driver_gpio
+        esp_driver_i2c
         esp_wifi
         esp_netif
         esp_event

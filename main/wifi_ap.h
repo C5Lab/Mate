@@ -18,3 +18,8 @@ const char *wifi_ap_get_ssid(void);
  * Get the AP IP address string (always "192.168.4.1").
  */
 const char *wifi_ap_get_ip(void);
+
+/**
+ * Get currently connected SoftAP client count.
+ */
+int wifi_ap_get_client_count(void);

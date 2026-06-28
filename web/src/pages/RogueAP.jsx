@@ -1,10 +1,10 @@
-import { useState, useEffect } from 'preact/hooks';
+import { useEffect, useState } from 'preact/hooks';
 import { Layout } from '../components/Layout';
-import { AttackMonitor } from '../components/AttackMonitor';
 import { PortalPicker } from '../components/PortalPicker';
 import { api } from '../api';
 import { getState } from '../store';
 import { showToast } from '../components/Toast';
+import { wsAddListener } from '../ws';
 
 export function RogueAP() {
   const [running, setRunning] = useState(false);
@@ -16,9 +16,12 @@ export function RogueAP() {
 
   useEffect(() => {
     loadPasswords();
-    /* Pre-fill SSID from first selected network */
-    const net = st.networks.find(n => st.selected.has(n.index));
-    if (net) setSsid(net.ssid);
+    const selected = st.networks.find((n) => st.selected.has(n.index));
+    if (selected?.ssid) setSsid(selected.ssid);
+    return wsAddListener((msg) => {
+      if (msg.type === 'attack_started' && msg.attack === 'rogueap') setRunning(true);
+      if (msg.type === 'attack_stopped') setRunning(false);
+    });
   }, []);
 
   async function loadPasswords() {
@@ -26,96 +29,107 @@ export function RogueAP() {
       const data = await api.passwords();
       if (data.passwords) {
         setKnownPasswords(data.passwords);
-        /* Auto-fill if we know the password for the selected network */
-        const net = st.networks.find(n => st.selected.has(n.index));
-        if (net) {
+
+        const selected = st.networks.find((n) => st.selected.has(n.index));
+        if (selected) {
           const known = data.passwords.find(
-            p => p.ssid.toLowerCase() === net.ssid.toLowerCase()
+            (item) => item.ssid.toLowerCase() === selected.ssid.toLowerCase(),
           );
-          if (known) {
+          if (known?.password) {
             setPassword(known.password);
-            showToast(`Password known for ${net.ssid}`, 'success');
+            showToast(`Known password loaded for ${selected.ssid}`, 'success');
           }
         }
       }
     } catch (e) {
-      /* First call may trigger fetch; retry after delay */
-      setTimeout(loadPasswords, 3000);
+      setTimeout(loadPasswords, 2500);
     }
   }
 
   async function start() {
-    if (!ssid || ssid.length === 0) {
-      showToast('Enter SSID', 'warning'); return;
+    if (!ssid.trim()) {
+      showToast('SSID is required', 'warning');
+      return;
     }
-    if (!password || password.length < 8) {
-      showToast('Password must be 8+ characters', 'warning'); return;
+    if (password.length < 8) {
+      showToast('Password must be at least 8 characters', 'warning');
+      return;
     }
     if (!portalSelected) {
-      showToast('Select a portal HTML template', 'warning'); return;
+      showToast('Select a portal template', 'warning');
+      return;
     }
 
-    if (st.selected.size > 0) {
+    if (st.selected.size) {
       await api.select(Array.from(st.selected));
     }
 
-    const res = await api.rogueAP(ssid, password);
+    const res = await api.rogueAP(ssid.trim(), password);
     if (res.ok) {
       setRunning(true);
+      showToast('Rogue AP started', 'success');
     } else {
-      showToast(res.error || 'Failed', 'error');
+      showToast(res.error || 'Failed to start', 'error');
     }
   }
 
   async function stop() {
     await api.stop();
     setRunning(false);
+    showToast('Stopped', 'warning');
   }
 
   return (
-    <Layout title="Rogue AP" back="/">
-      {!running && (
-        <>
-          <div class="field">
-            <label>AP SSID</label>
-            <input type="text" value={ssid} maxLength={32}
-                   onInput={e => setSsid(e.target.value)}
-                   placeholder="Network name" />
-          </div>
-
-          <div class="field">
-            <label>
-              WPA2 Password
-              {knownPasswords.length > 0 && (
-                <span class="badge badge-green" style="margin-left:8px">
-                  {knownPasswords.length} known
-                </span>
-              )}
-            </label>
-            <input type="text" value={password}
-                   onInput={e => setPassword(e.target.value)}
-                   placeholder="Min 8 characters" />
-          </div>
-
-          <PortalPicker onSelect={() => setPortalSelected(true)} />
-        </>
-      )}
-
-      <div class="btn-row" style="margin-bottom:14px">
+    <Layout
+      title="Rogue AP"
+      subtitle="Deploy a standalone AP with chosen SSID, credentials, and portal template."
+      back="/"
+    >
+      <section class="glass-card card-body reveal">
         {!running ? (
-          <button class="btn btn-magenta" onClick={start}>
-            {'\u{1F3AD}'} Start Rogue AP
-          </button>
-        ) : (
-          <button class="btn btn-red" onClick={stop}>
-            {'\u{26D4}'} Stop
-          </button>
-        )}
-      </div>
+          <>
+            <div class="field">
+              <label class="field-label">AP SSID</label>
+              <input
+                class="input"
+                type="text"
+                maxLength={32}
+                value={ssid}
+                onInput={(e) => setSsid(e.target.value)}
+                placeholder="Corporate Guest"
+              />
+            </div>
 
-      <AttackMonitor title="Rogue AP Monitor" attackType="rogueap" onEvent={(msg) => {
-        if (msg.type === 'attack_stopped') setRunning(false);
-      }} />
+            <div class="field">
+              <label class="field-label">
+                WPA2 Password
+                <span class="badge info">{knownPasswords.length} known</span>
+              </label>
+              <input
+                class="input"
+                type="text"
+                value={password}
+                onInput={(e) => setPassword(e.target.value)}
+                placeholder="Minimum 8 chars"
+              />
+            </div>
+
+            <PortalPicker onSelect={(idx) => setPortalSelected(idx > 0)} />
+          </>
+        ) : null}
+
+        <div class="btn-row">
+          {!running ? (
+            <button class="btn btn-primary" onClick={start}>
+              Start Rogue AP
+            </button>
+          ) : (
+            <button class="btn btn-danger" onClick={stop}>
+              Stop Rogue AP
+            </button>
+          )}
+        </div>
+      </section>
     </Layout>
   );
 }

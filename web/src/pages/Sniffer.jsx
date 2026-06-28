@@ -1,109 +1,181 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
+import { route } from 'preact-router';
 import { Layout } from '../components/Layout';
-import { AttackMonitor } from '../components/AttackMonitor';
 import { api } from '../api';
-import { getState, setState } from '../store';
+import { setState } from '../store';
 import { showToast } from '../components/Toast';
 import { wsAddListener } from '../ws';
 
-const REFRESH_INTERVAL_MS = 20000;
+const REFRESH_INTERVAL_MS = 4000;
+const SCAN_POLL_MS = 2000;
+const SCAN_TIMEOUT_MS = 60000;
 
-function ScanResultsPreview({ networks }) {
-  if (!networks.length) {
-    return <div class="empty-msg">Waiting for scan results...</div>;
+/* Merge a fresh sniffer snapshot into the current list without ever dropping
+ * an AP we already saw. Each refresh from JanOS may transiently report fewer
+ * APs/clients (e.g. between captures), and we don't want the UI to blink. */
+function mergeAps(prev, fresh) {
+  const map = new Map();
+  for (const a of prev) {
+    map.set(`${a.ssid}__${a.channel}`, { ...a, clients: [...(a.clients || [])] });
   }
+  for (const a of fresh) {
+    const key = `${a.ssid}__${a.channel}`;
+    const existing = map.get(key);
+    if (existing) {
+      const all = new Set([...(existing.clients || []), ...(a.clients || [])]);
+      existing.clients = [...all];
+      existing.clientCount = Math.max(existing.clientCount || 0, a.clientCount || all.size);
+      existing.channel = a.channel || existing.channel;
+    } else {
+      map.set(key, { ...a, clients: [...(a.clients || [])] });
+    }
+  }
+  return [...map.values()];
+}
+
+function mergeProbes(prev, fresh) {
+  const map = new Map();
+  for (const p of prev) map.set(p.ssid || `__idx${p.index}`, p);
+  for (const p of fresh) map.set(p.ssid || `__idx${p.index}`, p);
+  return [...map.values()].sort((a, b) => (a.index || 0) - (b.index || 0));
+}
+
+function NetworkRow({ ap, expanded, onToggle }) {
+  const clientCount = ap.clientCount || 0;
+  const clients = ap.clients || [];
 
   return (
-    <div class="observer-scan-list">
-      {networks.map((network) => (
-        <div class="observer-scan-row" key={network.index}>
-          <div>
-            <div class="observer-ssid">{network.ssid || '[Hidden]'}</div>
-            <div class="observer-scan-meta">{network.bssid} | {network.security} | {network.band}</div>
-          </div>
-          <div class="observer-scan-side">CH{network.channel} | {network.rssi}</div>
-        </div>
-      ))}
-    </div>
+    <li class={`observer-net ${expanded ? 'open' : ''}`}>
+      <button class="observer-net-header" onClick={onToggle}>
+        <span class={`observer-chevron ${expanded ? 'open' : ''}`}>▸</span>
+        <span class="observer-ssid">{ap.ssid || 'Unknown'}</span>
+        <span class="observer-net-meta">CH{ap.channel}</span>
+        <span class={`badge ${clientCount > 0 ? 'ok' : ''}`}>{clientCount} clients</span>
+      </button>
+      {expanded ? (
+        <ul class="observer-clients">
+          {clients.length > 0 ? clients.map((mac) => (
+            <li class="observer-client" key={`${ap.ssid}-${mac}`}>{mac}</li>
+          )) : (
+            <li class="observer-client empty">Waiting for client list...</li>
+          )}
+        </ul>
+      ) : null}
+    </li>
   );
 }
 
-function SnifferResultsTable({ aps }) {
+function NetworksPanel({ aps }) {
+  const [expandedKey, setExpandedKey] = useState(null);
+
   if (!aps.length) {
-    return <div class="empty-msg">No APs with clients found.</div>;
+    return <div class="empty-state">No APs with clients yet. Keep observer running.</div>;
+  }
+
+  const sorted = [...aps].sort((a, b) => (b.clientCount || 0) - (a.clientCount || 0));
+
+  return (
+    <ul class="observer-net-list">
+      {sorted.map((ap) => {
+        const key = `${ap.ssid}-${ap.channel}`;
+        const expanded = expandedKey === key;
+        return (
+          <NetworkRow
+            ap={ap}
+            expanded={expanded}
+            onToggle={() => setExpandedKey(expanded ? null : key)}
+            key={key}
+          />
+        );
+      })}
+    </ul>
+  );
+}
+
+function ProbesPanel({ probes, onPick }) {
+  if (!probes.length) {
+    return <div class="empty-state">No probes captured yet.</div>;
   }
 
   return (
-    <div class="observer-table-wrap">
-      <table class="observer-table">
-        <thead>
-          <tr>
-            <th>Network</th>
-            <th>Channel</th>
-            <th>Clients</th>
-            <th>Client MACs</th>
-          </tr>
-        </thead>
-        <tbody>
-          {aps.map((ap, index) => (
-            <tr key={`${ap.ssid}-${ap.channel}-${index}`}>
-              <td>
-                <div class="observer-ssid">{ap.ssid || 'Unknown SSID'}</div>
-              </td>
-              <td>CH{ap.channel}</td>
-              <td>{ap.clientCount}</td>
-              <td>
-                <div class="observer-macs">
-                  {ap.clients.length > 0 ? ap.clients.map((client) => (
-                    <span class="observer-mac" key={`${ap.ssid}-${client}`}>{client}</span>
-                  )) : <span class="observer-empty">Waiting for client list...</span>}
-                </div>
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
+    <ul class="probe-list">
+      {probes.map((p) => (
+        <li key={`${p.index}-${p.ssid}`}>
+          <button class="probe-item" onClick={() => onPick(p)}>
+            <span class="probe-idx">{p.index}</span>
+            <span class="probe-ssid">{p.ssid || '[hidden]'}</span>
+            <span class="probe-cta">Karma →</span>
+          </button>
+        </li>
+      ))}
+    </ul>
   );
 }
 
 export function Sniffer() {
   const [running, setRunning] = useState(false);
-  const [scanNetworks, setScanNetworks] = useState([]);
-  const [scanComplete, setScanComplete] = useState(false);
   const [isScanning, setIsScanning] = useState(false);
-  const [isRefreshing, setIsRefreshing] = useState(false);
   const [packetCount, setPacketCount] = useState(0);
   const [aps, setAps] = useState([]);
-  const [hasSnapshot, setHasSnapshot] = useState(false);
+  const [probes, setProbes] = useState([]);
   const refreshTimerRef = useRef(null);
   const scanPollRef = useRef(null);
   const scanTimeoutRef = useRef(null);
+  const refreshTickRef = useRef(0);
+
+  const apCount = aps.length;
+  const clientTotal = aps.reduce((sum, ap) => sum + (ap.clientCount || 0), 0);
 
   useEffect(() => {
+    (async () => {
+      try {
+        const status = await api.status();
+        if (status?.ok && status.state === 'sniffer') {
+          setRunning(true);
+          await loadSnifferResults();
+          await loadProbes();
+          startRefreshLoop();
+        } else {
+          await loadSnifferResults();
+          await loadProbes();
+        }
+      } catch (e) {
+        /* ignore initial sync errors */
+      }
+    })();
+
     const removeWs = wsAddListener((msg) => {
       if (msg.type === 'sniffer_count') {
-        setPacketCount(msg.count);
+        setPacketCount(msg.count || 0);
+        setState({ packetCount: msg.count || 0 });
       }
 
       if (msg.type === 'sniffer_results_updated') {
         loadSnifferResults();
       }
 
+      if (msg.type === 'probes_updated') {
+        loadProbes();
+      }
+
+      if (msg.type === 'attack_started' && msg.attack === 'sniffer') {
+        setRunning(true);
+      }
+
       if (msg.type === 'attack_stopped') {
-        stopTimers();
+        stopAllTimers();
         setRunning(false);
-        setIsRefreshing(false);
+        setIsScanning(false);
       }
     });
 
     return () => {
-      stopTimers();
+      stopAllTimers();
       removeWs();
     };
   }, []);
 
-  function stopTimers() {
+  function stopAllTimers() {
     if (refreshTimerRef.current) {
       clearInterval(refreshTimerRef.current);
       refreshTimerRef.current = null;
@@ -123,30 +195,59 @@ export function Sniffer() {
       const data = await api.snifferResults();
       if (!data.ok) return;
       setPacketCount(data.packetCount || 0);
-      setAps(data.aps || []);
-      setHasSnapshot(Boolean(data.hasSnapshot));
-      setIsRefreshing(false);
+      setState({ packetCount: data.packetCount || 0 });
+      const fresh = Array.isArray(data.aps) ? data.aps : [];
+      /* Only merge into the visible list when we got something. Empty refreshes
+       * are common (firmware between snapshots) and would otherwise blank the
+       * panel for the user. */
+      if (fresh.length > 0) {
+        setAps((prev) => mergeAps(prev, fresh));
+      }
     } catch (e) {
-      console.error('Failed to load sniffer results:', e);
-      setIsRefreshing(false);
+      /* ignore */
     }
   }
 
-  async function refreshSnifferResults() {
-    setIsRefreshing(true);
+  async function loadProbes() {
     try {
-      const res = await api.refreshSniffer();
-      if (!res.ok) {
-        setIsRefreshing(false);
+      const data = await api.probes();
+      if (!data.ok || !Array.isArray(data.probes)) return;
+      if (data.probes.length > 0) {
+        setProbes((prev) => mergeProbes(prev, data.probes));
       }
     } catch (e) {
-      console.error('Failed to refresh sniffer results:', e);
-      setIsRefreshing(false);
+      /* ignore */
     }
+  }
+
+  async function tickRefresh() {
+    /* Alternate between the two listing commands so JanOS never sees them
+       overlap (each listing locks state until its prompt completes). */
+    const tick = refreshTickRef.current++;
+    try {
+      if (tick % 2 === 0) {
+        await api.refreshSniffer();
+      } else {
+        await api.refreshProbes();
+      }
+    } catch (e) { /* ignore */ }
+  }
+
+  async function refreshAll() {
+    try { await api.refreshSniffer(); } catch (e) { /* ignore */ }
+    setTimeout(async () => {
+      try { await api.refreshProbes(); } catch (e) { /* ignore */ }
+    }, 1000);
+  }
+
+  function startRefreshLoop() {
+    if (refreshTimerRef.current) return;
+    refreshTickRef.current = 0;
+    refreshTimerRef.current = setInterval(tickRefresh, REFRESH_INTERVAL_MS);
   }
 
   async function startSnifferAfterScan() {
-    const res = await api.sniffer();
+    const res = await api.snifferNoscan();
     if (!res.ok) {
       showToast(res.error || 'Failed to start observer', 'error');
       setIsScanning(false);
@@ -157,22 +258,20 @@ export function Sniffer() {
     setIsScanning(false);
     setPacketCount(0);
     setAps([]);
-    setHasSnapshot(false);
-    await refreshSnifferResults();
-    refreshTimerRef.current = setInterval(refreshSnifferResults, REFRESH_INTERVAL_MS);
+    setProbes([]);
+    await loadSnifferResults();
+    await loadProbes();
+    startRefreshLoop();
     showToast('Network Observer started', 'success');
   }
 
   async function start() {
-    stopTimers();
+    stopAllTimers();
     setIsScanning(true);
     setRunning(false);
-    setIsRefreshing(false);
     setPacketCount(0);
     setAps([]);
-    setHasSnapshot(false);
-    setScanNetworks([]);
-    setScanComplete(false);
+    setProbes([]);
     setState({ networks: [], selected: new Set(), status: 'scanning' });
 
     try {
@@ -193,82 +292,106 @@ export function Sniffer() {
         const data = await api.scanResults();
         if (!data.ok) return;
 
-        setScanNetworks(data.networks || []);
         setState({ networks: data.networks || [], selected: new Set() });
 
         if (data.complete) {
-          stopTimers();
-          setScanComplete(true);
+          if (scanPollRef.current) {
+            clearInterval(scanPollRef.current);
+            scanPollRef.current = null;
+          }
+          if (scanTimeoutRef.current) {
+            clearTimeout(scanTimeoutRef.current);
+            scanTimeoutRef.current = null;
+          }
           showToast(`Scan complete: ${data.count} networks`, 'success');
           await startSnifferAfterScan();
         }
       } catch (e) {
-        console.error('Failed to poll scan results:', e);
+        /* ignore poll error */
       }
-    }, 2000);
+    }, SCAN_POLL_MS);
 
     scanTimeoutRef.current = setTimeout(() => {
-      stopTimers();
+      stopAllTimers();
       setIsScanning(false);
       showToast('Scan timed out', 'warning');
-    }, 60000);
+    }, SCAN_TIMEOUT_MS);
   }
 
   async function stop() {
-    stopTimers();
+    stopAllTimers();
     await api.stop();
     setRunning(false);
     setIsScanning(false);
-    setIsRefreshing(false);
+    showToast('Observer stopped', 'warning');
+  }
+
+  function pickProbe(probe) {
+    route(`/karma?probe=${probe.index}&ssid=${encodeURIComponent(probe.ssid || '')}`);
   }
 
   return (
-    <Layout title="Network Observer" back="/">
-      <div class="observer-stats">
-        <div class="observer-stat-label">Packages</div>
-        <div class="observer-stat-value">{packetCount}</div>
-      </div>
+    <Layout
+      title="Network Observer"
+      back="/"
+    >
+      <section class="glass-card card-body reveal">
+        <div class="stats-grid" style="grid-template-columns: repeat(4, minmax(0, 1fr));">
+          <article class="stat-card">
+            <div class="stat-label">Packets</div>
+            <div class="stat-value">{packetCount}</div>
+          </article>
+          <article class="stat-card">
+            <div class="stat-label">APs</div>
+            <div class="stat-value">{apCount}</div>
+          </article>
+          <article class="stat-card">
+            <div class="stat-label">Clients</div>
+            <div class="stat-value">{clientTotal}</div>
+          </article>
+          <article class="stat-card">
+            <div class="stat-label">Probes</div>
+            <div class="stat-value">{probes.length}</div>
+          </article>
+        </div>
 
-      <div class="btn-row" style="margin-top:0;margin-bottom:14px">
-        <button class="btn btn-green" onClick={start} disabled={running || isScanning}>
-          {isScanning ? <><span class="spinner" /> Scanning...</> : 'Start'}
-        </button>
-        <button class="btn btn-red" onClick={stop} disabled={!running && !isScanning}>
-          Stop
-        </button>
-      </div>
+        <div class="btn-row">
+          <button class="btn btn-success" onClick={start} disabled={running || isScanning}>
+            {isScanning ? <><span class="spinner" /> Scanning...</> : 'Start Observer'}
+          </button>
+          <button class="btn btn-secondary" onClick={refreshAll} disabled={!running}>
+            Refresh
+          </button>
+          <button class="btn btn-danger" onClick={stop} disabled={!running && !isScanning}>
+            Stop
+          </button>
+        </div>
 
-      <div class="observer-hint">
-        Start runs one scan, then launches the observer and refreshes client data every 20 seconds.
-      </div>
+        <div class="section-note">
+          Start runs one scan, then launches sniffer (noscan) and refreshes clients + probes every 4s.
+        </div>
+      </section>
 
-      {(scanNetworks.length > 0 || isScanning || scanComplete) && (
-        <div class="panel">
-          <div class="panel-header">
-            <span>Scan Results ({scanNetworks.length})</span>
-            {scanComplete && <span class="badge badge-cyan">ready</span>}
+      <div class="observer-grid">
+        <section class="glass-card card-body reveal">
+          <div class="section-head">
+            <h3 class="section-title">Observed Networks</h3>
+            <span class={`badge ${running ? 'ok' : ''}`}>{running ? 'Live' : 'Idle'}</span>
           </div>
-          <div class="panel-body" style="max-height:40vh;overflow-y:auto;padding:0">
-            <ScanResultsPreview networks={scanNetworks} />
+          <NetworksPanel aps={aps} />
+        </section>
+
+        <section class="glass-card card-body reveal">
+          <div class="section-head">
+            <h3 class="section-title">Probe Requests</h3>
+            <span class="badge">{probes.length}</span>
           </div>
-        </div>
-      )}
-
-      <div class="panel">
-        <div class="panel-header">
-          <span>Observed Clients</span>
-          {running && isRefreshing && <span class="badge badge-cyan">refreshing</span>}
-        </div>
-        <div class="panel-body">
-          {hasSnapshot ? <SnifferResultsTable aps={aps} /> : (
-            <div class="empty-msg">
-              {running ? 'Waiting for first observer snapshot...' : 'Press Start to begin observing.'}
-            </div>
-          )}
-        </div>
+          <div class="section-note" style="margin-top:0;margin-bottom:8px">
+            Click a probe to launch Karma against it.
+          </div>
+          <ProbesPanel probes={probes} onPick={pickProbe} />
+        </section>
       </div>
-
-      <AttackMonitor title="Network Observer Monitor" attackType="sniffer" />
     </Layout>
   );
 }

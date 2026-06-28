@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 import { api } from '../api';
 import { wsAddListener } from '../ws';
 
@@ -26,7 +26,7 @@ export function PortalPicker({ onSelect }) {
   }
 
   function scheduleRetry() {
-    if (retryTimerRef.current || filesRef.current.length > 0 || retryCountRef.current >= 5) {
+    if (retryTimerRef.current || filesRef.current.length > 0 || retryCountRef.current >= 6) {
       return;
     }
 
@@ -40,17 +40,15 @@ export function PortalPicker({ onSelect }) {
   }
 
   useEffect(() => {
-    let mounted = true;
-
     const removeWs = wsAddListener((msg) => {
-      if (!mounted || msg.type !== 'portals' || !msg.files) return;
-      finishWithFiles(msg.files);
+      if (msg.type === 'portals' && msg.files) {
+        finishWithFiles(msg.files);
+      }
     });
 
     loadPortals();
 
     return () => {
-      mounted = false;
       clearRetryTimer();
       removeWs();
     };
@@ -64,18 +62,11 @@ export function PortalPicker({ onSelect }) {
         finishWithFiles(data.files);
         return;
       }
-
-      if (data.status === 'loading') {
-        scheduleRetry();
-        return;
-      }
-
-      if (data.error === 'busy' || !data.ok) {
+      if (data.status === 'loading' || data.error === 'busy' || !data.ok) {
         scheduleRetry();
         return;
       }
     } catch (e) {
-      console.error('Failed to load portals:', e);
       scheduleRetry();
       return;
     }
@@ -89,26 +80,22 @@ export function PortalPicker({ onSelect }) {
     if (onSelect) onSelect(idx);
   }
 
-  if (loading) return <div class="empty-msg"><span class="spinner" /> Loading portals...</div>;
-
   return (
     <div class="field">
-      <label>HTML Portal Template</label>
-      <select
-        value={selected}
-        disabled={loading}
-        onChange={e => handleSelect(parseInt(e.target.value))}
-      >
-        <option value={0}>-- Select portal --</option>
-        {files.map(f => (
-          <option key={f.index} value={f.index}>{f.name}</option>
+      <label class="field-label">
+        Portal Template
+        {files.length > 0 && <span class="badge info">{files.length} loaded</span>}
+      </label>
+      <select class="select" value={selected} disabled={loading} onChange={(e) => handleSelect(parseInt(e.target.value, 10))}>
+        <option value={0}>Select HTML portal</option>
+        {files.map((f) => (
+          <option key={f.index} value={f.index}>
+            {f.name}
+          </option>
         ))}
       </select>
-      {files.length === 0 && (
-        <div style="font-size:11px;color:var(--muted);margin-top:4px">
-          No HTML files on SD card.
-        </div>
-      )}
+      {loading ? <div class="section-note">Fetching portal list from SD...</div> : null}
+      {!loading && files.length === 0 ? <div class="section-note">No portal templates found on SD card.</div> : null}
     </div>
   );
 }

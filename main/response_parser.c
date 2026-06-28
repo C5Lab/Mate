@@ -104,57 +104,126 @@ bool parse_portal_file_line(const char *line, parsed_portal_file_t *f)
     return f->index > 0 && len > 0;
 }
 
+/* ---------- Probe parsing ---------- */
+
+bool parse_probe_line(const char *line, parsed_probe_t *p)
+{
+    if (!line || !p) return false;
+
+    const char *q = line;
+    while (*q == ' ' || *q == '\t') q++;
+    if (!isdigit((unsigned char)*q)) return false;
+
+    int idx = 0;
+    while (isdigit((unsigned char)*q)) {
+        idx = idx * 10 + (*q - '0');
+        q++;
+    }
+    if (idx <= 0) return false;
+    if (*q != ' ' && *q != '\t') return false;
+    while (*q == ' ' || *q == '\t') q++;
+    if (*q == '\0') return false;
+
+    memset(p, 0, sizeof(*p));
+    p->index = idx;
+    strncpy(p->ssid, q, sizeof(p->ssid) - 1);
+
+    int len = strlen(p->ssid);
+    while (len > 0 && p->ssid[len - 1] <= ' ') {
+        p->ssid[--len] = '\0';
+    }
+
+    return len > 0;
+}
+
 /* ---------- Sniffer parsing ---------- */
 
 bool parse_sniffer_ap_line(const char *line, parsed_sniffer_ap_t *ap)
 {
-    /* Format: "AX3, CH40: 2" */
-    if (!line || line[0] == ' ') return false;
+    /* Primary format from SKILL:
+     *   "AX3, CH40: 2"
+     * Additional tolerated variants:
+     *   "AX3,CH40:2"
+     *   "AX3, CH40: 2 [Vendor]"
+     */
+    if (!line) return false;
 
-    const char *comma = strstr(line, ", CH");
-    if (!comma) return false;
+    const char *p = line;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p == '\0') return false;
 
-    const char *colon = strchr(comma, ':');
+    /* Client lines are indented MACs; AP lines are not. */
+    if (line[0] == ' ' || line[0] == '\t') return false;
+
+    const char *ch = strstr(p, "CH");
+    if (!ch) return false;
+
+    const char *colon = strchr(ch, ':');
     if (!colon) return false;
+
+    const char *ssid_end = ch;
+    while (ssid_end > p && (ssid_end[-1] == ' ' || ssid_end[-1] == ',')) ssid_end--;
+    if (ssid_end <= p) return false;
 
     memset(ap, 0, sizeof(*ap));
 
-    int ssid_len = comma - line;
+    int ssid_len = (int)(ssid_end - p);
     if (ssid_len > (int)sizeof(ap->ssid) - 1) ssid_len = sizeof(ap->ssid) - 1;
-    memcpy(ap->ssid, line, ssid_len);
+    memcpy(ap->ssid, p, ssid_len);
+    ap->ssid[ssid_len] = '\0';
 
-    ap->channel      = atoi(comma + 4); /* skip ", CH" */
+    ap->channel = atoi(ch + 2);
     ap->client_total = atoi(colon + 1);
-    ap->client_count = 0;
+    if (ap->client_total < 0) ap->client_total = 0;
 
-    return true;
+    /* Caller owns client storage (heap-backed dynvec under the hood); leave
+     * the pointer fields in a defined "no clients yet" state. */
+    ap->client_count = 0;
+    ap->client_cap   = 0;
+    ap->clients      = NULL;
+
+    return ap->channel > 0;
 }
 
 bool parse_sniffer_client_line(const char *line, char *mac_out, int mac_len)
 {
-    if (!line || line[0] != ' ') return false;
+    if (!line || !mac_out || mac_len < 18) return false;
+
+    /* In SKILL, client lines are indented with leading whitespace. */
+    if (!(line[0] == ' ' || line[0] == '\t')) return false;
 
     const char *p = line;
-    while (*p == ' ') p++;
+    while (*p) {
+        if (isxdigit((unsigned char)p[0]) &&
+            isxdigit((unsigned char)p[1]) &&
+            p[2] == ':' &&
+            isxdigit((unsigned char)p[3]) &&
+            isxdigit((unsigned char)p[4]) &&
+            p[5] == ':' &&
+            isxdigit((unsigned char)p[6]) &&
+            isxdigit((unsigned char)p[7]) &&
+            p[8] == ':' &&
+            isxdigit((unsigned char)p[9]) &&
+            isxdigit((unsigned char)p[10]) &&
+            p[11] == ':' &&
+            isxdigit((unsigned char)p[12]) &&
+            isxdigit((unsigned char)p[13]) &&
+            p[14] == ':' &&
+            isxdigit((unsigned char)p[15]) &&
+            isxdigit((unsigned char)p[16])) {
+            memcpy(mac_out, p, 17);
+            mac_out[17] = '\0';
+            return true;
+        }
+        p++;
+    }
 
-    /* Expect MAC format XX:XX:XX:XX:XX:XX (17 chars) */
-    int len = strlen(p);
-    if (len < 17) return false;
-
-    /* Quick validation: check colons at expected positions */
-    if (p[2] != ':' || p[5] != ':') return false;
-
-    strncpy(mac_out, p, mac_len - 1);
-    mac_out[mac_len - 1] = '\0';
-    /* Trim to 17 chars if longer */
-    if (strlen(mac_out) > 17) mac_out[17] = '\0';
-
-    return true;
+    return false;
 }
 
 bool parse_sniffer_empty_line(const char *line)
 {
-    return line && strcmp(line, "No APs with clients found.") == 0;
+    return line && strstr(line, "No APs with clients found.") != NULL;
 }
 
 /* ---------- Attack event detection ---------- */
@@ -184,6 +253,10 @@ attack_event_t parse_attack_event(const char *line)
         strncpy(ev.detail, pw, sizeof(ev.detail) - 1);
     } else if (strstr(line, "Password verified!")) {
         ev.type = ATTACK_EVENT_PASSWORD_VERIFIED;
+    } else if (strstr(line, "Password: ")) {
+        ev.type = ATTACK_EVENT_PASSWORD_RECEIVED;
+        const char *pw = strstr(line, "Password: ") + 10;
+        strncpy(ev.detail, pw, sizeof(ev.detail) - 1);
     } else if (strstr(line, "AP: Client connected")) {
         ev.type = ATTACK_EVENT_CLIENT_CONNECTED;
         const char *mac = strstr(line, "MAC:");

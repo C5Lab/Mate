@@ -1,3 +1,9 @@
 {
-    "idf.currentSetup": "C:\\Users\\mati\\esp\\v6.0-beta1\\esp-idf"
+  "idf.currentSetup": "C:\\Users\\mati\\esp\\v6.0-beta1\\esp-idf",
+  "clangd.path": "C:\\Espressif\\tools\\esp-clang\\esp-20.1.1_20250829\\esp-clang\\bin\\clangd.exe",
+  "clangd.arguments": [
+    "--background-index",
+    "--query-driver=**",
+    "--compile-commands-dir=c:\\Users\\mati\\Documents\\GitHub\\Mate\\build"
+  ]
 }

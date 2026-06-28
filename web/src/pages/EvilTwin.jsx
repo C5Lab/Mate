@@ -1,10 +1,10 @@
-import { useState } from 'preact/hooks';
+import { useEffect, useState } from 'preact/hooks';
 import { Layout } from '../components/Layout';
-import { AttackMonitor } from '../components/AttackMonitor';
 import { PortalPicker } from '../components/PortalPicker';
 import { api } from '../api';
 import { getState } from '../store';
 import { showToast } from '../components/Toast';
+import { wsAddListener } from '../ws';
 
 export function EvilTwin() {
   const [running, setRunning] = useState(false);
@@ -12,76 +12,109 @@ export function EvilTwin() {
   const [passwords, setPasswords] = useState([]);
   const st = getState();
 
-  const targetNet = st.networks.find(n => st.selected.has(n.index));
+  useEffect(() => wsAddListener((msg) => {
+    if (msg.type === 'attack_started' && msg.attack === 'eviltwin') setRunning(true);
+    if (msg.type === 'attack_stopped') setRunning(false);
+    if (msg.type === 'password_received') {
+      setPasswords((prev) => [
+        {
+          id: `${Date.now()}-${Math.random().toString(16).slice(2, 6)}`,
+          password: msg.password,
+          time: new Date().toLocaleTimeString(),
+        },
+        ...prev,
+      ]);
+      showToast(`Password captured: ${msg.password}`, 'success');
+    }
+  }), []);
+
+  const targetNet = st.networks.find((n) => st.selected.has(n.index));
 
   async function start() {
-    if (st.selected.size === 0) {
-      showToast('Select networks first (first = clone target)', 'warning');
+    if (!st.selected.size) {
+      showToast('Choose at least one target network first', 'warning');
       return;
     }
     if (!portalSelected) {
-      showToast('Select a portal HTML template', 'warning');
+      showToast('Select an SD portal template', 'warning');
       return;
     }
+
     await api.select(Array.from(st.selected));
     const res = await api.evilTwin();
     if (res.ok) {
       setRunning(true);
+      showToast('Evil Twin started', 'success');
     } else {
-      showToast(res.error || 'Failed', 'error');
+      showToast(res.error || 'Failed to start', 'error');
     }
   }
 
   async function stop() {
     await api.stop();
     setRunning(false);
-  }
-
-  function onEvent(msg) {
-    if (msg.type === 'attack_stopped') setRunning(false);
-    if (msg.type === 'password_received') {
-      setPasswords(prev => [...prev, msg.password]);
-    }
+    showToast('Stopped', 'warning');
   }
 
   return (
-    <Layout title="Evil Twin" back="/">
-      <div style="margin-bottom:12px;font-size:13px;color:var(--muted)">
-        Clone target: {targetNet ? targetNet.ssid : 'none'} |
-        Deauth targets: {st.selected.size}
-      </div>
-
-      {!running && (
-        <PortalPicker onSelect={() => setPortalSelected(true)} />
-      )}
-
-      <div class="btn-row" style="margin-bottom:14px">
-        {!running ? (
-          <button class="btn btn-orange" onClick={start}
-                  disabled={st.selected.size === 0 || !portalSelected}>
-            {'\u{1F47B}'} Start Evil Twin
-          </button>
-        ) : (
-          <button class="btn btn-red" onClick={stop}>
-            {'\u{26D4}'} Stop
-          </button>
-        )}
-      </div>
-
-      {passwords.length > 0 && (
-        <div class="panel">
-          <div class="panel-header">Captured Passwords ({passwords.length})</div>
-          <div class="panel-body" style="padding:8px 14px">
-            {passwords.map((pw, i) => (
-              <div key={i} style="font-family:monospace;font-size:13px;padding:4px 0;color:var(--green)">
-                {pw}
-              </div>
-            ))}
+    <Layout
+      title="Evil Twin"
+      subtitle="Clone selected AP and present a credential portal template from SD storage."
+      back="/"
+    >
+      <section class="glass-card card-body reveal">
+        <div class="kv">
+          <div class="kv-row">
+            <span class="kv-key">Clone target</span>
+            <span class="kv-val">{targetNet?.ssid || 'Not selected'}</span>
+          </div>
+          <div class="kv-row">
+            <span class="kv-key">Deauth targets</span>
+            <span class="kv-val">{st.selected.size}</span>
           </div>
         </div>
-      )}
 
-      <AttackMonitor title="Evil Twin Monitor" attackType="eviltwin" onEvent={onEvent} />
+        {!running ? <PortalPicker onSelect={(idx) => setPortalSelected(idx > 0)} /> : null}
+
+        <div class="btn-row">
+          {!running ? (
+            <button class="btn btn-primary" onClick={start} disabled={!st.selected.size || !portalSelected}>
+              Start Evil Twin
+            </button>
+          ) : (
+            <button class="btn btn-danger" onClick={stop}>
+              Stop Operation
+            </button>
+          )}
+        </div>
+      </section>
+
+      {passwords.length > 0 ? (
+        <section class="glass-card card-body reveal">
+          <div class="section-head">
+            <h3 class="section-title">Captured Credentials</h3>
+            <span class="badge ok">{passwords.length}</span>
+          </div>
+          <div class="table-wrap">
+            <table class="table">
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Password</th>
+                </tr>
+              </thead>
+              <tbody>
+                {passwords.map((pw) => (
+                  <tr key={pw.id}>
+                    <td>{pw.time}</td>
+                    <td>{pw.password}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      ) : null}
     </Layout>
   );
 }

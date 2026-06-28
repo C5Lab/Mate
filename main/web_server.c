@@ -1,7 +1,10 @@
 #include "web_server.h"
 #include "command_handler.h"
 #include "response_parser.h"
+#include "wifi_ap.h"
+#include "dynvec.h"
 
+#include <stdarg.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -22,11 +25,124 @@ static httpd_handle_t s_server = NULL;
 
 /* ---------- WebSocket client tracking ---------- */
 
+/* Policy cap on simultaneous WS clients -- not a data cap. Mate is a
+ * single-user device; allowing more than a handful of browsers to push
+ * commands at the same time invites contention, not features. Kept fixed
+ * intentionally; do NOT generalise this to a dynvec. */
 #define MAX_WS_CLIENTS 4
 
 static int s_ws_fds[MAX_WS_CLIENTS];
 static int s_ws_count = 0;
 static SemaphoreHandle_t s_ws_mutex;
+
+/* Allocate big response/JSON buffers preferentially from PSRAM (when
+ * enabled in sdkconfig). On boards without PSRAM (e.g. XIAO-ESP32-C6)
+ * heap_caps_malloc with MALLOC_CAP_SPIRAM returns NULL, so we fall back
+ * to internal heap. Keeps the 8 KB / 16 KB JSON staging buffers off the
+ * scarce internal RAM pool that wifi/lwip/httpd workers compete for. */
+static void *psram_malloc(size_t bytes)
+{
+    void *p = heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!p) p = malloc(bytes);
+    return p;
+}
+
+/* ---------- Chunked JSON writer ----------
+ *
+ * Streams an HTTP response in 1 KB chunks via httpd_resp_send_chunk. Each
+ * call to cw_printf() appends to an internal buffer; whenever the buffer
+ * fills (or printf wants more than will fit) the buffer is flushed.
+ * cw_finish() flushes any remainder and terminates the chunked transfer.
+ *
+ * Replaces the historical pattern of preallocating a fixed-size JSON buffer
+ * (8 KB for scan results, 16 KB for sniffer, 4 KB for subghz) which silently
+ * truncated the output once the cap was reached and routinely OOM'd on the
+ * ESP32 once wifi/lwip were up. */
+typedef struct {
+    httpd_req_t *req;
+    char         buf[1024];
+    int          pos;
+    bool         failed;
+} chunked_writer_t;
+
+static void cw_init(chunked_writer_t *cw, httpd_req_t *req)
+{
+    cw->req    = req;
+    cw->pos    = 0;
+    cw->failed = false;
+    httpd_resp_set_type(req, "application/json");
+}
+
+static void cw_flush(chunked_writer_t *cw)
+{
+    if (cw->failed || cw->pos == 0) return;
+    if (httpd_resp_send_chunk(cw->req, cw->buf, cw->pos) != ESP_OK) {
+        cw->failed = true;
+    }
+    cw->pos = 0;
+}
+
+static void cw_vprintf(chunked_writer_t *cw, const char *fmt, va_list ap)
+{
+    if (cw->failed) return;
+
+    /* First attempt into the remaining slot of the current buffer. */
+    int remaining = (int)sizeof(cw->buf) - cw->pos;
+    va_list aq;
+    va_copy(aq, ap);
+    int written = vsnprintf(cw->buf + cw->pos, remaining, fmt, aq);
+    va_end(aq);
+
+    if (written < 0) return;
+
+    if (written < remaining) {
+        cw->pos += written;
+        return;
+    }
+
+    /* Doesn't fit -- flush, then either retry into a fresh buffer, or
+     * (for genuinely large tokens) allocate a one-shot scratch chunk. */
+    cw_flush(cw);
+    if (cw->failed) return;
+
+    if (written < (int)sizeof(cw->buf)) {
+        va_copy(aq, ap);
+        cw->pos = vsnprintf(cw->buf, sizeof(cw->buf), fmt, aq);
+        va_end(aq);
+        return;
+    }
+
+    /* Single token bigger than buf -- ship it via a dedicated chunk. */
+    char *scratch = psram_malloc((size_t)written + 1);
+    if (!scratch) {
+        cw->failed = true;
+        return;
+    }
+    va_copy(aq, ap);
+    int n = vsnprintf(scratch, (size_t)written + 1, fmt, aq);
+    va_end(aq);
+    if (n > 0 && httpd_resp_send_chunk(cw->req, scratch, n) != ESP_OK) {
+        cw->failed = true;
+    }
+    free(scratch);
+}
+
+static void cw_printf(chunked_writer_t *cw, const char *fmt, ...)
+    __attribute__((format(printf, 2, 3)));
+static void cw_printf(chunked_writer_t *cw, const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    cw_vprintf(cw, fmt, ap);
+    va_end(ap);
+}
+
+static esp_err_t cw_finish(chunked_writer_t *cw)
+{
+    cw_flush(cw);
+    if (cw->failed) return ESP_FAIL;
+    return httpd_resp_send_chunk(cw->req, NULL, 0);
+}
 
 /* ---------- WS send queue (decouples UART task from httpd) ---------- */
 
@@ -187,7 +303,11 @@ static esp_err_t serve_spiffs_file(httpd_req_t *req, const char *filepath)
         return ESP_OK;
     }
 
-    char buf[512];
+    /* 2 KB chunks: cuts httpd_resp_send_chunk count for app.js (96 KB) from
+     * ~188 to ~47, reducing chunked-encoding overhead and lwip pressure
+     * that was producing intermittent EAGAIN under softAP load. The httpd
+     * worker stack is 6 KB so this fits comfortably. */
+    char buf[2048];
     int read_bytes;
     while ((read_bytes = fread(buf, 1, sizeof(buf), f)) > 0) {
         httpd_resp_send_chunk(req, buf, read_bytes);
@@ -246,33 +366,22 @@ static esp_err_t api_scan_post(httpd_req_t *req)
 static esp_err_t api_scan_results_get(httpd_req_t *req)
 {
     const scan_results_t *r = cmd_get_scan_results();
+    chunked_writer_t cw;
+    cw_init(&cw, req);
 
-    char *buf = malloc(8192);
-    if (!buf) {
-        send_json(req, "{\"ok\":false,\"error\":\"oom\"}");
-        return ESP_OK;
-    }
-
-    int pos = snprintf(buf, 8192,
-        "{\"ok\":true,\"complete\":%s,\"count\":%d,\"networks\":[",
-        r->scan_complete ? "true" : "false", r->count);
-
-    for (int i = 0; i < r->count && pos < 7800; i++) {
+    cw_printf(&cw, "{\"ok\":true,\"complete\":%s,\"count\":%d,\"networks\":[",
+              r->scan_complete ? "true" : "false", r->count);
+    for (int i = 0; i < r->count; i++) {
         const parsed_network_t *n = &r->networks[i];
-        pos += snprintf(buf + pos, 8192 - pos,
+        cw_printf(&cw,
             "%s{\"index\":%d,\"ssid\":\"%s\",\"bssid\":\"%s\","
             "\"channel\":%d,\"security\":\"%s\",\"rssi\":%d,\"band\":\"%s\"}",
             i > 0 ? "," : "",
             n->index, n->ssid, n->bssid,
             n->channel, n->security, n->rssi, n->band);
     }
-
-    pos += snprintf(buf + pos, 8192 - pos, "]}");
-
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, buf, pos);
-    free(buf);
-    return ESP_OK;
+    cw_printf(&cw, "]}");
+    return cw_finish(&cw);
 }
 
 static esp_err_t api_select_post(httpd_req_t *req)
@@ -284,23 +393,32 @@ static esp_err_t api_select_post(httpd_req_t *req)
         return ESP_OK;
     }
 
-    /* Parse indices from JSON: {"indices":[1,3,5]} or simple "1,3,5" */
-    int indices[MAX_NETWORKS];
-    int count = 0;
+    /* Parse indices from JSON: {"indices":[1,3,5]} or simple "1,3,5".
+     * No fixed cap on the parsed list -- the body is bounded by the recv
+     * buffer above and the dynvec just grows as integers are found. */
+    dynvec_t v;
+    dynvec_init(&v, sizeof(int), 8);
 
     const char *p = strstr(body, "[");
     if (p) p++;
     else p = body;
 
-    while (*p && count < MAX_NETWORKS) {
+    while (*p) {
         while (*p && !(*p >= '0' && *p <= '9')) p++;
         if (*p >= '0' && *p <= '9') {
-            indices[count++] = atoi(p);
+            int idx = atoi(p);
+            if (!dynvec_push(&v, &idx)) {
+                ESP_LOGW(TAG, "select indices: push OOM at count=%zu", v.count);
+                break;
+            }
             while (*p >= '0' && *p <= '9') p++;
         }
     }
 
-    if (count > 0 && cmd_do_select(indices, count)) {
+    bool ok = (v.count > 0 && cmd_do_select((const int *)v.data, (int)v.count));
+    dynvec_free(&v);
+
+    if (ok) {
         send_json(req, "{\"ok\":true}");
     } else {
         send_json(req, "{\"ok\":false,\"error\":\"no indices\"}");
@@ -308,16 +426,83 @@ static esp_err_t api_select_post(httpd_req_t *req)
     return ESP_OK;
 }
 
+static bool json_get_string(const char *json, const char *key, char *out, int out_len);
+
 static esp_err_t api_attack_post(httpd_req_t *req)
 {
     const char *uri = req->uri;
     bool ok = false;
 
     if (strstr(uri, "/deauth"))         ok = cmd_do_deauth();
+    else if (strstr(uri, "/blackout"))   ok = cmd_do_blackout();
     else if (strstr(uri, "/eviltwin"))   ok = cmd_do_evil_twin();
     else if (strstr(uri, "/sae"))        ok = cmd_do_sae();
     else if (strstr(uri, "/handshake"))  ok = cmd_do_handshake();
+    else if (strstr(uri, "/sniffer_noscan")) ok = cmd_do_sniffer_noscan();
     else if (strstr(uri, "/sniffer"))    ok = cmd_do_sniffer();
+    else if (strstr(uri, "/mitm"))       ok = cmd_do_mitm();
+    else if (strstr(uri, "/karma")) {
+        char body[96] = {0};
+        if (req->content_len > 0) {
+            int received = httpd_req_recv(req, body, sizeof(body) - 1);
+            if (received < 0) {
+                body[0] = '\0';
+            }
+        }
+
+        int probe_index = 0;
+        const char *p = strstr(body, "\"index\"");
+        if (p) {
+            p += 7;
+            while (*p && !(*p >= '0' && *p <= '9')) p++;
+            probe_index = atoi(p);
+        }
+        ok = cmd_do_karma(probe_index);
+    }
+    else if (strstr(uri, "/portal")) {
+        char body[160] = {0};
+        if (req->content_len > 0) {
+            int received = httpd_req_recv(req, body, sizeof(body) - 1);
+            if (received < 0) {
+                body[0] = '\0';
+            }
+        }
+
+        char ssid[33] = {0};
+        json_get_string(body, "\"ssid\"", ssid, sizeof(ssid));
+        ok = cmd_do_portal(ssid);
+    }
+    else if (strstr(uri, "/nmap")) {
+        char body[160] = {0};
+        if (req->content_len > 0) {
+            int received = httpd_req_recv(req, body, sizeof(body) - 1);
+            if (received < 0) {
+                body[0] = '\0';
+            }
+        }
+
+        char level[16] = {0};
+        char target_ip[24] = {0};
+        json_get_string(body, "\"level\"", level, sizeof(level));
+        json_get_string(body, "\"ip\"", target_ip, sizeof(target_ip));
+        ok = cmd_do_nmap(level[0] ? level : NULL, target_ip[0] ? target_ip : NULL);
+    }
+    else if (strstr(uri, "/arp_ban")) {
+        char body[160] = {0};
+        if (req->content_len > 0) {
+            int received = httpd_req_recv(req, body, sizeof(body) - 1);
+            if (received < 0) {
+                body[0] = '\0';
+            }
+        }
+
+        char mac[24] = {0};
+        char ip[24] = {0};
+        json_get_string(body, "\"mac\"", mac, sizeof(mac));
+        json_get_string(body, "\"ip\"", ip, sizeof(ip));
+        ok = cmd_do_arp_ban(mac[0] ? mac : NULL, ip[0] ? ip : NULL);
+    }
+    else if (strstr(uri, "/arp"))        ok = cmd_do_arp();
     else if (strstr(uri, "/rogueap")) {
         char body[256] = {0};
         httpd_req_recv(req, body, sizeof(body) - 1);
@@ -349,6 +534,30 @@ static esp_err_t api_attack_post(httpd_req_t *req)
     return ESP_OK;
 }
 
+static bool json_get_string(const char *json, const char *key, char *out, int out_len)
+{
+    if (!json || !key || !out || out_len <= 1) return false;
+    const char *k = strstr(json, key);
+    if (!k) return false;
+    const char *q1 = strchr(k, '"');
+    if (!q1) return false;
+    q1 = strchr(q1 + 1, '"');
+    if (!q1) return false;
+    const char *colon = strchr(q1, ':');
+    if (!colon) return false;
+    const char *q2 = strchr(colon, '"');
+    if (!q2) return false;
+    q2++;
+    const char *q3 = strchr(q2, '"');
+    if (!q3) return false;
+
+    int len = (int)(q3 - q2);
+    if (len >= out_len) len = out_len - 1;
+    memcpy(out, q2, len);
+    out[len] = '\0';
+    return len > 0;
+}
+
 static esp_err_t api_stop_post(httpd_req_t *req)
 {
     cmd_do_stop();
@@ -356,23 +565,66 @@ static esp_err_t api_stop_post(httpd_req_t *req)
     return ESP_OK;
 }
 
+static esp_err_t api_wifi_connect_post(httpd_req_t *req)
+{
+    char body[256] = {0};
+    int received = httpd_req_recv(req, body, sizeof(body) - 1);
+    if (received <= 0) {
+        send_json(req, "{\"ok\":false,\"error\":\"no body\"}");
+        return ESP_OK;
+    }
+
+    char ssid[33] = {0};
+    char password[65] = {0};
+    if (!json_get_string(body, "\"ssid\"", ssid, sizeof(ssid))) {
+        send_json(req, "{\"ok\":false,\"error\":\"ssid required\"}");
+        return ESP_OK;
+    }
+    json_get_string(body, "\"password\"", password, sizeof(password));
+
+    if (cmd_do_wifi_connect(ssid, password)) {
+        send_json(req, "{\"ok\":true,\"status\":\"connecting\"}");
+    } else {
+        httpd_resp_set_status(req, "409 Conflict");
+        send_json(req, "{\"ok\":false,\"error\":\"busy\"}");
+    }
+    return ESP_OK;
+}
+
+static esp_err_t api_wifi_disconnect_post(httpd_req_t *req)
+{
+    if (cmd_do_wifi_disconnect()) {
+        send_json(req, "{\"ok\":true}");
+    } else {
+        httpd_resp_set_status(req, "409 Conflict");
+        send_json(req, "{\"ok\":false,\"error\":\"busy\"}");
+    }
+    return ESP_OK;
+}
+
 static esp_err_t api_portals_get(httpd_req_t *req)
 {
-    parsed_portal_file_t files[MAX_PORTAL_FILES];
-    int n = cmd_get_portal_files(files, MAX_PORTAL_FILES);
+    int n = cmd_get_portal_files_count();
     cmd_state_t state = cmd_get_state();
 
     if (n > 0) {
-        char buf[1024] = "{\"ok\":true,\"files\":[";
-        int pos = strlen(buf);
-        for (int i = 0; i < n; i++) {
-            pos += snprintf(buf + pos, sizeof(buf) - pos,
-                "%s{\"index\":%d,\"name\":\"%s\"}",
-                i > 0 ? "," : "", files[i].index, files[i].filename);
+        parsed_portal_file_t *files = psram_malloc((size_t)n * sizeof(*files));
+        if (!files) {
+            send_json(req, "{\"ok\":false,\"error\":\"oom\"}");
+            return ESP_OK;
         }
-        pos += snprintf(buf + pos, sizeof(buf) - pos, "]}");
-        send_json(req, buf);
-        return ESP_OK;
+        n = cmd_get_portal_files(files, n);
+
+        chunked_writer_t cw;
+        cw_init(&cw, req);
+        cw_printf(&cw, "{\"ok\":true,\"files\":[");
+        for (int i = 0; i < n; i++) {
+            cw_printf(&cw, "%s{\"index\":%d,\"name\":\"%s\"}",
+                      i > 0 ? "," : "", files[i].index, files[i].filename);
+        }
+        cw_printf(&cw, "]}");
+        free(files);
+        return cw_finish(&cw);
     }
 
     if (state == STATE_LISTING_PORTALS) {
@@ -421,77 +673,61 @@ static esp_err_t api_portal_select_post(httpd_req_t *req)
 
 static esp_err_t api_passwords_get(httpd_req_t *req)
 {
-    parsed_password_t pws[MAX_PASSWORDS];
-    int n = cmd_get_passwords(pws, MAX_PASSWORDS);
+    int n = cmd_get_passwords_count();
 
     if (n == 0) {
-        /* Try fetching fresh data */
         cmd_do_list_passwords();
         send_json(req, "{\"ok\":true,\"passwords\":[],\"status\":\"loading\"}");
         return ESP_OK;
     }
 
-    char buf[2048] = "{\"ok\":true,\"passwords\":[";
-    int pos = strlen(buf);
-    for (int i = 0; i < n; i++) {
-        pos += snprintf(buf + pos, sizeof(buf) - pos,
-            "%s{\"ssid\":\"%s\",\"password\":\"%s\"}",
-            i > 0 ? "," : "", pws[i].ssid, pws[i].password);
+    parsed_password_t *pws = psram_malloc((size_t)n * sizeof(*pws));
+    if (!pws) {
+        send_json(req, "{\"ok\":false,\"error\":\"oom\"}");
+        return ESP_OK;
     }
-    pos += snprintf(buf + pos, sizeof(buf) - pos, "]}");
-    send_json(req, buf);
-    return ESP_OK;
+    n = cmd_get_passwords(pws, n);
+
+    chunked_writer_t cw;
+    cw_init(&cw, req);
+    cw_printf(&cw, "{\"ok\":true,\"passwords\":[");
+    for (int i = 0; i < n; i++) {
+        cw_printf(&cw, "%s{\"ssid\":\"%s\",\"password\":\"%s\"}",
+                  i > 0 ? "," : "", pws[i].ssid, pws[i].password);
+    }
+    cw_printf(&cw, "]}");
+    free(pws);
+    return cw_finish(&cw);
 }
 
 static esp_err_t api_sniffer_results_get(httpd_req_t *req)
 {
     const sniffer_results_t *results = cmd_get_sniffer_results();
-    char *buf = malloc(16384);
-    if (!buf) {
-        send_json(req, "{\"ok\":false,\"error\":\"oom\"}");
-        return ESP_OK;
-    }
+    chunked_writer_t cw;
+    cw_init(&cw, req);
 
-    int pos = snprintf(
-        buf,
-        16384,
+    cw_printf(&cw,
         "{\"ok\":true,\"hasSnapshot\":%s,\"empty\":%s,\"packetCount\":%d,\"aps\":[",
         results->has_snapshot ? "true" : "false",
         results->empty ? "true" : "false",
-        results->packet_count
-    );
+        results->packet_count);
 
-    for (int i = 0; i < results->count && pos < 16000; i++) {
+    for (int i = 0; i < results->count; i++) {
         const parsed_sniffer_ap_t *ap = &results->aps[i];
-        pos += snprintf(
-            buf + pos,
-            16384 - pos,
+        cw_printf(&cw,
             "%s{\"ssid\":\"%s\",\"channel\":%d,\"clientCount\":%d,\"clients\":[",
-            i > 0 ? "," : "",
-            ap->ssid,
-            ap->channel,
-            ap->client_total
-        );
+            i > 0 ? "," : "", ap->ssid, ap->channel, ap->client_total);
 
-        for (int j = 0; j < ap->client_count && j < MAX_SNIFFER_CLIENTS && pos < 16000; j++) {
-            pos += snprintf(
-                buf + pos,
-                16384 - pos,
-                "%s\"%s\"",
-                j > 0 ? "," : "",
-                ap->clients[j]
-            );
+        for (int j = 0; j < ap->client_count; j++) {
+            const char *mac = parsed_sniffer_ap_client(ap, j);
+            cw_printf(&cw, "%s\"%s\"", j > 0 ? "," : "", mac ? mac : "");
         }
 
-        pos += snprintf(buf + pos, 16384 - pos, "]}");
+        cw_printf(&cw, "]}");
     }
 
-    pos += snprintf(buf + pos, 16384 - pos, "]}");
-
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, buf, pos);
-    free(buf);
-    return ESP_OK;
+    cw_printf(&cw, "]}");
+    return cw_finish(&cw);
 }
 
 static esp_err_t api_sniffer_refresh_post(httpd_req_t *req)
@@ -505,16 +741,396 @@ static esp_err_t api_sniffer_refresh_post(httpd_req_t *req)
     return ESP_OK;
 }
 
+static esp_err_t api_probes_get(httpd_req_t *req)
+{
+    int n = cmd_get_probes_count();
+    cmd_state_t state = cmd_get_state();
+
+    if (n == 0 && state == STATE_IDLE) {
+        cmd_do_list_probes();
+        state = cmd_get_state();
+    }
+
+    parsed_probe_t *probes = NULL;
+    if (n > 0) {
+        probes = psram_malloc((size_t)n * sizeof(*probes));
+        if (!probes) {
+            send_json(req, "{\"ok\":false,\"error\":\"oom\"}");
+            return ESP_OK;
+        }
+        n = cmd_get_probes(probes, n);
+    }
+
+    chunked_writer_t cw;
+    cw_init(&cw, req);
+    cw_printf(&cw, "{\"ok\":true,\"loading\":%s,\"probes\":[",
+              (state == STATE_LISTING_PROBES) ? "true" : "false");
+    for (int i = 0; i < n; i++) {
+        cw_printf(&cw, "%s{\"index\":%d,\"ssid\":\"%s\"}",
+                  i > 0 ? "," : "", probes[i].index, probes[i].ssid);
+    }
+    cw_printf(&cw, "]}");
+    free(probes);
+    return cw_finish(&cw);
+}
+
+static esp_err_t api_probes_refresh_post(httpd_req_t *req)
+{
+    if (cmd_do_list_probes()) {
+        send_json(req, "{\"ok\":true,\"status\":\"loading\"}");
+    } else {
+        httpd_resp_set_status(req, "409 Conflict");
+        send_json(req, "{\"ok\":false,\"error\":\"busy\"}");
+    }
+    return ESP_OK;
+}
+
+static esp_err_t api_arp_hosts_get(httpd_req_t *req)
+{
+    int n = cmd_get_arp_hosts_count();
+    uint32_t at = cmd_get_arp_hosts_at_ms();
+
+    arp_host_t *hosts = NULL;
+    if (n > 0) {
+        hosts = psram_malloc((size_t)n * sizeof(*hosts));
+        if (!hosts) {
+            send_json(req, "{\"ok\":false,\"error\":\"oom\"}");
+            return ESP_OK;
+        }
+        n = cmd_get_arp_hosts(hosts, n);
+    }
+
+    chunked_writer_t cw;
+    cw_init(&cw, req);
+    cw_printf(&cw, "{\"ok\":true,\"at\":%u,\"count\":%d,\"hosts\":[",
+              (unsigned)at, n);
+    for (int i = 0; i < n; i++) {
+        cw_printf(&cw, "%s{\"ip\":\"%s\",\"mac\":\"%s\",\"icmp_only\":%s}",
+                  i > 0 ? "," : "",
+                  hosts[i].ip, hosts[i].mac,
+                  hosts[i].icmp_only ? "true" : "false");
+    }
+    cw_printf(&cw, "]}");
+    free(hosts);
+    return cw_finish(&cw);
+}
+
+static esp_err_t api_nmap_results_get(httpd_req_t *req)
+{
+    nmap_state_t st;
+    cmd_get_nmap_state(&st);
+
+    int n = cmd_get_nmap_hosts_count();
+    nmap_host_t *hosts = NULL;
+    if (n > 0) {
+        hosts = psram_malloc((size_t)n * sizeof(*hosts));
+        if (!hosts) {
+            send_json(req, "{\"ok\":false,\"error\":\"oom\"}");
+            return ESP_OK;
+        }
+        n = cmd_get_nmap_hosts(hosts, n);
+    }
+
+    chunked_writer_t cw;
+    cw_init(&cw, req);
+    cw_printf(&cw,
+        "{\"ok\":true,\"at\":%u,\"level\":\"%s\",\"total_hosts\":%d,"
+        "\"open_ports\":%d,\"done\":%s,\"scanning\":\"%s\","
+        "\"port_current\":%d,\"port_total\":%d,\"count\":%d,\"hosts\":[",
+        (unsigned)st.at_ms, st.level, st.total_hosts,
+        st.open_ports, st.done ? "true" : "false", st.scanning_ip,
+        st.port_current, st.port_total, n);
+    for (int i = 0; i < n; i++) {
+        cw_printf(&cw,
+            "%s{\"ip\":\"%s\",\"mac\":\"%s\",\"done\":%s,"
+            "\"no_open_ports\":%s,\"ports\":[",
+            i > 0 ? "," : "",
+            hosts[i].ip, hosts[i].mac,
+            hosts[i].done ? "true" : "false",
+            hosts[i].no_open_ports ? "true" : "false");
+        for (int p = 0; p < hosts[i].port_count; p++) {
+            cw_printf(&cw, "%s{\"port\":%d,\"service\":\"%s\"}",
+                      p > 0 ? "," : "",
+                      hosts[i].ports[p].port,
+                      hosts[i].ports[p].service);
+        }
+        cw_printf(&cw, "]}");
+    }
+    cw_printf(&cw, "]}");
+    free(hosts);
+    return cw_finish(&cw);
+}
+
 static esp_err_t api_status_get(httpd_req_t *req)
 {
-    char buf[128];
+    const char *sta_ssid = cmd_get_sta_ssid();
+    char buf[384];
     snprintf(buf, sizeof(buf),
-        "{\"ok\":true,\"state\":\"%s\",\"scan_count\":%d,\"packet_count\":%d}",
+        "{\"ok\":true,\"state\":\"%s\",\"scan_count\":%d,\"packet_count\":%d,"
+        "\"c5_connected\":%s,\"heap_free\":%u,\"heap_internal\":%u,\"ap_clients\":%d,"
+        "\"sta_connected\":%s,\"sta_ssid\":\"%s\"}",
         cmd_state_name(cmd_get_state()),
         cmd_get_scan_results()->count,
-        cmd_get_sniffer_results()->packet_count);
+        cmd_get_sniffer_results()->packet_count,
+        cmd_is_c5_connected() ? "true" : "false",
+        (unsigned)esp_get_free_heap_size(),
+        (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+        wifi_ap_get_client_count(),
+        cmd_is_sta_connected() ? "true" : "false",
+        sta_ssid ? sta_ssid : "");
     send_json(req, buf);
     return ESP_OK;
+}
+
+static esp_err_t api_dashboard_get(httpd_req_t *req)
+{
+    const scan_results_t *scan = cmd_get_scan_results();
+    int strongest_idx = -1;
+    int strongest_rssi = -999;
+    for (int i = 0; i < scan->count; i++) {
+        if (scan->networks[i].rssi > strongest_rssi) {
+            strongest_rssi = scan->networks[i].rssi;
+            strongest_idx = i;
+        }
+    }
+
+    int handshake_count = cmd_get_handshake_count();
+    cmd_state_t state = cmd_get_state();
+    bool hs_loading = (state == STATE_LISTING_HANDSHAKES);
+    /* Auto-trigger SD listing AT MOST ONCE per ESP boot. We use an
+     * "attempted" latch (set the moment we fire) rather than the
+     * "completed" flag, otherwise any failure to receive JanOS's response
+     * would make every subsequent dashboard poll re-fire `list_dir
+     * /sdcard/lab/handshakes` -- which has nothing to do with what the
+     * user is actually doing (SubGHz, scans, etc.) and noisily steals UART
+     * airtime in the middle of unrelated commands. */
+    static bool s_dashboard_hs_attempted = false;
+    if (!s_dashboard_hs_attempted &&
+        !cmd_handshake_initial_done() &&
+        state == STATE_IDLE &&
+        cmd_is_c5_connected()) {
+        s_dashboard_hs_attempted = true;
+        cmd_do_list_handshake_count();
+        hs_loading = true;
+    }
+
+    float lat = 0.0f, lon = 0.0f;
+    bool has_fix = cmd_get_last_gps_fix(&lat, &lon);
+
+    const char *sta_ssid = cmd_get_sta_ssid();
+    char buf[640];
+    snprintf(
+        buf,
+        sizeof(buf),
+        "{\"ok\":true,\"c5_connected\":%s,\"ap_clients\":%d,\"heap_free\":%u,"
+        "\"heap_internal\":%u,\"handshake_count\":%d,\"handshake_loading\":%s,"
+        "\"gps_fix\":%s,\"gps_lat\":%.6f,\"gps_lon\":%.6f,\"last_net_rssi\":%d,"
+        "\"sd_free_gb\":-1,\"sd_total_gb\":-1,\"sta_connected\":%s,\"sta_ssid\":\"%s\"}",
+        cmd_is_c5_connected() ? "true" : "false",
+        wifi_ap_get_client_count(),
+        (unsigned)esp_get_free_heap_size(),
+        (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+        handshake_count < 0 ? 0 : handshake_count,
+        hs_loading ? "true" : "false",
+        has_fix ? "true" : "false",
+        has_fix ? lat : 0.0f,
+        has_fix ? lon : 0.0f,
+        strongest_idx >= 0 ? strongest_rssi : -120,
+        cmd_is_sta_connected() ? "true" : "false",
+        sta_ssid ? sta_ssid : ""
+    );
+    send_json(req, buf);
+    return ESP_OK;
+}
+
+static esp_err_t api_wardrive_logs_get(httpd_req_t *req)
+{
+    int n = cmd_get_wardrive_logs_count();
+    cmd_state_t state = cmd_get_state();
+
+    if (n > 0) {
+        parsed_portal_file_t *files = psram_malloc((size_t)n * sizeof(*files));
+        if (!files) {
+            send_json(req, "{\"ok\":false,\"error\":\"oom\"}");
+            return ESP_OK;
+        }
+        n = cmd_get_wardrive_logs(files, n);
+
+        chunked_writer_t cw;
+        cw_init(&cw, req);
+        cw_printf(&cw, "{\"ok\":true,\"files\":[");
+        for (int i = 0; i < n; i++) {
+            cw_printf(&cw, "%s{\"index\":%d,\"name\":\"%s\"}",
+                      i > 0 ? "," : "", files[i].index, files[i].filename);
+        }
+        cw_printf(&cw, "]}");
+        free(files);
+        return cw_finish(&cw);
+    }
+
+    if (state == STATE_LISTING_WARDRIVE) {
+        send_json(req, "{\"ok\":true,\"status\":\"loading\"}");
+        return ESP_OK;
+    }
+
+    if (state != STATE_IDLE) {
+        httpd_resp_set_status(req, "409 Conflict");
+        send_json(req, "{\"ok\":false,\"error\":\"busy\"}");
+        return ESP_OK;
+    }
+
+    if (cmd_do_list_wardrive_logs()) {
+        send_json(req, "{\"ok\":true,\"status\":\"loading\"}");
+    } else {
+        httpd_resp_set_status(req, "409 Conflict");
+        send_json(req, "{\"ok\":false,\"error\":\"busy\"}");
+    }
+    return ESP_OK;
+}
+
+/* ---------- Sub-GHz handlers ---------- */
+
+static bool json_get_float(const char *json, const char *key, float *out)
+{
+    if (!json || !key || !out) return false;
+    const char *k = strstr(json, key);
+    if (!k) return false;
+    const char *colon = strchr(k, ':');
+    if (!colon) return false;
+    const char *p = colon + 1;
+    while (*p == ' ' || *p == '\t') p++;
+    char *end = NULL;
+    float v = strtof(p, &end);
+    if (end == p) return false;
+    *out = v;
+    return true;
+}
+
+static bool json_get_int(const char *json, const char *key, int *out)
+{
+    float f;
+    if (!json_get_float(json, key, &f)) return false;
+    *out = (int)f;
+    return true;
+}
+
+static bool json_get_bool(const char *json, const char *key, bool *out)
+{
+    if (!json || !key || !out) return false;
+    const char *k = strstr(json, key);
+    if (!k) return false;
+    const char *colon = strchr(k, ':');
+    if (!colon) return false;
+    const char *p = colon + 1;
+    while (*p == ' ' || *p == '\t') p++;
+    if (strncmp(p, "true", 4) == 0)  { *out = true;  return true; }
+    if (strncmp(p, "false", 5) == 0) { *out = false; return true; }
+    return false;
+}
+
+static esp_err_t api_subghz_post(httpd_req_t *req)
+{
+    const char *uri = req->uri;
+    char body[160] = {0};
+    if (req->content_len > 0) {
+        int received = httpd_req_recv(req, body, sizeof(body) - 1);
+        if (received < 0) body[0] = '\0';
+    }
+
+    bool ok = false;
+
+    if (strstr(uri, "/listen")) {
+        float freq = 433.92f;
+        bool raw = false;
+        json_get_float(body, "\"freq\"", &freq);
+        json_get_bool(body, "\"raw\"", &raw);
+        ok = cmd_do_subghz_listen(freq, raw);
+    }
+    else if (strstr(uri, "/jam")) {
+        float freq = 433.92f;
+        json_get_float(body, "\"freq\"", &freq);
+        ok = cmd_do_subghz_jam(freq);
+    }
+    else if (strstr(uri, "/tx")) {
+        char preset[16] = {0};
+        if (json_get_string(body, "\"preset\"", preset, sizeof(preset)) && preset[0]) {
+            ok = cmd_do_subghz_tx_preset(preset);
+        } else {
+            int idx = 0;
+            json_get_int(body, "\"index\"", &idx);
+            ok = cmd_do_subghz_tx(idx);
+        }
+    }
+    else if (strstr(uri, "/delete")) {
+        int idx = 0;
+        json_get_int(body, "\"index\"", &idx);
+        ok = cmd_do_subghz_delete(idx);
+    }
+    else if (strstr(uri, "/clear")) {
+        ok = cmd_do_subghz_clear();
+    }
+    else if (strstr(uri, "/export")) {
+        ok = cmd_do_subghz_export();
+    }
+    else if (strstr(uri, "/import")) {
+        ok = cmd_do_subghz_import();
+    }
+    else if (strstr(uri, "/list/refresh")) {
+        ok = cmd_do_subghz_list_refresh();
+    }
+
+    if (ok) {
+        send_json(req, "{\"ok\":true}");
+    } else {
+        httpd_resp_set_status(req, "409 Conflict");
+        send_json(req, "{\"ok\":false,\"error\":\"busy or bad params\"}");
+    }
+    return ESP_OK;
+}
+
+static esp_err_t api_subghz_list_get(httpd_req_t *req)
+{
+    /* Stream the response in 1 KB chunks instead of preallocating a single
+     * fixed JSON buffer. This removes both the silent truncation that
+     * happened when the cache exceeded the historical buffer cap and the
+     * frequent OOM the fixed allocation hit once wifi/httpd were up. */
+    int count = cmd_get_subghz_count();
+    if (count < 0) count = 0;
+
+    subghz_signal_t *sigs = NULL;
+    if (count > 0) {
+        sigs = psram_malloc((size_t)count * sizeof(*sigs));
+        if (!sigs) {
+            ESP_LOGW(TAG,
+                "subghz_list_get OOM: count=%d free_heap=%u largest_internal=%u",
+                count,
+                (unsigned)esp_get_free_heap_size(),
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+            send_json(req, "{\"ok\":false,\"error\":\"oom\"}");
+            return ESP_OK;
+        }
+        count = cmd_get_subghz_signals(sigs, count);
+    }
+
+    chunked_writer_t cw;
+    cw_init(&cw, req);
+    cw_printf(&cw, "{\"ok\":true,\"count\":%d,\"signals\":[", count);
+    for (int i = 0; i < count; i++) {
+        const subghz_signal_t *s = &sigs[i];
+        cw_printf(&cw,
+            "%s{\"idx\":%d,\"type\":\"%s\",\"freq\":%.2f,\"bits\":%d,"
+            "\"serial\":\"%s\",\"btn\":%d,\"cnt\":%d,\"mf\":\"%s\","
+            "\"id\":\"%s\",\"te\":%d,\"proto\":%d,"
+            "\"is_raw\":%s,\"edges\":%d}",
+            i > 0 ? "," : "",
+            s->idx, s->type, s->freq, s->bits,
+            s->serial, s->btn, s->cnt, s->mf,
+            s->id_str, s->te, s->proto,
+            s->is_raw ? "true" : "false", s->edges);
+    }
+    cw_printf(&cw, "]}");
+    free(sigs);
+    return cw_finish(&cw);
 }
 
 /* ---------- Root / SPA handler ---------- */
@@ -586,8 +1202,17 @@ esp_err_t web_server_start(void)
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.uri_match_fn     = httpd_uri_match_wildcard;
-    config.stack_size       = 6144;
-    config.max_uri_handlers = 20;
+    /* httpd worker stack: 8 KB. cmd_do_* are invoked synchronously from
+     * the HTTP handler, and the chain
+     *   handler -> cmd_do_select -> display_update -> refresh_display
+     *   -> esp_lcd_panel_draw_bitmap -> SPI master + DMA descriptor setup
+     * plus printf/snprintf locals reliably overflows 6 KB. The next ISR
+     * then crashes restoring a corrupted task frame -- StoreProhibited
+     * in vPortYieldFromInt with EXCVADDR=0xffffffa0 and LBEG=strlen ROM
+     * (classic stack-smash signature). 8 KB gives the SPI/LCD path
+     * comfortable headroom. */
+    config.stack_size       = 8192;
+    config.max_uri_handlers = 32;
     config.max_open_sockets = 7;
     config.lru_purge_enable = true;
     config.recv_wait_timeout  = 10;
@@ -615,6 +1240,10 @@ esp_err_t web_server_start(void)
         return ESP_ERR_NO_MEM;
     }
 
+    /* Stack: 3KB. Original size; was bumped to 4K defensively but reverted
+     * to free up internal RAM (we were down to 7 KB free heap after httpd
+     * start, which made serving app.js fail with EAGAIN). 3 KB is enough
+     * for httpd_ws_send_frame_async with our 4-client cap. */
     BaseType_t task_ok = xTaskCreate(ws_sender_task, "ws_send", 3072, NULL, 5, NULL);
     if (task_ok != pdPASS) {
         ESP_LOGE(TAG, "Failed to create WS sender task");
@@ -653,12 +1282,22 @@ esp_err_t web_server_start(void)
     REGISTER_URI("/api/select",        HTTP_POST, api_select_post);
     REGISTER_URI("/api/attack/*",      HTTP_POST, api_attack_post);
     REGISTER_URI("/api/stop",          HTTP_POST, api_stop_post);
+    REGISTER_URI("/api/wifi/connect",  HTTP_POST, api_wifi_connect_post);
+    REGISTER_URI("/api/wifi/disconnect", HTTP_POST, api_wifi_disconnect_post);
     REGISTER_URI("/api/portals",       HTTP_GET,  api_portals_get);
     REGISTER_URI("/api/portal/select", HTTP_POST, api_portal_select_post);
     REGISTER_URI("/api/passwords",     HTTP_GET,  api_passwords_get);
+    REGISTER_URI("/api/wardrive/logs", HTTP_GET,  api_wardrive_logs_get);
     REGISTER_URI("/api/sniffer/results", HTTP_GET,  api_sniffer_results_get);
     REGISTER_URI("/api/sniffer/results", HTTP_POST, api_sniffer_refresh_post);
+    REGISTER_URI("/api/probes",          HTTP_GET,  api_probes_get);
+    REGISTER_URI("/api/probes",          HTTP_POST, api_probes_refresh_post);
+    REGISTER_URI("/api/arp/hosts",       HTTP_GET,  api_arp_hosts_get);
+    REGISTER_URI("/api/nmap/results",    HTTP_GET,  api_nmap_results_get);
     REGISTER_URI("/api/status",        HTTP_GET,  api_status_get);
+    REGISTER_URI("/api/dashboard",     HTTP_GET,  api_dashboard_get);
+    REGISTER_URI("/api/subghz/list",   HTTP_GET,  api_subghz_list_get);
+    REGISTER_URI("/api/subghz/*",      HTTP_POST, api_subghz_post);
 
     /* Captive portal detection endpoints */
     REGISTER_URI("/generate_204",        HTTP_GET, android_204_handler);

@@ -17,9 +17,18 @@ void display_init(void);
 void display_update(const char *tx_cmd, const char *rx_line);
 
 /**
- * Show AP info on the display (called once after AP starts).
+ * Provide AP connection info (called once after AP starts). While no client
+ * is connected the display shows a "connect" splash with the SSID + password.
+ * - password: AP password, or NULL/"" for an open network.
  */
-void display_show_ap_info(const char *ssid, const char *ip);
+void display_show_ap_info(const char *ssid, const char *ip, const char *password);
+
+/**
+ * Update the connected-client count. When it drops to 0 the display reverts
+ * to the AP connect splash; when >0 it shows the operational TX/RX view.
+ * Thread-safe.
+ */
+void display_set_client_count(int count);
 
 /**
  * Show a short status line (e.g. command-handler state). Drawn above AP info.

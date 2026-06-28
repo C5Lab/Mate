@@ -88,6 +88,46 @@ Default pins are configurable via `idf.py menuconfig`.
 - GPIO 26 = RX (from Monster TX)
 - GPIO 32 = TX (to Monster RX)
 
+## 🏭 Building All Firmware Permutations
+
+`tools/build_all.py` uses the official `espressif/idf` Docker image to build every board/flash-size combination in one shot. No local ESP-IDF installation required — only Docker.
+
+### Default build matrix
+
+| Output folder | Chip | Flash |
+|---|---|---|
+| `binaries/xiao-c6/` | ESP32-C6 | 4 MB |
+| `binaries/cores3/` | ESP32-S3 | 16 MB |
+| `binaries/atoms3r/` | ESP32-S3 | 8 MB |
+| `binaries/stickc-plus2/` | ESP32 | 8 MB |
+| `binaries/atom-lite/` | ESP32-Pico | 4 MB |
+
+Each folder contains: `mate-<board>.bin`, `bootloader-<board>.bin`, `partition-table-<board>.bin`, `storage-<board>.bin`.
+
+Delegates to `.github/scripts/container_build.sh` using `espressif/idf:release-v6.0` — same image as CI.
+
+### Usage
+
+```bash
+# Build all boards (default IDF v6.0.0)
+python tools/build_all.py
+
+# Specific IDF version
+python tools/build_all.py --idf-version v5.3.2
+
+# Only selected boards
+python tools/build_all.py --targets xiao_c6,cores3
+
+# Add extra flash-size variants (e.g. also build 4 MB and 16 MB versions)
+python tools/build_all.py --flash-sizes 4,8,16
+
+# Keep build/ directories for debugging
+python tools/build_all.py --keep-build
+
+# Custom output directory
+python tools/build_all.py --output-dir /tmp/fw-release
+```
+
 ## 💻 Web UI Development
 
 ```bash
