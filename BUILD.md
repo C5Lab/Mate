@@ -11,7 +11,7 @@ partition layout, display driver, and Grove UART pins — all selected through
 
 ---
 
-## 1. Supported boards
+## 1. Supported boards. 
 
 | Board          | MCU              | Flash | Display            | UART TX/RX (Grove) | Notes                          |
 |----------------|------------------|-------|--------------------|--------------------|--------------------------------|
