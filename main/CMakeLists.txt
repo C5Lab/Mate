@@ -9,6 +9,7 @@ set(srcs
     "dynvec.c"
     "power_sticks3.c"
     "backlight_atoms3r.c"
+    "epaper_gdew0154.c"
 )
 
 idf_component_register(

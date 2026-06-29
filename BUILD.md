@@ -95,16 +95,28 @@ python tools/build_all.py --targets sticks3,atoms3,atoms3-lite
 
 # Keep the per-board build-<board>/ dirs for inspection
 python tools/build_all.py --targets cores3 --keep-build
+
+# Rebuild only the boards that failed on the last run (others left untouched)
+python tools/build_all.py --retry-failed
+
+# Auto re-attempt flaky failures up to 2 extra times in the same run
+python tools/build_all.py --retry 2
 ```
+
+Failed boards are recorded in `binaries/.build_failed`; `--retry-failed` reads
+it, and it is cleared once every board builds cleanly. `--retry N` is handy for
+flaky Docker/network failures during a full build.
 
 Requirements:
 - **Docker** running (the script runs `docker info` first and aborts otherwise).
 - First run pulls the `espressif/idf:release-v6.0` image and populates a local
   `.espressif/` toolchain cache (subsequent runs are much faster).
 
-> ⚠️ `build_all.py` **wipes the entire `binaries/` directory** at the start of
-> every run (`shutil.rmtree`) and recreates it. Anything you add there manually
-> (e.g. a custom top-level script) is deleted on the next run.
+> ⚠️ A **full build** (no `--targets`) **wipes the entire `binaries/` directory**
+> at the start (`shutil.rmtree`) so a removed board leaves no stale output.
+> A **subset build** (`--targets ...`) only clears the targeted boards'
+> subdirectories, leaving siblings intact. Either way, don't store hand-made
+> files under `binaries/` — keep tooling in `tools/`.
 
 ### Method B — local `idf.py` (fast single-board iteration)
 

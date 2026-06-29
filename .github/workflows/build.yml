@@ -96,11 +96,14 @@ jobs:
       # build_all.py runs the firmware build, generates the per-board
       # flash_board.py, and verifies the generated sdkconfig matches the
       # board's defaults (catches config leakage). --no-docker because we are
-      # already inside the esp-idf container.
+      # already inside the esp-idf container. --retry 2 re-attempts the board
+      # up to 2 extra times so a flaky failure (e.g. transient component-manager
+      # network error) does not fail the job and block the release gate.
       - name: Build firmware (${{ matrix.board }})
         run: |
           python3 tools/build_all.py \
             --no-docker \
+            --retry 2 \
             --targets ${{ matrix.board }} \
             --output-dir artifacts
 

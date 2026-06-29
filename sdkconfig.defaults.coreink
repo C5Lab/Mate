@@ -1,0 +1,8 @@
+# M5Stack CoreInk specific (ESP32-PICO-D4: 4MB flash, no PSRAM)
+# https://docs.m5stack.com/en/core/coreink
+# GDEW0154M09 1.54" 200x200 1-bit e-paper, SPI (MOSI=23 SCK=18 CS=9 DC=15 RST=0 BUSY=4)
+# Grove HY2.0-4P PORT: G32 / G33
+CONFIG_JANOS_BOARD_COREINK=y
+CONFIG_IDF_TARGET="esp32"
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_4mb.csv"

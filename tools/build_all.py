@@ -158,6 +158,18 @@ BOARDS = {
         "app_offset":         "0x10000",
         "spiffs_offset":      "0x1D0000",  # 0x10000 + 0x1C0000 (partitions_4mb.csv)
     },
+    "coreink": {
+        "idf_target":         "esp32",
+        "sdkconfig_defaults": "sdkconfig.defaults;sdkconfig.defaults.coreink",
+        "chip":               "esp32",
+        "flash_size":         "4MB",
+        "flash_mode":         "dio",
+        "flash_freq":         "40m",
+        "boot_offset":        "0x1000",
+        "ptable_offset":      "0x8000",
+        "app_offset":         "0x10000",
+        "spiffs_offset":      "0x1D0000",  # 0x10000 + 0x1C0000 (partitions_4mb.csv)
+    },
 }
 
 IMAGE        = "espressif/idf:release-v6.0"
@@ -577,6 +589,16 @@ def parse_args() -> argparse.Namespace:
         help="Print the board build matrix as JSON and exit. Single source of "
              "truth for the GitHub Actions matrix.",
     )
+    p.add_argument(
+        "--retry-failed", action="store_true",
+        help="Rebuild only the boards that failed on the last run (read from "
+             "the .build_failed state file). Leaves all other boards untouched.",
+    )
+    p.add_argument(
+        "--retry", type=int, default=0, metavar="N",
+        help="Auto re-attempt boards that fail, up to N extra times in this "
+             "run (useful for flaky Docker/network failures). Default: 0.",
+    )
     return p.parse_args()
 
 
@@ -586,6 +608,31 @@ def print_matrix() -> None:
     matrix = [{"board": b, "idf_target": cfg["idf_target"]}
               for b, cfg in BOARDS.items()]
     print(json.dumps(matrix))
+
+
+STATE_FILE_NAME = ".build_failed"
+
+
+def clean_board_dirs(out_root: Path, boards: list) -> None:
+    for b in boards:
+        d = out_root / b
+        if d.exists():
+            log(f"Cleaning {d} ...")
+            shutil.rmtree(d)
+
+
+def build_boards(boards: list, keep_build: bool, out_root: Path,
+                 use_docker: bool) -> list:
+    """Build each board; return the list that failed (in order)."""
+    failed: list[str] = []
+    for board in boards:
+        try:
+            build_board(board, keep_build, out_root, use_docker=use_docker)
+            log(f"  -> artifacts written to {out_root / board}")
+        except SystemExit as exc:
+            log(f"  FAILED: {exc}")
+            failed.append(board)
+    return failed
 
 
 def main() -> None:
@@ -598,37 +645,78 @@ def main() -> None:
     if not args.no_docker and not docker_available():
         sys.exit("Docker is not available. Please install Docker and ensure the daemon is running.")
 
-    if args.targets:
+    out_root   = Path(args.output_dir)
+    state_file = out_root / STATE_FILE_NAME
+
+    # Read the previous run's failures BEFORE any cleaning (a full build wipes
+    # out_root, taking the state file with it).
+    prev_failed: list[str] = []
+    if state_file.exists():
+        prev_failed = [b for b in state_file.read_text(encoding="utf-8").split()
+                       if b in BOARDS]
+
+    # Decide which boards to build. retry-failed and targets are both "subset"
+    # builds that leave untargeted boards' artifacts untouched.
+    if args.retry_failed:
+        if not prev_failed:
+            sys.exit(f"No failed boards recorded in {state_file}; nothing to "
+                     f"retry. Run a build first, or use --targets.")
+        boards = prev_failed
+        subset = True
+        log(f"Retrying last failed board(s): {', '.join(boards)}")
+    elif args.targets:
         boards = [b.strip() for b in args.targets.split(",")]
         unknown = [b for b in boards if b not in BOARDS]
         if unknown:
             sys.exit(f"Unknown board(s): {', '.join(unknown)}. Available: {', '.join(BOARDS)}")
+        subset = True
     else:
         boards = list(BOARDS.keys())
+        subset = False
 
-    out_root = Path(args.output_dir)
-
-    if out_root.exists():
-        log(f"Cleaning {out_root} ...")
-        shutil.rmtree(out_root)
-    out_root.mkdir(parents=True)
+    if subset:
+        # Only clear the boards we're about to rebuild, so siblings' artifacts
+        # (and their flashers) survive. CI builds one board per job into a
+        # shared tree and relies on this.
+        out_root.mkdir(parents=True, exist_ok=True)
+        clean_board_dirs(out_root, boards)
+    else:
+        # Full build: wipe everything so a removed board leaves no stale output.
+        if out_root.exists():
+            log(f"Cleaning {out_root} ...")
+            shutil.rmtree(out_root)
+        out_root.mkdir(parents=True)
 
     log(f"Build matrix ({len(boards)} jobs):")
     for b in boards:
         log(f"  {b}  [{BOARDS[b]['idf_target']}]")
 
-    failed: list[str] = []
-    for board in boards:
-        try:
-            build_board(board, args.keep_build, out_root, use_docker=not args.no_docker)
-            log(f"  -> artifacts written to {out_root / board}")
-        except SystemExit as exc:
-            log(f"  FAILED: {exc}")
-            failed.append(board)
+    failed = build_boards(boards, args.keep_build, out_root, not args.no_docker)
+
+    # Auto re-attempt flaky failures within this same run.
+    attempts_left = args.retry
+    while failed and attempts_left > 0:
+        attempts_left -= 1
+        log(f"Re-attempting {len(failed)} failed board(s) "
+            f"({attempts_left} more retr{'y' if attempts_left == 1 else 'ies'} after this): "
+            f"{', '.join(failed)}")
+        clean_board_dirs(out_root, failed)
+        failed = build_boards(failed, args.keep_build, out_root, not args.no_docker)
+
+    # Persist the failed set for --retry-failed. Merge with prior state: keep
+    # previously-failed boards we didn't touch this run, drop the ones we just
+    # fixed, add this run's failures.
+    new_state = (set(prev_failed) - set(boards)) | set(failed)
+    if new_state:
+        out_root.mkdir(parents=True, exist_ok=True)
+        state_file.write_text("\n".join(sorted(new_state)) + "\n", encoding="utf-8")
+    elif state_file.exists():
+        state_file.unlink()
 
     print()
     if failed:
         log(f"Build FAILED for: {', '.join(failed)}")
+        log("Rebuild just these with:  python tools/build_all.py --retry-failed")
         sys.exit(1)
     else:
         log(f"All {len(boards)} build(s) succeeded. Binaries in: {out_root}")

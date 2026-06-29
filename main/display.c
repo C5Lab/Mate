@@ -3,6 +3,7 @@
 
 #include <string.h>
 #include <stdio.h>
+#include <stdbool.h>
 #include "esp_log.h"
 
 #if CONFIG_JANOS_HAS_DISPLAY
@@ -17,7 +18,9 @@
 #include "freertos/semphr.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
+#include "freertos/task.h"
 #include "backlight_atoms3r.h"
+#include "epaper_gdew0154.h"
 
 /* Throttle full-screen redraw to ~10 Hz. UART line rate from C5 can exceed
  * 100 lines/sec during scans / sniffer / SubGHz; redrawing on every line
@@ -26,7 +29,9 @@
  * Throttled-out updates are dropped on the floor; the very next call after
  * cooldown will pick up the latest s_last_tx/s_last_rx/s_status_line state. */
 #define DISP_REFRESH_MIN_INTERVAL_US  (100 * 1000)
+#if !CONFIG_JANOS_BOARD_COREINK
 static int64_t s_last_refresh_us = 0;
+#endif
 
 static const char *TAG = "display";
 
@@ -35,11 +40,13 @@ static const char *TAG = "display";
 /* Display geometry -- set per board */
 static int s_width  = 0;
 static int s_height = 0;
-static esp_lcd_panel_handle_t s_panel = NULL;
 static SemaphoreHandle_t s_mutex;
 
+#if !CONFIG_JANOS_BOARD_COREINK
+static esp_lcd_panel_handle_t s_panel = NULL;
 /* Full-screen framebuffer (heap-allocated, DMA-capable) */
 static uint16_t *s_framebuf = NULL;
+#endif
 
 /* Fixed 4-line display state */
 #define DISP_LINE_LEN  40
@@ -67,6 +74,65 @@ static int  s_client_count = 0;
 
 #define DISP_MARGIN_X    4
 
+/* ---------- Framebuffer backend ----------
+ * Two backends share the same text/layout renderer:
+ *   - Color LCD boards: 16bpp RGB565 buffer, blitted via esp_lcd.
+ *   - CoreInk e-paper:  1bpp buffer (bit 1 = white, 0 = black), pushed to the
+ *     GDEW0154M09 driver. Background (COLOR_BG/black) maps to white paper and
+ *     any non-background color maps to black ink, so the existing dark-themed
+ *     layout reads as black-on-white on e-paper.
+ * The fb_clear()/fb_set_pixel() inlines compile to the identical RGB565 ops on
+ * LCD boards, so their behaviour is unchanged. */
+#if CONFIG_JANOS_BOARD_COREINK
+
+static uint8_t *s_epd_fb   = NULL;   /* 1bpp framebuffer (DMA-capable) */
+static uint8_t *s_epd_prev = NULL;   /* last flushed frame, to skip redundant refreshes */
+static volatile bool s_epd_dirty = false;
+
+/* E-paper full refresh is slow (~1.2 s) and wears the panel, so cap how often
+ * the dedicated epd_task may push a new frame. */
+#define EPD_REFRESH_INTERVAL_MS 3000
+
+static inline void fb_clear(void)
+{
+    if (s_epd_fb) memset(s_epd_fb, 0xFF, EPD_FB_SIZE);   /* all white */
+}
+
+static inline void fb_set_pixel(int x, int y, uint16_t color)
+{
+    if ((unsigned)x >= EPD_WIDTH || (unsigned)y >= EPD_HEIGHT || !s_epd_fb) return;
+    const size_t idx = (size_t)y * (EPD_WIDTH / 8) + (x >> 3);
+    const uint8_t bit = 0x80 >> (x & 7);
+    if (color == COLOR_BG) s_epd_fb[idx] |=  bit;        /* background -> white */
+    else                   s_epd_fb[idx] &= ~bit;        /* ink        -> black */
+}
+
+#else  /* color LCD backend */
+
+static inline void fb_clear(void)
+{
+    const size_t n = (size_t)s_width * s_height;
+    for (size_t i = 0; i < n; i++) s_framebuf[i] = COLOR_BG;
+}
+
+static inline void fb_set_pixel(int x, int y, uint16_t color)
+{
+    if ((unsigned)x < (unsigned)s_width && (unsigned)y < (unsigned)s_height)
+        s_framebuf[(size_t)y * s_width + x] = color;
+}
+
+#endif
+
+/* Display readiness differs per backend (e-paper has no esp_lcd panel). */
+static inline bool disp_ready(void)
+{
+#if CONFIG_JANOS_BOARD_COREINK
+    return s_epd_fb != NULL;
+#else
+    return s_panel && s_framebuf;
+#endif
+}
+
 /* Font scale is chosen at init from the panel width: big panels use 2 (12x16px
  * glyphs), small ones (e.g. AtomS3 0.85" 128x128) use 1 (6x8px) so that the
  * SSID / password / IP lines fit instead of being truncated to ~10 chars. */
@@ -82,7 +148,7 @@ static void render_text_at(int y0, const char *text, uint16_t color)
     const int chh = disp_font_chh();
 
     for (int r = 0; r < chh && (y0 + r) < s_height; r++) {
-        uint16_t *rowp = s_framebuf + (size_t)(y0 + r) * s_width;
+        const int py = y0 + r;
         const int sy = r / s_font_scale;
         int x = DISP_MARGIN_X;
         for (int ti = 0; text[ti] && x + chw <= s_width - DISP_MARGIN_X; ti++) {
@@ -93,8 +159,7 @@ static void render_text_at(int y0, const char *text, uint16_t color)
             for (int col = 0; col < 6; col++) {
                 if (bits & (0x80 >> col)) {
                     for (int dx = 0; dx < s_font_scale; dx++) {
-                        int px = x + col * s_font_scale + dx;
-                        if (px < s_width) rowp[px] = color;
+                        fb_set_pixel(x + col * s_font_scale + dx, py, color);
                     }
                 }
             }
@@ -103,28 +168,34 @@ static void render_text_at(int y0, const char *text, uint16_t color)
     }
 }
 
-static void refresh_display(void)
+/* Render the current display state into the active framebuffer.
+ * Caller must hold s_mutex. Backend-agnostic: all pixels go through fb_*(). */
+static void do_render(void)
 {
     /* Defensive: refuse to draw if state is bogus. Crash-loop forensics
      * showed snprintf called with buf=0x10 via this path under stack
      * pressure -- guard so a corrupted framebuffer/dimensions never blits. */
-    if (!s_framebuf || s_width <= 0 || s_height <= 0) {
+    if (!disp_ready() || s_width <= 0 || s_height <= 0) {
         return;
     }
-    s_last_refresh_us = esp_timer_get_time();
 
-    /* Clear entire framebuffer to black */
-    const size_t total_px = (size_t)s_width * s_height;
-    for (size_t i = 0; i < total_px; i++) {
-        s_framebuf[i] = COLOR_BG;
-    }
+    fb_clear();
 
+    const int chh = disp_font_chh();
+#if CONFIG_JANOS_BOARD_COREINK
+    /* E-paper: pack the 4 lines tightly (line height = glyph + small gap) and
+     * center the block vertically, instead of spreading them across the tall
+     * 200px panel with large empty gaps between rows. */
+    const int slot_h = chh + 8;
+    int yoff = (s_height - slot_h * DISP_NUM_ROWS) / 2;
+    if (yoff < 0) yoff = 0;
+#else
     /* Divide screen into 4 equal vertical slots */
     const int slot_h = s_height / DISP_NUM_ROWS;
-    const int chh = disp_font_chh();
     /* Vertically center text within each slot */
     const int text_yoff = (slot_h - chh) / 2;
     const int yoff = (text_yoff > 0) ? text_yoff : 0;
+#endif
 
     if (s_client_count <= 0) {
         /* No client connected: show how to connect (SSID + password). */
@@ -137,7 +208,13 @@ static void refresh_display(void)
         }
         {
             char buf[DISP_LINE_LEN + 8];
+            /* Narrow panels (CoreInk e-paper at scale 2 = ~16 chars/line) would
+             * clip "http://192.168.4.1" (18 chars); show the bare IP so it fits. */
+#if CONFIG_JANOS_BOARD_COREINK
+            snprintf(buf, sizeof(buf), "%s", s_ap_ip[0] ? s_ap_ip : "192.168.4.1");
+#else
             snprintf(buf, sizeof(buf), "http://%s", s_ap_ip[0] ? s_ap_ip : "192.168.4.1");
+#endif
             render_text_at(3 * slot_h + yoff, buf, COLOR_GREEN);
         }
     } else {
@@ -164,9 +241,20 @@ static void refresh_display(void)
         }
     }
 
+}
+
+#if !CONFIG_JANOS_BOARD_COREINK
+/* Color-LCD path: blit is fast, so render+blit inline (throttled) straight
+ * from the public API. */
+static void refresh_display(void)
+{
+    if (!disp_ready()) return;
+    s_last_refresh_us = esp_timer_get_time();
+    do_render();
     /* Single full-screen blit — no tearing, no stale pixels */
     esp_lcd_panel_draw_bitmap(s_panel, 0, 0, s_width, s_height, s_framebuf);
 }
+#endif
 
 /* ---------- Board-specific init ---------- */
 
@@ -504,32 +592,47 @@ static void board_lcd_init(void)
     esp_lcd_panel_disp_on_off(s_panel, true);
 }
 
+#elif CONFIG_JANOS_BOARD_COREINK
+
+/* M5Stack CoreInk: GDEW0154M09 200x200 1-bit e-paper (not an esp_lcd panel). */
+static void board_lcd_init(void)
+{
+    s_width  = EPD_WIDTH;
+    s_height = EPD_HEIGHT;
+    epaper_init();
+}
+
 #else
 
 static void board_lcd_init(void) { }
 
 #endif
 
-/* ---------- Public API ---------- */
+/* ---------- Refresh scheduling ---------- */
 
-void display_init(void)
+#if CONFIG_JANOS_BOARD_COREINK
+/* E-paper refresh runs in its own task: a full refresh blocks ~1.2 s and must
+ * never stall the UART/web callers. The public API just flags the frame dirty;
+ * this task renders + pushes the latest state at a capped rate, and skips the
+ * (slow, panel-wearing) refresh when the rendered frame is unchanged. */
+static void epd_task(void *arg)
 {
-    s_mutex = xSemaphoreCreateMutex();
-    board_lcd_init();
-    /* Pick a font scale that keeps full lines (SSID/PW/IP, ~21 chars at scale 1)
-     * readable. Narrow panels (AtomS3/AtomS3R 128px) can't fit them at scale 2. */
-    s_font_scale = (s_width > 0 && s_width < 160) ? 1 : 2;
-    if (s_panel && s_width > 0 && s_height > 0) {
-        s_framebuf = heap_caps_malloc((size_t)s_width * s_height * sizeof(uint16_t),
-                                     MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
-        if (!s_framebuf) {
-            ESP_LOGE(TAG, "Failed to allocate framebuffer (%d bytes)",
-                     s_width * s_height * 2);
+    (void)arg;
+    for (;;) {
+        if (s_epd_dirty) {
+            s_epd_dirty = false;
+            xSemaphoreTake(s_mutex, portMAX_DELAY);
+            do_render();
+            xSemaphoreGive(s_mutex);
+            if (s_epd_fb && (!s_epd_prev || memcmp(s_epd_prev, s_epd_fb, EPD_FB_SIZE) != 0)) {
+                if (s_epd_prev) memcpy(s_epd_prev, s_epd_fb, EPD_FB_SIZE);
+                epaper_display(s_epd_fb);   /* slow, runs unlocked */
+            }
         }
-        ESP_LOGI(TAG, "Display initialized: %dx%d, fb=%p", s_width, s_height, s_framebuf);
+        vTaskDelay(pdMS_TO_TICKS(EPD_REFRESH_INTERVAL_MS));
     }
 }
-
+#else
 /* Decide if we should actually blit now. Caller already holds s_mutex. */
 static void maybe_refresh_display(void)
 {
@@ -539,10 +642,64 @@ static void maybe_refresh_display(void)
         refresh_display();
     }
 }
+#endif
+
+/* Request a redraw. force=true is for low-frequency events (connect splash,
+ * client-count change) that must not be throttled away. On e-paper both paths
+ * just flag the frame dirty; epd_task owns the timing. Caller holds s_mutex. */
+static void mark_dirty(bool force)
+{
+#if CONFIG_JANOS_BOARD_COREINK
+    (void)force;
+    s_epd_dirty = true;
+#else
+    if (force) refresh_display();
+    else       maybe_refresh_display();
+#endif
+}
+
+/* ---------- Public API ---------- */
+
+void display_init(void)
+{
+    s_mutex = xSemaphoreCreateMutex();
+    board_lcd_init();
+    /* Pick a font scale that keeps full lines (SSID/PW/IP, ~21 chars at scale 1)
+     * readable. Narrow panels (AtomS3/AtomS3R 128px) can't fit them at scale 2.
+     * CoreInk's 200px e-paper fits everything only at scale 1 (~32 chars/line). */
+#if CONFIG_JANOS_BOARD_COREINK
+    s_font_scale = 2;
+#else
+    s_font_scale = (s_width > 0 && s_width < 160) ? 1 : 2;
+#endif
+#if CONFIG_JANOS_BOARD_COREINK
+    s_epd_fb   = heap_caps_malloc(EPD_FB_SIZE, MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    s_epd_prev = heap_caps_malloc(EPD_FB_SIZE, MALLOC_CAP_8BIT);
+    if (s_epd_fb) memset(s_epd_fb, 0xFF, EPD_FB_SIZE);
+    /* Seed prev != fb so the very first frame always flushes. */
+    if (s_epd_prev) memset(s_epd_prev, 0x00, EPD_FB_SIZE);
+    if (s_epd_fb) {
+        ESP_LOGI(TAG, "E-paper display ready: %dx%d, fb=%p", s_width, s_height, s_epd_fb);
+        xTaskCreate(epd_task, "epd_refresh", 4096, NULL, 3, NULL);
+    } else {
+        ESP_LOGE(TAG, "Failed to allocate e-paper framebuffer (%d bytes)", EPD_FB_SIZE);
+    }
+#else
+    if (s_panel && s_width > 0 && s_height > 0) {
+        s_framebuf = heap_caps_malloc((size_t)s_width * s_height * sizeof(uint16_t),
+                                     MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+        if (!s_framebuf) {
+            ESP_LOGE(TAG, "Failed to allocate framebuffer (%d bytes)",
+                     s_width * s_height * 2);
+        }
+        ESP_LOGI(TAG, "Display initialized: %dx%d, fb=%p", s_width, s_height, s_framebuf);
+    }
+#endif
+}
 
 void display_update(const char *tx_cmd, const char *rx_line)
 {
-    if (!s_panel || !s_framebuf) return;
+    if (!disp_ready()) return;
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
 
@@ -557,14 +714,14 @@ void display_update(const char *tx_cmd, const char *rx_line)
         s_rx_count++;
     }
 
-    maybe_refresh_display();
+    mark_dirty(false);
 
     xSemaphoreGive(s_mutex);
 }
 
 void display_show_ap_info(const char *ssid, const char *ip, const char *password)
 {
-    if (!s_panel || !s_framebuf) return;
+    if (!disp_ready()) return;
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     strncpy(s_ap_ssid, ssid ? ssid : "", DISP_LINE_LEN);
@@ -575,25 +732,25 @@ void display_show_ap_info(const char *ssid, const char *ip, const char *password
     s_ap_pass[DISP_LINE_LEN] = '\0';
     snprintf(s_status_line, sizeof(s_status_line), "AP:%s", ssid ? ssid : "");
     /* AP info is one-shot at boot; force unthrottled draw. */
-    refresh_display();
+    mark_dirty(true);
     xSemaphoreGive(s_mutex);
 }
 
 void display_set_client_count(int count)
 {
-    if (!s_panel || !s_framebuf) return;
+    if (!disp_ready()) return;
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     s_client_count = count;
     /* Connect/disconnect is a low-frequency event; force an immediate draw
      * so the splash <-> operational view switch is not throttled away. */
-    refresh_display();
+    mark_dirty(true);
     xSemaphoreGive(s_mutex);
 }
 
 void display_set_status(const char *status)
 {
-    if (!s_panel || !s_framebuf) return;
+    if (!disp_ready()) return;
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     if (status) {
@@ -602,7 +759,7 @@ void display_set_status(const char *status)
     } else {
         s_status_line[0] = '\0';
     }
-    maybe_refresh_display();
+    mark_dirty(false);
     xSemaphoreGive(s_mutex);
 }
 
