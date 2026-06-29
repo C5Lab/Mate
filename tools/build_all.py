@@ -170,6 +170,18 @@ BOARDS = {
         "app_offset":         "0x10000",
         "spiffs_offset":      "0x1D0000",  # 0x10000 + 0x1C0000 (partitions_4mb.csv)
     },
+    "atoms3u": {
+        "idf_target":         "esp32s3",
+        "sdkconfig_defaults": "sdkconfig.defaults;sdkconfig.defaults.atoms3u",
+        "chip":               "esp32s3",
+        "flash_size":         "8MB",
+        "flash_mode":         "dio",
+        "flash_freq":         "80m",
+        "boot_offset":        "0x0",
+        "ptable_offset":      "0x8000",
+        "app_offset":         "0x10000",
+        "spiffs_offset":      "0x3D0000",  # 0x10000 + 0x3C0000 (partitions_8mb.csv)
+    },
 }
 
 IMAGE        = "espressif/idf:release-v6.0"
