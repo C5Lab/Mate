@@ -17,6 +17,7 @@
 #include "freertos/semphr.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
+#include "backlight_atoms3r.h"
 
 /* Throttle full-screen redraw to ~10 Hz. UART line rate from C5 can exceed
  * 100 lines/sec during scans / sniffer / SubGHz; redrawing on every line
@@ -306,9 +307,9 @@ static void board_lcd_init(void)
     esp_lcd_panel_disp_on_off(s_panel, true);
 }
 
-#elif defined(CONFIG_JANOS_BOARD_ATOMS3R) || defined(CONFIG_JANOS_BOARD_ATOMS3)
+#elif CONFIG_JANOS_BOARD_ATOMS3
 
-/* AtomS3R / AtomS3: GC9107, 128x128, SPI (identical LCD pinout) */
+/* AtomS3: GC9107, 128x128, SPI. Backlight on a direct GPIO. */
 #define LCD_HOST     SPI2_HOST
 #define LCD_DC_GPIO  33
 #define LCD_CS_GPIO  15
@@ -336,6 +337,68 @@ static void board_lcd_init(void)
         gpio_config(&bl_cfg);
         gpio_set_level(LCD_BL_GPIO, 1);
     }
+
+    spi_bus_config_t bus = {
+        .mosi_io_num = LCD_MOSI_GPIO,
+        .miso_io_num = -1,
+        .sclk_io_num = LCD_CLK_GPIO,
+        .max_transfer_sz = LCD_W * LCD_H * sizeof(uint16_t),
+    };
+    ESP_ERROR_CHECK(spi_bus_initialize(LCD_HOST, &bus, SPI_DMA_CH_AUTO));
+
+    esp_lcd_panel_io_handle_t io;
+    esp_lcd_panel_io_spi_config_t io_cfg = {
+        .dc_gpio_num = LCD_DC_GPIO,
+        .cs_gpio_num = LCD_CS_GPIO,
+        .pclk_hz     = 20 * 1000 * 1000,
+        .lcd_cmd_bits   = 8,
+        .lcd_param_bits = 8,
+        .spi_mode = 0,
+        .trans_queue_depth = 10,
+    };
+    ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)LCD_HOST, &io_cfg, &io));
+
+    esp_lcd_panel_dev_config_t panel_cfg = {
+        .reset_gpio_num = LCD_RST_GPIO,
+        .bits_per_pixel = 16,
+    };
+    ESP_ERROR_CHECK(esp_lcd_new_panel_st7789(io, &panel_cfg, &s_panel));
+
+    esp_lcd_panel_reset(s_panel);
+    esp_lcd_panel_init(s_panel);
+    esp_lcd_panel_invert_color(s_panel, true);
+    ESP_ERROR_CHECK(esp_lcd_panel_set_gap(s_panel, LCD_GAP_X, LCD_GAP_Y));
+    esp_lcd_panel_disp_on_off(s_panel, true);
+
+}
+
+#elif CONFIG_JANOS_BOARD_ATOMS3R
+
+/*
+ * AtomS3R: 128x128, SPI, but DIFFERENT from AtomS3:
+ *   SCK=14, DC=42, RST=48 (CS=15, MOSI=21 shared); controller GC9107 on
+ *   older units, ST7735 on newer ones (2026.05.14+). The backlight is NOT a
+ *   GPIO -- it hangs off an LP5562 LED driver on the internal I2C bus, so it
+ *   is enabled via atoms3r_backlight_on() (see backlight_atoms3r.c).
+ */
+#define LCD_HOST      SPI2_HOST
+#define LCD_DC_GPIO   42
+#define LCD_CS_GPIO   14
+#define LCD_CLK_GPIO  15
+#define LCD_MOSI_GPIO 21
+#define LCD_RST_GPIO  48
+#define LCD_W  128
+#define LCD_H  128
+#define LCD_GAP_X 2
+#define LCD_GAP_Y 1
+
+static void board_lcd_init(void)
+{
+    s_width = LCD_W;
+    s_height = LCD_H;
+
+    /* Backlight is driven by the LP5562 over I2C, not a GPIO. */
+    atoms3r_backlight_on();
 
     spi_bus_config_t bus = {
         .mosi_io_num = LCD_MOSI_GPIO,

@@ -104,7 +104,7 @@ Default pins are configurable via `idf.py menuconfig`.
 
 Each folder contains: `mate-<board>.bin`, `bootloader-<board>.bin`, `partition-table-<board>.bin`, `storage-<board>.bin`.
 
-Delegates to `.github/scripts/container_build.sh` using `espressif/idf:release-v6.0` — same image as CI.
+Runs each build in the `espressif/idf:release-v6.0` container — the same image (and board matrix) the CI workflow uses.
 
 ### Usage
 

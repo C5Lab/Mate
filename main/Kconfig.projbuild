@@ -41,6 +41,10 @@ menu "JanOS Web Client Configuration"
         config JANOS_BOARD_ATOM_LITE
             bool "M5Stack Atom Lite (no display)"
             depends on IDF_TARGET_ESP32
+
+        config JANOS_BOARD_ATOM_MATRIX
+            bool "M5Stack ATOM Matrix (no display)"
+            depends on IDF_TARGET_ESP32
     endchoice
 
     config JANOS_HAS_DISPLAY
@@ -48,6 +52,7 @@ menu "JanOS Web Client Configuration"
         default n if JANOS_BOARD_XIAO_C6
         default n if JANOS_BOARD_NANOC6
         default n if JANOS_BOARD_ATOM_LITE
+        default n if JANOS_BOARD_ATOM_MATRIX
         default n if JANOS_BOARD_ATOMS3_LITE
         default y
 
@@ -59,9 +64,10 @@ menu "JanOS Web Client Configuration"
             default 2  if JANOS_BOARD_NANOC6
             default 2  if JANOS_BOARD_CORES3
             default 32 if JANOS_BOARD_STICKC_PLUS2
-            default 5  if JANOS_BOARD_ATOMS3R
+            default 2  if JANOS_BOARD_ATOMS3R
             default 9  if JANOS_BOARD_STICKS3
             default 26 if JANOS_BOARD_ATOM_LITE
+            default 26 if JANOS_BOARD_ATOM_MATRIX
             default 2  if JANOS_BOARD_ATOMS3
             default 2  if JANOS_BOARD_ATOMS3_LITE
             help
@@ -74,9 +80,10 @@ menu "JanOS Web Client Configuration"
             default 1  if JANOS_BOARD_NANOC6
             default 1  if JANOS_BOARD_CORES3
             default 33 if JANOS_BOARD_STICKC_PLUS2
-            default 6  if JANOS_BOARD_ATOMS3R
+            default 1  if JANOS_BOARD_ATOMS3R
             default 10 if JANOS_BOARD_STICKS3
             default 32 if JANOS_BOARD_ATOM_LITE
+            default 32 if JANOS_BOARD_ATOM_MATRIX
             default 1  if JANOS_BOARD_ATOMS3
             default 1  if JANOS_BOARD_ATOMS3_LITE
             help

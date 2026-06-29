@@ -8,6 +8,7 @@ set(srcs
     "display.c"
     "dynvec.c"
     "power_sticks3.c"
+    "backlight_atoms3r.c"
 )
 
 idf_component_register(

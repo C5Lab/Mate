@@ -4,7 +4,8 @@ build_all.py – build all board permutations of janos-web-client locally,
 mirroring the GitHub Actions workflow (espressif/idf:release-v6.0).
 
 Calls Docker directly from Python (no bash wrapper) to avoid MSYS path
-conversion issues on Windows. Build logic mirrors container_build.sh.
+conversion issues on Windows. This script is the single source of truth for
+the board build matrix, mirrored into CI via --print-matrix.
 
 Output layout:
   binaries/
@@ -25,6 +26,7 @@ Usage:
 """
 
 import argparse
+import json
 import shutil
 import subprocess
 import sys
@@ -144,6 +146,18 @@ BOARDS = {
         "app_offset":         "0x10000",
         "spiffs_offset":      "0x1D0000",  # 0x10000 + 0x1C0000 (partitions_4mb.csv)
     },
+    "atom-matrix": {
+        "idf_target":         "esp32",
+        "sdkconfig_defaults": "sdkconfig.defaults;sdkconfig.defaults.atom-matrix",
+        "chip":               "esp32",
+        "flash_size":         "4MB",
+        "flash_mode":         "dio",
+        "flash_freq":         "40m",
+        "boot_offset":        "0x1000",
+        "ptable_offset":      "0x8000",
+        "app_offset":         "0x10000",
+        "spiffs_offset":      "0x1D0000",  # 0x10000 + 0x1C0000 (partitions_4mb.csv)
+    },
 }
 
 IMAGE        = "espressif/idf:release-v6.0"
@@ -172,7 +186,7 @@ def docker_available() -> bool:
         return False
 
 
-def build_board(board: str, keep_build: bool, out_root: Path) -> None:
+def build_board(board: str, keep_build: bool, out_root: Path, use_docker: bool = True) -> None:
     cfg       = BOARDS[board]
     build_dir = REPO_ROOT / f"build-{board}"
     out_dir   = out_root / board
@@ -200,18 +214,24 @@ def build_board(board: str, keep_build: bool, out_root: Path) -> None:
         f" && idf.py -B build-{board} build"
     )
 
-    docker_cmd = [
-        "docker", "run", "--rm",
-        "--workdir", "/project",
-        "--env", f"IDF_TARGET={cfg['idf_target']}",
-        "--env", f"SDKCONFIG_DEFAULTS={cfg['sdkconfig_defaults']}",
-        "--volume", f"{REPO_ROOT}:/project",
-        "--volume", f"{CACHE_DIR}:/root/.espressif",
-        IMAGE,
-        "bash", "-c", idf_cmd,
-    ]
+    if use_docker:
+        cmd = [
+            "docker", "run", "--rm",
+            "--workdir", "/project",
+            "--env", f"IDF_TARGET={cfg['idf_target']}",
+            "--env", f"SDKCONFIG_DEFAULTS={cfg['sdkconfig_defaults']}",
+            "--volume", f"{REPO_ROOT}:/project",
+            "--volume", f"{CACHE_DIR}:/root/.espressif",
+            IMAGE,
+            "bash", "-c", idf_cmd,
+        ]
+    else:
+        # Native build: assume we're already inside the esp-idf container/host
+        # (e.g. GitHub Actions). Reuse the exact same idf command sequence so
+        # the anti-config-leak guarantees hold identically to the Docker path.
+        cmd = ["bash", "-c", idf_cmd]
 
-    run(docker_cmd)
+    run(cmd)
     _verify_config(board, cfg)
     _collect_artifacts(board, build_dir, out_dir)
     generate_flasher(board, out_dir)
@@ -547,13 +567,35 @@ def parse_args() -> argparse.Namespace:
         "--output-dir", default=str(BINARIES_DIR),
         help=f"Root output directory (default: {BINARIES_DIR})",
     )
+    p.add_argument(
+        "--no-docker", action="store_true",
+        help="Run idf.py directly instead of via Docker (for CI inside the "
+             "espressif/idf container, or a host with esp-idf installed)",
+    )
+    p.add_argument(
+        "--print-matrix", action="store_true",
+        help="Print the board build matrix as JSON and exit. Single source of "
+             "truth for the GitHub Actions matrix.",
+    )
     return p.parse_args()
+
+
+def print_matrix() -> None:
+    """Emit the board matrix as a compact JSON array for GitHub Actions to
+    consume via `fromJSON`. Keeps the CI matrix in lockstep with BOARDS."""
+    matrix = [{"board": b, "idf_target": cfg["idf_target"]}
+              for b, cfg in BOARDS.items()]
+    print(json.dumps(matrix))
 
 
 def main() -> None:
     args = parse_args()
 
-    if not docker_available():
+    if args.print_matrix:
+        print_matrix()
+        return
+
+    if not args.no_docker and not docker_available():
         sys.exit("Docker is not available. Please install Docker and ensure the daemon is running.")
 
     if args.targets:
@@ -578,7 +620,7 @@ def main() -> None:
     failed: list[str] = []
     for board in boards:
         try:
-            build_board(board, args.keep_build, out_root)
+            build_board(board, args.keep_build, out_root, use_docker=not args.no_docker)
             log(f"  -> artifacts written to {out_root / board}")
         except SystemExit as exc:
             log(f"  FAILED: {exc}")
