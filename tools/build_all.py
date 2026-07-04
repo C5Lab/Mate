@@ -185,9 +185,11 @@ BOARDS = {
 }
 
 IMAGE        = "espressif/idf:release-v6.0"
+NODE_IMAGE   = "node:24-alpine"
 REPO_ROOT    = Path(__file__).resolve().parent.parent
 BINARIES_DIR = REPO_ROOT / "binaries"
 CACHE_DIR    = REPO_ROOT / ".espressif"
+WEB_DIR      = REPO_ROOT / "web"
 
 # ---------------------------------------------------------------------------
 
@@ -208,6 +210,41 @@ def docker_available() -> bool:
         return True
     except (subprocess.CalledProcessError, FileNotFoundError):
         return False
+
+
+def build_web(use_docker: bool) -> None:
+    """Rebuild the Preact web UI into spiffs/ before packaging firmware.
+
+    The ESP-IDF container has no npm, so the firmware build alone embeds
+    whatever stale spiffs/app.js is on disk. Run `npm run build` here (vite
+    outputs to ../spiffs per web/vite.config.js) so the flashed UI always
+    matches web/src. Uses a local npm if present, otherwise the node Docker
+    image (host doesn't need Node installed)."""
+    if not (WEB_DIR / "package.json").exists():
+        log("web/ not found — skipping web build")
+        return
+
+    log("=== Building web UI (npm run build -> spiffs/) ===")
+    npm = shutil.which("npm")
+    if npm:
+        run([npm, "ci", "--no-audit", "--no-fund"], cwd=WEB_DIR)
+        run([npm, "run", "build"], cwd=WEB_DIR)
+        return
+
+    if not use_docker:
+        sys.exit("No local npm and --no-docker set: cannot build the web UI. "
+                 "Install Node or drop --no-docker.")
+
+    # Shadow the host node_modules with an anonymous volume so Windows-installed
+    # binaries don't leak into the Linux container, then do a clean install.
+    run([
+        "docker", "run", "--rm",
+        "--volume", f"{REPO_ROOT}:/proj",
+        "--volume", "/proj/web/node_modules",
+        "--workdir", "/proj/web",
+        NODE_IMAGE,
+        "sh", "-c", "npm ci --no-audit --no-fund && npm run build",
+    ])
 
 
 def build_board(board: str, keep_build: bool, out_root: Path, use_docker: bool = True) -> None:
@@ -325,10 +362,12 @@ flash_board.py – Mate firmware flasher for {board}
 Chip: {chip} | Flash: {flash_size} | Mode: {flash_mode} @ {flash_freq}
 
 Auto-installs esptool and pyserial into a local .venv if needed.
+Flashes with a full erase by default (reliable across board/partition
+changes); pass --no-erase for a faster same-board reflash.
 Usage:
-  python flash_board.py              # auto-detect port
+  python flash_board.py              # auto-detect port, full erase + flash
   python flash_board.py --port COM3
-  python flash_board.py --erase      # full erase before flash
+  python flash_board.py --no-erase   # skip erase (faster; same board only)
   python flash_board.py --monitor    # open serial monitor after flash
 """
 import os
@@ -520,7 +559,7 @@ def main():
     ap = argparse.ArgumentParser(description=f"Mate flasher – {{BOARD}}")
     ap.add_argument("--port",    help="Serial port (e.g. COM3 or /dev/ttyUSB0)")
     ap.add_argument("--baud",    type=int, default=DEFAULT_BAUD)
-    ap.add_argument("--erase",   action="store_true", help="Full erase before flashing")
+    ap.add_argument("--no-erase", action="store_true", help="Skip the full erase (faster; same-board reflash only)")
     ap.add_argument("--monitor", action="store_true", help="Serial monitor after flash")
     ap.add_argument("--no-stub", action="store_true", help="Flash without the stub (slower, robust for finicky ESP32 modules)")
     args = ap.parse_args()
@@ -534,7 +573,7 @@ def main():
         port   = wait_for_port(before)
     print(f"{{GREEN}}Port: {{port}}{{RESET}}")
 
-    if args.erase:
+    if not args.no_erase:
         erase(port, args.baud)
 
     rc = flash(port, args.baud, no_stub=args.no_stub)
@@ -595,6 +634,11 @@ def parse_args() -> argparse.Namespace:
         "--no-docker", action="store_true",
         help="Run idf.py directly instead of via Docker (for CI inside the "
              "espressif/idf container, or a host with esp-idf installed)",
+    )
+    p.add_argument(
+        "--no-web", action="store_true",
+        help="Skip rebuilding the web UI; embed the existing spiffs/ as-is "
+             "(e.g. when the web was already built in a separate CI step)",
     )
     p.add_argument(
         "--print-matrix", action="store_true",
@@ -702,6 +746,12 @@ def main() -> None:
     log(f"Build matrix ({len(boards)} jobs):")
     for b in boards:
         log(f"  {b}  [{BOARDS[b]['idf_target']}]")
+
+    # Rebuild the web UI once (target-agnostic) so every board embeds fresh
+    # spiffs. This is the step build_all previously lacked, which meant
+    # firmware-only rebuilds silently shipped a stale UI.
+    if not args.no_web:
+        build_web(not args.no_docker)
 
     failed = build_boards(boards, args.keep_build, out_root, not args.no_docker)
 

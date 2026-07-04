@@ -117,6 +117,7 @@ function formatLastNet(st) {
 function operationLabel(status) {
   const labels = {
     idle: 'Chillin',
+    scan: 'AP Scan',
     scanning: 'AP Scan',
     deauth: 'Deauth',
     blackout: 'Blackout',
@@ -129,13 +130,27 @@ function operationLabel(status) {
     karma: 'Karma',
     portal: 'Portal',
     subghz: 'SubGHz',
+    subghz_listen: 'SubGHz Listen',
+    subghz_jam: 'SubGHz Jam',
+    wardrive: 'Wardrive',
+    wardrive_run: 'Wardrive',
+    antisurv: 'Anti-Surveillance',
+    antisurv_run: 'Anti-Surveillance',
   };
-  return labels[status] || String(status || 'Chillin');
+  if (labels[status]) return labels[status];
+  if (!status) return 'Chillin';
+  /* Prettify any unmapped device-state string, e.g. "listing_wardrive"
+   * -> "Listing Wardrive", instead of leaking the raw token. */
+  return String(status).replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
 function operationMeta(st) {
   if (st.status === 'idle') return 'Ready';
   if (st.status === 'scanning') return `${st.scanCount || st.networks.length || 0} APs discovered`;
+  if (st.status === 'wardrive' || st.status === 'wardrive_run') {
+    const s = st.wardrive && st.wardrive.stats;
+    return s ? `${s.nets} nets · ${s.bt} BT · ${Math.round(s.dist)} m` : 'Waiting for GPS fix';
+  }
   if (st.packetCount) return `${st.packetCount} packets captured`;
   return 'Operation running';
 }
@@ -169,10 +184,12 @@ export function Home() {
           <div class="operation-name">{operationLabel(st.status)}</div>
           <div class="operation-caption">{operationMeta(st)}</div>
         </div>
-        <button class="btn btn-danger operation-stop" onClick={stopOperation}>
-          <Glyph name="stop" />
-          Stop
-        </button>
+        {isBusy && (
+          <button class="btn btn-danger operation-stop" onClick={stopOperation}>
+            <Glyph name="stop" />
+            Stop
+          </button>
+        )}
       </section>
 
       <section class="glass-card card-body">

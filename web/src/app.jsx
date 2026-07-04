@@ -10,7 +10,12 @@ import {
   setQuickActions,
   setState,
   subscribe,
+  wardriveReset,
+  wardrivePatch,
+  antisurvReset,
+  antisurvPatch,
 } from './store';
+import { ingestWardriveLine } from './wardriveParse';
 import { ToastContainer } from './components/Toast';
 import { QUICK_ACTION_OPTIONS } from './quickActions';
 
@@ -62,6 +67,11 @@ function SettingsIcon() {
   );
 }
 
+/* Bump this on every web change so the footer confirms which build is loaded.
+ * If the footer version doesn't match the latest, the browser is serving a
+ * cached/stale app.js (hard-refresh or open in a private tab). */
+export const WEB_VERSION = '0004';
+
 export function App() {
   const [, forceUpdate] = useState(0);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -85,6 +95,19 @@ export function App() {
           heapFree: data.heap_free || 0,
           heapInternal: data.heap_internal || 0,
         });
+
+        /* Reconcile the wardrive/anti-surv run flags from the authoritative
+         * device state. The WS attack_started/stopped events are the fast
+         * path but a single dropped frame (or a page reload mid-run) would
+         * otherwise leave the Engine UI out of sync with the top menu. */
+        const s = getState();
+        const wdRun = data.state === 'wardrive_run';
+        const asRun = data.state === 'antisurv_run';
+        if (s.wardrive.running !== wdRun) {
+          if (wdRun) wardriveReset({ running: true, gps: 'waiting' });
+          else wardrivePatch({ running: false, gps: 'idle' });
+        }
+        if (s.antisurv.running !== asRun) antisurvPatch({ running: asRun });
       } catch (e) {
         /* ignore status polling errors */
       }
@@ -143,10 +166,22 @@ export function App() {
 
       if (msg.type === 'attack_started') {
         setState({ status: normalizeStatus(msg.attack) });
+        /* Only (re)initialize if not already running. This frame can arrive
+         * AFTER the one-shot "GPS fix obtained" line and the first CSV rows
+         * (WS vs uart_line are separate transports), so blindly resetting
+         * would wipe the fix state + table and strand the badge on
+         * "Waiting for GPS fix". The optimistic startRun() already armed it. */
+        if (msg.attack === 'wardrive' && !st.wardrive.running) {
+          wardriveReset({ running: true, gps: 'waiting' });
+        } else if (msg.attack === 'antisurv' && !st.antisurv.running) {
+          antisurvReset({ running: true });
+        }
       }
 
       if (msg.type === 'attack_stopped') {
         setState({ status: 'idle' });
+        if (st.wardrive.running) wardrivePatch({ running: false, gps: 'idle' });
+        if (st.antisurv.running) antisurvPatch({ running: false });
       }
 
       if (msg.type === 'sniffer_count') {
@@ -178,6 +213,8 @@ export function App() {
        * We skip the ICMP-only rows because arp_ban needs a usable MAC. */
       if (msg.type === 'uart_line' && typeof msg.data === 'string') {
         const line = msg.data;
+        // Wardrive / anti-surveillance stream (CSV rows, stats, GPS, followers).
+        if (ingestWardriveLine(line)) return;
         if (line.includes('=== Discovered Hosts ===')) {
           clearArpHosts();
         } else {
@@ -242,7 +279,7 @@ export function App() {
       </header>
 
       <main class="page-shell">
-        <Router>
+        <Router onChange={() => window.scrollTo(0, 0)}>
           <Home path="/" />
           <Scan path="/scan" />
           <Deauth path="/deauth" />
@@ -296,6 +333,10 @@ export function App() {
           </section>
         </div>
       ) : null}
+
+      <footer class="app-version">
+        JanOS Web <span>v{WEB_VERSION}</span>
+      </footer>
 
       <ToastContainer />
     </div>

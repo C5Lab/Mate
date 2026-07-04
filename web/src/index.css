@@ -1547,3 +1547,18 @@ button:not(:disabled) {
     min-width: 52px;
   }
 }
+
+/* Build version stamp — confirms which web build is actually loaded
+   (stale cache detection). Kept subtle at the very bottom of every page. */
+.app-version {
+  margin: 18px 0 8px;
+  text-align: center;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  color: var(--slate, #7c8aa0);
+  opacity: 0.6;
+}
+.app-version span {
+  color: var(--blue, #43c9ff);
+}

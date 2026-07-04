@@ -59,6 +59,11 @@ typedef enum {
     STATE_LISTING_SNIFFER,
     STATE_LISTING_HANDSHAKES,
     STATE_LISTING_WARDRIVE,
+    STATE_WARDRIVE_CONFIG,      /* reading get_wardrive_config [WDCFG] block */
+    STATE_WARDRIVE_BLACKLIST,   /* reading wardrive_blacklist list */
+    STATE_WARDRIVE_RUN,         /* start_wardrive_promisc[_trace] streaming */
+    STATE_ANTISURV_RUN,         /* start_antisurveillance streaming */
+    STATE_DEAUTH_DETECT,        /* deauth_detector streaming */
     STATE_LISTING_PROBES,
     STATE_ATTACK_KARMA,
     STATE_SUBGHZ_LISTEN,
@@ -235,6 +240,99 @@ const char *cmd_get_sta_ssid(void);
 /** Copy up to `max` cached wardrive log entries into `out`. */
 int cmd_get_wardrive_logs(parsed_portal_file_t *out, int max);
 int cmd_get_wardrive_logs_count(void);
+
+/* ---------- Wardrive 2.0 config / control ---------- */
+
+/** Snapshot of the C5 wardrive config ([WDCFG] block from get_wardrive_config). */
+typedef struct {
+    bool valid;             /* a complete block has been parsed at least once */
+    char bands[32];         /* e.g. "wifi24,wifi5,ble" */
+    char channels[16];      /* "popular" | "all" | "custom" */
+    char custom[128];       /* e.g. "1:6:11:36" (channel list) */
+    int  wifi_delta;        /* re-log threshold dBm (0 = log once) */
+    int  ble_delta;
+    int  cooldown;          /* startup cooldown seconds */
+    int  mem_cap;           /* in-RAM entry cap */
+    char antisurv[8];       /* "low" | "med" | "high" */
+} wardrive_cfg_t;
+
+/** Fields to push to the C5 on Apply. Empty string / -1 means "leave unchanged". */
+typedef struct {
+    char bands[32];         /* "wifi24,wifi5,ble" ("" = skip) */
+    char channels[16];      /* "popular"|"all"|"custom" ("" = skip) */
+    char custom[128];       /* channel list for custom mode */
+    int  wifi_delta;        /* -1 = skip */
+    int  ble_delta;         /* -1 = skip */
+    int  cooldown;          /* -1 = skip */
+    int  mem_cap;           /* -1 = skip */
+    char antisurv[8];       /* "low"|"med"|"high" ("" = skip) */
+    char gps[16];           /* "m5"|"atgm"|"external"|"cap" ("" = skip) */
+} wardrive_apply_t;
+
+/** Request the current config block from the C5 (get_wardrive_config). */
+bool cmd_do_wardrive_config_load(void);
+
+/** Copy the cached config snapshot. `out->valid` reflects freshness. */
+void cmd_get_wardrive_cfg(wardrive_cfg_t *out);
+
+/** Apply a batch of config settings (fires set_wardrive_* / set_antisurv_* / gps_set). */
+bool cmd_do_wardrive_config_set(const wardrive_apply_t *a);
+
+/** Start promiscuous wardrive. trace=true adds KML (start_wardrive_promisc_trace). */
+bool cmd_do_wardrive_start(bool trace);
+
+/** Start anti-surveillance (follower detection). */
+bool cmd_do_antisurv_start(void);
+
+/** Request the MAC blacklist (wardrive_blacklist list). */
+bool cmd_do_wardrive_blacklist_load(void);
+
+/** Edit the MAC blacklist. action = "add" | "remove" | "clear"; mac ignored for clear. */
+bool cmd_do_wardrive_blacklist_edit(const char *action, const char *mac);
+
+/** Copy up to `max` cached blacklist MAC strings into `out` (18 bytes each). */
+int cmd_get_wardrive_blacklist(char (*out)[18], int max);
+int cmd_get_wardrive_blacklist_count(void);
+
+/** True once a blacklist listing has completed (distinguishes empty from unloaded). */
+bool cmd_get_wardrive_blacklist_valid(void);
+
+/** Live wardrive status, parsed from the C5 stream and cached so the web can
+ *  poll it over HTTP (robust to WebSocket drops during the CSV flood). */
+typedef struct {
+    bool  active;      /* a wardrive run is in progress */
+    bool  gps_valid;   /* GPS fix acquired */
+    int   nets;        /* unique WiFi networks */
+    int   bt;          /* BT devices */
+    int   relogs;
+    int   best_ch;     /* D-UCB best channel */
+    int   sats;        /* satellites */
+    float dist;        /* travelled metres */
+    char  file[24];    /* active log file, e.g. "w10.log" */
+} wardrive_status_t;
+
+/** Copy the cached live wardrive status. */
+void cmd_get_wardrive_status(wardrive_status_t *out);
+
+/* ---------- Deauth detector ---------- */
+
+/** One detected AP under deauth attack, aggregated by BSSID. */
+typedef struct {
+    char     bssid[18];
+    char     ap[33];
+    int      channel;
+    int      rssi;       /* most recent */
+    int      hits;       /* deauth frames seen for this AP */
+    uint32_t last_ms;    /* monotonic ms of last sighting */
+} deauth_event_t;
+
+/** Start the deauth detector (deauth_detector). Streams into a cache the web
+ *  polls over HTTP (robust to WebSocket drops). */
+bool cmd_do_deauth_detect_start(void);
+
+/** Copy up to `max` aggregated deauth events into `out`; returns count copied. */
+int cmd_get_deauth_events(deauth_event_t *out, int max);
+int cmd_get_deauth_events_count(void);
 
 /** Copy up to `max` cached probe entries into `out`. */
 int cmd_get_probes(parsed_probe_t *out, int max);

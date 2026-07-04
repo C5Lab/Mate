@@ -4,10 +4,12 @@ flash_board.py – Mate firmware flasher for atoms3u
 Chip: esp32s3 | Flash: 8MB | Mode: dio @ 80m
 
 Auto-installs esptool and pyserial into a local .venv if needed.
+Flashes with a full erase by default (reliable across board/partition
+changes); pass --no-erase for a faster same-board reflash.
 Usage:
-  python flash_board.py              # auto-detect port
+  python flash_board.py              # auto-detect port, full erase + flash
   python flash_board.py --port COM3
-  python flash_board.py --erase      # full erase before flash
+  python flash_board.py --no-erase   # skip erase (faster; same board only)
   python flash_board.py --monitor    # open serial monitor after flash
 """
 import os
@@ -199,7 +201,7 @@ def main():
     ap = argparse.ArgumentParser(description=f"Mate flasher – {BOARD}")
     ap.add_argument("--port",    help="Serial port (e.g. COM3 or /dev/ttyUSB0)")
     ap.add_argument("--baud",    type=int, default=DEFAULT_BAUD)
-    ap.add_argument("--erase",   action="store_true", help="Full erase before flashing")
+    ap.add_argument("--no-erase", action="store_true", help="Skip the full erase (faster; same-board reflash only)")
     ap.add_argument("--monitor", action="store_true", help="Serial monitor after flash")
     ap.add_argument("--no-stub", action="store_true", help="Flash without the stub (slower, robust for finicky ESP32 modules)")
     args = ap.parse_args()
@@ -213,7 +215,7 @@ def main():
         port   = wait_for_port(before)
     print(f"{GREEN}Port: {port}{RESET}")
 
-    if args.erase:
+    if not args.no_erase:
         erase(port, args.baud)
 
     rc = flash(port, args.baud, no_stub=args.no_stub)

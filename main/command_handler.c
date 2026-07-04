@@ -62,10 +62,23 @@ static bool                 s_portal_header_seen = false;
 static sniffer_results_t    s_sniffer;
 static sniffer_results_t    s_sniffer_build;
 static bool                 s_sniffer_collecting = false;
+/* JanOS echoes "> show_sniffer_results" before printing the AP list, and
+ * is_prompt_line() treats any "> ..." line as a prompt. Without this guard the
+ * echo would end the snapshot instantly (0 APs) and the real AP rows -- which
+ * arrive right after -- would be dropped, so the console shows results but the
+ * UI stays empty. Only accept a prompt as the terminator once we've seen our
+ * own command echo. Reset in begin_sniffer_snapshot(). */
+static bool                 s_sniffer_echo_seen = false;
 static int                  s_sniffer_ap_index = -1;
 static int                  s_handshake_count = -1;
 static bool                 s_handshake_initial_done = false;
 static dynvec_t             s_wardrive_logs;  /* parsed_portal_file_t */
+static wardrive_cfg_t       s_wd_cfg;         /* last parsed [WDCFG] snapshot */
+static wardrive_cfg_t       s_wd_cfg_build;   /* accumulator during config load */
+static dynvec_t             s_wd_blacklist;   /* char[18] MAC strings */
+static bool                 s_wd_blacklist_valid = false; /* list fetched at least once */
+static wardrive_status_t    s_wd_status;      /* live status, polled over HTTP */
+static dynvec_t             s_deauth_events;  /* deauth_event_t, polled over HTTP */
 static dynvec_t             s_probes;         /* parsed_probe_t */
 static dynvec_t             s_probes_build;   /* parsed_probe_t */
 static cmd_state_t          s_probe_resume_state = STATE_IDLE;
@@ -102,9 +115,18 @@ static bool                 s_nmap_active = false;   /* set by cmd_do_nmap, clea
 
 static bool is_prompt_line(const char *line)
 {
+    /* A real JanOS CLI prompt is a bare "> " (only whitespace after the '>').
+     * Command echoes ("> show_sniffer_results") and prompt-prefixed async
+     * status lines ("> Still waiting for GPS fix... (10s)") are NOT prompts:
+     * treating them as such prematurely ends listing/collection states, so the
+     * device console shows results while the UI stays empty. Require the rest
+     * of the line to be empty. */
     if (!line) return false;
     while (*line == ' ') line++;
-    return line[0] == '>' && (line[1] == '\0' || line[1] == ' ');
+    if (line[0] != '>') return false;
+    const char *p = line + 1;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    return *p == '\0';
 }
 
 static bool is_not_connected_line(const char *line)
@@ -300,6 +322,7 @@ static void begin_sniffer_snapshot(void)
 {
     reset_sniffer_build();
     s_sniffer_collecting = true;
+    s_sniffer_echo_seen  = false;
 }
 
 /* ---------- ARP host cache helpers ---------- */
@@ -784,6 +807,33 @@ static void sync_display_status(void)
     }
 }
 
+/* Aggregate a deauth sighting by BSSID (bump hit count / refresh fields, or
+ * append a new AP). Bounded so a flood can't grow memory without limit. */
+#define DEAUTH_EVENTS_MAX 128
+static void deauth_record(const char *bssid, const char *ap, int ch, int rssi)
+{
+    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+    deauth_event_t *arr = (deauth_event_t *)s_deauth_events.data;
+    for (int i = 0; i < (int)s_deauth_events.count; i++) {
+        if (strcmp(arr[i].bssid, bssid) == 0) {
+            arr[i].hits++;
+            arr[i].channel = ch;
+            arr[i].rssi    = rssi;
+            arr[i].last_ms = now;
+            if (ap[0]) { strncpy(arr[i].ap, ap, sizeof(arr[i].ap) - 1);
+                         arr[i].ap[sizeof(arr[i].ap) - 1] = '\0'; }
+            return;
+        }
+    }
+    if (s_deauth_events.count >= DEAUTH_EVENTS_MAX) return;
+    deauth_event_t e;
+    memset(&e, 0, sizeof(e));
+    strncpy(e.bssid, bssid, sizeof(e.bssid) - 1);
+    strncpy(e.ap,    ap,    sizeof(e.ap) - 1);
+    e.channel = ch; e.rssi = rssi; e.hits = 1; e.last_ms = now;
+    if (!dynvec_push(&s_deauth_events, &e)) log_drop("deauth_events");
+}
+
 /* Robust per-key parser. JanOS emits two RX schemas (KeeLoq/StarLine vs.
  * generic protocols), and the same applies to LIST entries; rather than
  * trying to anchor everything in one sscanf, look up each key and parse
@@ -1018,6 +1068,19 @@ static void on_uart_line(const char *line, void *ctx)
         s_display_cb(NULL, line);
     }
 
+    /* Universal stop marker: JanOS prints "All operations stopped." whenever
+     * any long-running task ends -- via our `stop`, a physical button, or the
+     * serial console. Treat it as authoritative: force our FSM back to IDLE
+     * (so /api/status stops reporting the old run) and tell every client the
+     * operation ended, without waiting for the next status poll. */
+    if (strstr(line, "All operations stopped.")) {
+        s_wd_status.active = false;
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        s_state = STATE_IDLE;
+        xSemaphoreGive(s_mutex);
+        broadcast_json("{\"type\":\"attack_stopped\"}");
+    }
+
     const char *gps = strstr(line, "GPS fix obtained:");
     if (!gps) gps = strstr(line, "GPS fix recovered:");
     if (gps) {
@@ -1181,6 +1244,12 @@ static void on_uart_line(const char *line, void *ctx)
             parsed_sniffer_ap_t ap;
             char client[SNIFFER_CLIENT_LEN];
 
+            /* Our own command echo -- mark it seen, don't treat as prompt. */
+            if (strstr(line, "show_sniffer_results")) {
+                s_sniffer_echo_seen = true;
+                break;
+            }
+
             if (parse_sniffer_empty_line(line)) {
                 finish_sniffer_snapshot();
                 break;
@@ -1212,7 +1281,7 @@ static void on_uart_line(const char *line, void *ctx)
                 break;
             }
 
-            if (is_prompt_line(line)) {
+            if (is_prompt_line(line) && s_sniffer_echo_seen) {
                 finish_sniffer_snapshot();
                 break;
             }
@@ -1429,6 +1498,12 @@ static void on_uart_line(const char *line, void *ctx)
             begin_sniffer_snapshot();
         }
 
+        /* Our own command echo -- mark it seen, don't treat as prompt. */
+        if (strstr(line, "show_sniffer_results")) {
+            s_sniffer_echo_seen = true;
+            break;
+        }
+
         if (parse_sniffer_empty_line(line)) {
             finish_sniffer_snapshot();
             break;
@@ -1459,7 +1534,7 @@ static void on_uart_line(const char *line, void *ctx)
             break;
         }
 
-        if (is_prompt_line(line)) {
+        if (is_prompt_line(line) && s_sniffer_echo_seen) {
             finish_sniffer_snapshot();
         }
         break;
@@ -1494,6 +1569,177 @@ static void on_uart_line(const char *line, void *ctx)
             xSemaphoreTake(s_mutex, portMAX_DELAY);
             s_state = STATE_IDLE;
             xSemaphoreGive(s_mutex);
+        }
+        break;
+    }
+
+    case STATE_WARDRIVE_CONFIG: {
+        const char *tag = strstr(line, "[WDCFG]");
+        if (tag) {
+            const char *p = tag + 7;         /* skip "[WDCFG]" */
+            while (*p == ' ') p++;
+            if (strncmp(p, "END", 3) == 0) {
+                s_wd_cfg = s_wd_cfg_build;
+                s_wd_cfg.valid = true;
+                xSemaphoreTake(s_mutex, portMAX_DELAY);
+                if (s_state == STATE_WARDRIVE_CONFIG) s_state = STATE_IDLE;
+                xSemaphoreGive(s_mutex);
+                broadcast_json("{\"type\":\"wardrive_config\"}");
+                break;
+            }
+            const char *eq = strchr(p, '=');
+            if (eq) {
+                char key[24];
+                int klen = (int)(eq - p);
+                if (klen > 0 && klen < (int)sizeof(key)) {
+                    memcpy(key, p, klen);
+                    key[klen] = '\0';
+                    const char *val = eq + 1;
+                    /* trim trailing CR/LF/space */
+                    char v[128];
+                    strncpy(v, val, sizeof(v) - 1);
+                    v[sizeof(v) - 1] = '\0';
+                    for (int i = (int)strlen(v) - 1; i >= 0 &&
+                         (v[i] == '\r' || v[i] == '\n' || v[i] == ' '); i--) v[i] = '\0';
+                    if      (!strcmp(key, "bands"))     strncpy(s_wd_cfg_build.bands, v, sizeof(s_wd_cfg_build.bands) - 1);
+                    else if (!strcmp(key, "channels"))  strncpy(s_wd_cfg_build.channels, v, sizeof(s_wd_cfg_build.channels) - 1);
+                    else if (!strcmp(key, "custom"))    strncpy(s_wd_cfg_build.custom, v, sizeof(s_wd_cfg_build.custom) - 1);
+                    else if (!strcmp(key, "wifi_rssi_delta"))    s_wd_cfg_build.wifi_delta = atoi(v);
+                    else if (!strcmp(key, "ble_rssi_delta"))     s_wd_cfg_build.ble_delta  = atoi(v);
+                    else if (!strcmp(key, "startup_cooldown"))   s_wd_cfg_build.cooldown   = atoi(v);
+                    else if (!strcmp(key, "mem_cap"))            s_wd_cfg_build.mem_cap    = atoi(v);
+                    else if (!strcmp(key, "antisurv_sensitivity")) strncpy(s_wd_cfg_build.antisurv, v, sizeof(s_wd_cfg_build.antisurv) - 1);
+                }
+            }
+            break;
+        }
+        if (is_prompt_line(line)) {
+            xSemaphoreTake(s_mutex, portMAX_DELAY);
+            if (s_state == STATE_WARDRIVE_CONFIG) s_state = STATE_IDLE;
+            xSemaphoreGive(s_mutex);
+        }
+        break;
+    }
+
+    case STATE_WARDRIVE_BLACKLIST: {
+        /* Rows are bare MACs "AA:BB:CC:DD:EE:FF"; header is
+         * "Blacklist: N/64 entries"; terminator is "Blacklist END". */
+        size_t len = strlen(line);
+        const char *p = line;
+        while (*p == ' ') p++;
+        if (strlen(p) >= 17 && p[2] == ':' && p[5] == ':' && !strstr(line, "Blacklist")) {
+            char mac[18];
+            strncpy(mac, p, 17);
+            mac[17] = '\0';
+            if (!dynvec_push(&s_wd_blacklist, mac)) log_drop("wd_blacklist");
+            break;
+        }
+        (void)len;
+        if (strstr(line, "Blacklist END") || is_prompt_line(line)) {
+            s_wd_blacklist_valid = true;
+            xSemaphoreTake(s_mutex, portMAX_DELAY);
+            if (s_state == STATE_WARDRIVE_BLACKLIST) s_state = STATE_IDLE;
+            xSemaphoreGive(s_mutex);
+            broadcast_json("{\"type\":\"wardrive_blacklist\",\"count\":%d}",
+                           (int)s_wd_blacklist.count);
+        }
+        break;
+    }
+
+    case STATE_WARDRIVE_RUN: {
+        /* Parse the key status lines into a cache the web polls over HTTP.
+         * This is the reliable path: the WebSocket can drop frames under the
+         * CSV flood, so we do NOT depend on it for the badge/stats. */
+        if (strstr(line, "GPS fix obtained") || strstr(line, "GPS fix recovered")) {
+            s_wd_status.gps_valid = true;
+            ESP_LOGI(TAG, "WD: GPS fix");
+        } else if (strstr(line, "GPS fix lost")) {
+            s_wd_status.gps_valid = false;
+            ESP_LOGI(TAG, "WD: GPS fix lost");
+        } else if (strstr(line, "Wardrive promisc:")) {
+            const char *p;
+            if ((p = strstr(line, "promisc:")))     s_wd_status.nets    = atoi(p + 8);
+            if ((p = strstr(line, "networks, ")))    s_wd_status.bt      = atoi(p + 10);
+            if ((p = strstr(line, "devices, ")))     s_wd_status.relogs  = atoi(p + 9);
+            if ((p = strstr(line, "best ch: ")))     s_wd_status.best_ch = atoi(p + 9);
+            if ((p = strstr(line, "sats: ")))        s_wd_status.sats    = atoi(p + 6);
+            if ((p = strstr(line, "dist: ")))        s_wd_status.dist    = atof(p + 6);
+            if (strstr(line, "GPS: valid"))          s_wd_status.gps_valid = true;
+            ESP_LOGI(TAG, "WD stats: fix=%d nets=%d bt=%d relogs=%d ch=%d sats=%d dist=%.0f",
+                     s_wd_status.gps_valid, s_wd_status.nets, s_wd_status.bt,
+                     s_wd_status.relogs, s_wd_status.best_ch, s_wd_status.sats, s_wd_status.dist);
+        } else if (strstr(line, "Flushed ") && strstr(line, " to ")) {
+            const char *path = strstr(line, " to ") + 4;
+            const char *base = strrchr(path, '/');
+            base = base ? base + 1 : path;
+            int i = 0;
+            while (base[i] && base[i] != '\r' && base[i] != '\n' &&
+                   base[i] != ' ' && i < (int)sizeof(s_wd_status.file) - 1) {
+                s_wd_status.file[i] = base[i];
+                i++;
+            }
+            s_wd_status.file[i] = '\0';
+            s_wd_status.gps_valid = true;  /* a flush means we're logging with a fix */
+        }
+
+        /* Streaming run. Status lines also flow through as raw uart_line events
+         * and are parsed client-side (WS fast path when it survives).
+         *
+         * BUT a flush emits 100+ CSV sighting rows in a burst. Broadcasting
+         * each as its own WS frame overflows the 16-slot queue and starves the
+         * low-rate status frames above -- which left the UI badge stuck on
+         * "Waiting for GPS fix" with no stats tile. Throttle the CSV rows
+         * (MAC...,WIFI / ...,BLE) to a trickle so the important frames always
+         * get through; the live table still samples sightings. */
+        size_t l = strlen(line);
+        bool is_csv = l > 18 && line[2] == ':' && line[5] == ':' &&
+                      ((l >= 5 && strcmp(line + l - 5, ",WIFI") == 0) ||
+                       (l >= 4 && strcmp(line + l - 4, ",BLE") == 0));
+        if (is_csv) {
+            static int64_t s_wd_csv_last_us = 0;
+            int64_t now = esp_timer_get_time();
+            if (now - s_wd_csv_last_us < 300000) return;  /* drop row, no WS flood */
+            s_wd_csv_last_us = now;
+        }
+        break;
+    }
+
+    case STATE_ANTISURV_RUN:
+        /* Follower alerts + summary are low-rate; forward as-is. */
+        break;
+
+    case STATE_DEAUTH_DETECT: {
+        /* Parse "[DEAUTH] CH: 6 | AP: MyNetwork (AA:BB:CC:DD:EE:FF) | RSSI: -45"
+         * into the aggregated cache the web polls (robust to WS drops during a
+         * deauth flood). */
+        const char *tag = strstr(line, "[DEAUTH]");
+        if (tag) {
+            int ch = 0, rssi = 0;
+            char ap[33] = {0}, bssid[18] = {0};
+            const char *p;
+            if ((p = strstr(tag, "CH:")))   ch   = atoi(p + 3);
+            if ((p = strstr(tag, "RSSI:"))) rssi = atoi(p + 5);
+            if ((p = strstr(tag, "AP:"))) {
+                p += 3;
+                while (*p == ' ') p++;
+                const char *paren = strchr(p, '(');
+                if (paren) {
+                    int n = (int)(paren - p);
+                    while (n > 0 && p[n - 1] == ' ') n--;
+                    if (n > (int)sizeof(ap) - 1) n = sizeof(ap) - 1;
+                    memcpy(ap, p, n);
+                    ap[n] = '\0';
+                    const char *b = paren + 1;
+                    const char *end = strchr(b, ')');
+                    if (end) {
+                        int bn = (int)(end - b);
+                        if (bn > (int)sizeof(bssid) - 1) bn = sizeof(bssid) - 1;
+                        memcpy(bssid, b, bn);
+                        bssid[bn] = '\0';
+                    }
+                }
+            }
+            if (bssid[0]) deauth_record(bssid, ap, ch, rssi);
         }
         break;
     }
@@ -1621,6 +1867,10 @@ void cmd_handler_init(void)
     dynvec_init(&s_portals,        sizeof(parsed_portal_file_t), 8);
     dynvec_init(&s_passwords,      sizeof(parsed_password_t),    8);
     dynvec_init(&s_wardrive_logs,  sizeof(parsed_portal_file_t), 8);
+    dynvec_init(&s_wd_blacklist,   sizeof(char[18]),             8);
+    dynvec_init(&s_deauth_events,  sizeof(deauth_event_t),       8);
+    memset(&s_wd_cfg,       0, sizeof(s_wd_cfg));
+    memset(&s_wd_cfg_build, 0, sizeof(s_wd_cfg_build));
     dynvec_init(&s_probes,         sizeof(parsed_probe_t),       8);
     dynvec_init(&s_probes_build,   sizeof(parsed_probe_t),       8);
     dynvec_init(&s_subghz_signals, sizeof(subghz_signal_t),      8);
@@ -1675,6 +1925,11 @@ const char *cmd_state_name(cmd_state_t s)
     case STATE_LISTING_SNIFFER:   return "listing_sniffer";
     case STATE_LISTING_HANDSHAKES:return "listing_handshakes";
     case STATE_LISTING_WARDRIVE:  return "listing_wardrive";
+    case STATE_WARDRIVE_CONFIG:   return "wardrive_config";
+    case STATE_WARDRIVE_BLACKLIST:return "wardrive_blacklist";
+    case STATE_WARDRIVE_RUN:      return "wardrive_run";
+    case STATE_ANTISURV_RUN:      return "antisurv_run";
+    case STATE_DEAUTH_DETECT:     return "deauth_detect";
     case STATE_LISTING_PROBES:    return "listing_probes";
     case STATE_ATTACK_KARMA:      return "karma";
     case STATE_SUBGHZ_LISTEN:     return "subghz_listen";
@@ -1729,6 +1984,8 @@ static bool is_listing_state(cmd_state_t s)
            s == STATE_LISTING_SNIFFER ||
            s == STATE_LISTING_HANDSHAKES ||
            s == STATE_LISTING_WARDRIVE ||
+           s == STATE_WARDRIVE_CONFIG ||
+           s == STATE_WARDRIVE_BLACKLIST ||
            s == STATE_LISTING_PROBES ||
            s == STATE_SUBGHZ_LIST ||
            s == STATE_SUBGHZ_IMPORT ||
@@ -2084,6 +2341,7 @@ bool cmd_do_stop(void)
     uart_bridge_send("stop");
 
     s_sniffer_collecting = false;
+    s_wd_status.active = false;
     s_probe_resume_state = STATE_IDLE;
     s_subghz_import_count = 0;
 
@@ -2185,6 +2443,170 @@ bool cmd_do_list_wardrive_logs(void)
     if (s_display_cb) s_display_cb("list_dir /sdcard/lab/wardrives", NULL);
     uart_bridge_send("list_dir /sdcard/lab/wardrives");
     return true;
+}
+
+/* ---------- Wardrive 2.0 config / control ---------- */
+
+bool cmd_do_wardrive_config_load(void)
+{
+    if (!set_state_if_idle(STATE_WARDRIVE_CONFIG)) return false;
+    memset(&s_wd_cfg_build, 0, sizeof(s_wd_cfg_build));
+    if (s_display_cb) s_display_cb("get_wardrive_config", NULL);
+    uart_bridge_send("get_wardrive_config");
+    return true;
+}
+
+void cmd_get_wardrive_cfg(wardrive_cfg_t *out)
+{
+    if (out) *out = s_wd_cfg;
+}
+
+bool cmd_do_wardrive_config_set(const wardrive_apply_t *a)
+{
+    if (!a) return false;
+    /* Config writes are only safe while idle (they hit NVS on the C5 and
+     * would otherwise interleave with an active scan/attack). */
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool idle = (s_state == STATE_IDLE);
+    xSemaphoreGive(s_mutex);
+    if (!idle) return false;
+
+    char cmd[192];
+    if (a->gps[0]) {
+        snprintf(cmd, sizeof(cmd), "gps_set %s", a->gps);
+        uart_bridge_send(cmd);
+    }
+    if (a->bands[0]) {
+        snprintf(cmd, sizeof(cmd), "set_wardrive_bands %s", a->bands);
+        uart_bridge_send(cmd);
+    }
+    if (a->channels[0]) {
+        if (!strcmp(a->channels, "custom") && a->custom[0])
+            snprintf(cmd, sizeof(cmd), "set_wardrive_channels custom %s", a->custom);
+        else
+            snprintf(cmd, sizeof(cmd), "set_wardrive_channels %s", a->channels);
+        uart_bridge_send(cmd);
+    }
+    if (a->wifi_delta >= 0) {
+        snprintf(cmd, sizeof(cmd), "set_wardrive_rssi_delta wifi %d", a->wifi_delta);
+        uart_bridge_send(cmd);
+    }
+    if (a->ble_delta >= 0) {
+        snprintf(cmd, sizeof(cmd), "set_wardrive_rssi_delta ble %d", a->ble_delta);
+        uart_bridge_send(cmd);
+    }
+    if (a->mem_cap >= 0) {
+        snprintf(cmd, sizeof(cmd), "set_wardrive_memcap %d", a->mem_cap);
+        uart_bridge_send(cmd);
+    }
+    if (a->cooldown >= 0) {
+        snprintf(cmd, sizeof(cmd), "set_wardrive_cooldown %d", a->cooldown);
+        uart_bridge_send(cmd);
+    }
+    if (a->antisurv[0]) {
+        snprintf(cmd, sizeof(cmd), "set_antisurv_sensitivity %s", a->antisurv);
+        uart_bridge_send(cmd);
+    }
+    /* Invalidate the cached snapshot so the next config load reflects NVS. */
+    s_wd_cfg.valid = false;
+    return true;
+}
+
+bool cmd_do_wardrive_start(bool trace)
+{
+    if (!set_state_if_idle(STATE_WARDRIVE_RUN)) return false;
+    memset(&s_wd_status, 0, sizeof(s_wd_status));
+    s_wd_status.active = true;
+    const char *c = trace ? "start_wardrive_promisc_trace" : "start_wardrive_promisc";
+    if (s_display_cb) s_display_cb(c, NULL);
+    uart_bridge_send(c);
+    broadcast_json("{\"type\":\"attack_started\",\"attack\":\"wardrive\"}");
+    return true;
+}
+
+bool cmd_do_antisurv_start(void)
+{
+    if (!set_state_if_idle(STATE_ANTISURV_RUN)) return false;
+    if (s_display_cb) s_display_cb("start_antisurveillance", NULL);
+    uart_bridge_send("start_antisurveillance");
+    broadcast_json("{\"type\":\"attack_started\",\"attack\":\"antisurv\"}");
+    return true;
+}
+
+bool cmd_do_deauth_detect_start(void)
+{
+    if (!set_state_if_idle(STATE_DEAUTH_DETECT)) return false;
+    dynvec_clear(&s_deauth_events);
+    if (s_display_cb) s_display_cb("deauth_detector", NULL);
+    uart_bridge_send("deauth_detector");
+    broadcast_json("{\"type\":\"attack_started\",\"attack\":\"deauth_detect\"}");
+    return true;
+}
+
+int cmd_get_deauth_events(deauth_event_t *out, int max)
+{
+    int n = (int)s_deauth_events.count < max ? (int)s_deauth_events.count : max;
+    if (n > 0 && out) memcpy(out, s_deauth_events.data, n * sizeof(deauth_event_t));
+    return n;
+}
+
+int cmd_get_deauth_events_count(void)
+{
+    return (int)s_deauth_events.count;
+}
+
+bool cmd_do_wardrive_blacklist_load(void)
+{
+    if (!set_state_if_idle(STATE_WARDRIVE_BLACKLIST)) return false;
+    dynvec_clear(&s_wd_blacklist);
+    s_wd_blacklist_valid = false;
+    if (s_display_cb) s_display_cb("wardrive_blacklist list", NULL);
+    uart_bridge_send("wardrive_blacklist list");
+    return true;
+}
+
+bool cmd_do_wardrive_blacklist_edit(const char *action, const char *mac)
+{
+    if (!action) return false;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool idle = (s_state == STATE_IDLE);
+    xSemaphoreGive(s_mutex);
+    if (!idle) return false;
+
+    char cmd[64];
+    if (!strcmp(action, "clear")) {
+        snprintf(cmd, sizeof(cmd), "wardrive_blacklist clear");
+    } else if ((!strcmp(action, "add") || !strcmp(action, "remove")) && mac && mac[0]) {
+        snprintf(cmd, sizeof(cmd), "wardrive_blacklist %s %s", action, mac);
+    } else {
+        return false;
+    }
+    if (s_display_cb) s_display_cb(cmd, NULL);
+    uart_bridge_send(cmd);
+    s_wd_blacklist_valid = false;   /* force reload on next GET */
+    return true;
+}
+
+bool cmd_get_wardrive_blacklist_valid(void)
+{
+    return s_wd_blacklist_valid;
+}
+
+void cmd_get_wardrive_status(wardrive_status_t *out)
+{
+    if (out) *out = s_wd_status;
+}
+
+int cmd_get_wardrive_blacklist(char (*out)[18], int max)
+{
+    int n = (int)s_wd_blacklist.count < max ? (int)s_wd_blacklist.count : max;
+    if (n > 0 && out) memcpy(out, s_wd_blacklist.data, n * sizeof(*out));
+    return n;
+}
+
+int cmd_get_wardrive_blacklist_count(void)
+{
+    return (int)s_wd_blacklist.count;
 }
 
 int cmd_get_handshake_count(void)

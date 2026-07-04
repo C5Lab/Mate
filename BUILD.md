@@ -137,6 +137,56 @@ classic ESP32 boards use `set-target esp32`.
 > **Always delete `sdkconfig` first** when switching boards. `idf.py clean` does
 > **not** remove it — it only cleans `build/`.
 
+### Web UI (SPIFFS assets)
+
+The web GUI is a Preact/Vite app in [`web/`](web/). `vite build` compiles it into
+[`spiffs/`](spiffs/) (`app.js`, `index.css`, `index.html`) — see
+[`web/vite.config.js`](web/vite.config.js) (`outDir: '../spiffs'`). That `spiffs/`
+directory is then packed into **`storage-<board>.bin`** and flashed at the SPIFFS
+offset, so the web UI ships inside the firmware.
+
+**`build_all.py` rebuilds the web automatically** (`build_web()`), once per run,
+before packaging any board — using a local `npm` if present, otherwise the
+`node:20-alpine` Docker image (so the host needs no Node). Skip it with
+`--no-web` when the web was already built (e.g. a separate CI step).
+
+```bash
+python tools/build_all.py --targets nanoc6            # rebuilds web + firmware
+python tools/build_all.py --targets nanoc6 --no-web   # embed existing spiffs/ as-is
+```
+
+Manual web build (e.g. Method B, or to preview the UI without flashing):
+
+```bash
+# Local Node
+npm --prefix web ci && npm --prefix web run build
+
+# Or via Docker (no local Node); shadow host node_modules to avoid OS-specific binaries
+docker run --rm -v "$PWD:/proj" -v /proj/web/node_modules -w /proj/web \
+  node:20-alpine sh -c "npm ci && npm run build"
+```
+
+> ⚠️ **The ESP-IDF container has no `npm`**, so a firmware-only build
+> (`idf.py build`, or `build_all.py --no-web`) embeds whatever `app.js` is already
+> in `spiffs/`. If you edit `web/src/**` and rebuild firmware *without* rebuilding
+> the web, you will flash a **stale UI**. `build_all.py` (without `--no-web`) does
+> this for you; a bare `idf.py build` does not.
+
+> Cache note: the server sends `Cache-Control: no-store` for HTML/JS/CSS, but a
+> phone that already loaded the old UI (especially a captive-portal WebView) may
+> still show it. After reflashing, hard-refresh or open `http://192.168.4.1` in a
+> private/incognito tab to bypass the cache.
+
+#### Build version stamp — **always bump on any `web/src/**` change**
+
+`WEB_VERSION` in [`web/src/app.jsx`](web/src/app.jsx) is rendered in a footer on
+every page (`JanOS Web v0001`). **Every time you change anything under
+`web/src/`, increment it by 1** (zero-padded 4 digits: `0001` → `0002` → …).
+This is the ground truth for "is the new UI actually on the device": if the
+footer shows an older number than the change you just flashed, you're looking at
+a **stale cached `app.js`**, not a code bug — clear the cache / use incognito.
+No exceptions: treat the bump as part of the web change itself.
+
 ---
 
 ## 4. Flashing
@@ -149,13 +199,20 @@ flash size/mode/freq and the four image offsets. It auto-installs `esptool` +
 
 ```bash
 cd binaries/sticks3
-python flash_board.py                 # auto-detect port
+python flash_board.py                 # auto-detect port; FULL ERASE + flash (default)
 python flash_board.py --port COM13
 python flash_board.py --baud 115200   # slower, more robust link
-python flash_board.py --erase         # full erase first
+python flash_board.py --no-erase      # skip erase (faster; same-board reflash only)
 python flash_board.py --monitor       # open serial monitor after flashing
 python flash_board.py --no-stub       # force the no-stub path (see below)
 ```
+
+> **The flasher erases the whole chip by default.** A plain `write-flash` already
+> replaces every partition, but switching boards/flash sizes can leave stale data
+> at old offsets, so a full erase is the reliable default. For rapid same-board
+> iteration use `--no-erase` to skip it. (If a *reflashed* web UI still looks old,
+> that's browser cache, not the flash — check the `v####` footer and use
+> incognito; see §3 Web UI.)
 
 **Automatic no-stub fallback:** some ESP32 modules (notably the **ESP32-PICO-D4**
 on Atom Lite) drop the esptool *stub* when the baud is bumped, failing with

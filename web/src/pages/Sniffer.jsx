@@ -222,22 +222,21 @@ export function Sniffer() {
 
   async function tickRefresh() {
     /* Alternate between the two listing commands so JanOS never sees them
-       overlap (each listing locks state until its prompt completes). */
+       overlap (each listing locks state until its prompt completes).
+       Pull the fresh results ourselves ~700ms after asking JanOS to print
+       them, rather than depending solely on the `sniffer_results_updated`
+       WS frame (which can be dropped). This is what makes the Observed
+       Networks list update live instead of only on remount. */
     const tick = refreshTickRef.current++;
     try {
       if (tick % 2 === 0) {
         await api.refreshSniffer();
+        setTimeout(loadSnifferResults, 700);
       } else {
         await api.refreshProbes();
+        setTimeout(loadProbes, 700);
       }
     } catch (e) { /* ignore */ }
-  }
-
-  async function refreshAll() {
-    try { await api.refreshSniffer(); } catch (e) { /* ignore */ }
-    setTimeout(async () => {
-      try { await api.refreshProbes(); } catch (e) { /* ignore */ }
-    }, 1000);
   }
 
   function startRefreshLoop() {
@@ -358,9 +357,6 @@ export function Sniffer() {
         <div class="btn-row">
           <button class="btn btn-success" onClick={start} disabled={running || isScanning}>
             {isScanning ? <><span class="spinner" /> Scanning...</> : 'Start Observer'}
-          </button>
-          <button class="btn btn-secondary" onClick={refreshAll} disabled={!running}>
-            Refresh
           </button>
           <button class="btn btn-danger" onClick={stop} disabled={!running && !isScanning}>
             Stop
