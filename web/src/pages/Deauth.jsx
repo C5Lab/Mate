@@ -4,6 +4,7 @@ import { api } from '../api';
 import { getState } from '../store';
 import { showToast } from '../components/Toast';
 import { wsAddListener } from '../ws';
+import { AttackMonitor } from '../components/AttackMonitor';
 
 export function Deauth() {
   const [running, setRunning] = useState(false);
@@ -65,6 +66,8 @@ export function Deauth() {
           )}
         </div>
       </section>
+
+      <AttackMonitor title="Serial" attackType="deauth" />
     </Layout>
   );
 }

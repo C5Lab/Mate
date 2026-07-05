@@ -196,6 +196,20 @@ bool cmd_do_list_handshake_count(void);
 /** Request wardrive log files from SD card. */
 bool cmd_do_list_wardrive_logs(void);
 
+/* ---------- Serial console (UART line ring buffer, polled over HTTP) ----------
+ * The WebSocket drops frames in some environments, so raw UART telemetry is
+ * also kept in a ring the web can poll — same robustness pattern as the
+ * sniffer/wardrive/deauth caches. */
+#define SERIAL_LINE_LEN 128
+typedef struct {
+    uint32_t seq;
+    char     text[SERIAL_LINE_LEN];
+} serial_line_t;
+
+/** Snapshot UART lines newer than `since` (oldest first, up to `max`).
+ *  Returns the current sequence number; writes the count copied to *n_out. */
+uint32_t cmd_serial_snapshot(uint32_t since, serial_line_t *out, int max, int *n_out);
+
 /* ---------- State queries ---------- */
 
 cmd_state_t cmd_get_state(void);

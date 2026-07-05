@@ -56,6 +56,7 @@ export const api = {
   wardriveBlacklistEdit: (action, mac) =>
                                  post('/api/wardrive/blacklist', { action, mac: mac || '' }),
   status:         ()          => get('/api/status'),
+  serialTail:     (since)     => get(`/api/serial?since=${since || 0}`),
   dashboard:      ()          => get('/api/dashboard'),
   subghzListen:   (freq, raw) => post('/api/subghz/listen', { freq, raw: !!raw }),
   subghzJam:      (freq)      => post('/api/subghz/jam', { freq }),

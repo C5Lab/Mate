@@ -1183,6 +1183,45 @@ static esp_err_t api_wardrive_blacklist_post(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* GET /api/serial?since=N -> raw UART lines newer than N (polled console).
+ * Reliable transport for the serial view; the WS can drop frames. */
+static esp_err_t api_serial_get(httpd_req_t *req)
+{
+    uint32_t since = 0;
+    char q[48];
+    if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK) {
+        char val[24];
+        if (httpd_query_key_value(q, "since", val, sizeof(val)) == ESP_OK) {
+            since = (uint32_t)strtoul(val, NULL, 10);
+        }
+    }
+
+    static serial_line_t lines[100];
+    int n = 0;
+    uint32_t seq = cmd_serial_snapshot(since, lines, (int)(sizeof(lines) / sizeof(lines[0])), &n);
+
+    chunked_writer_t cw;
+    cw_init(&cw, req);
+    cw_printf(&cw, "{\"ok\":true,\"seq\":%u,\"lines\":[", (unsigned)seq);
+    for (int i = 0; i < n; i++) {
+        /* Escape the line for JSON (quotes/backslashes). */
+        cw_printf(&cw, "%s\"", i > 0 ? "," : "");
+        const char *p = lines[i].text;
+        char esc[SERIAL_LINE_LEN * 2];
+        int j = 0;
+        for (int k = 0; p[k] && j < (int)sizeof(esc) - 2; k++) {
+            char c = p[k];
+            if (c == '"' || c == '\\') esc[j++] = '\\';
+            if ((unsigned char)c < 0x20) c = ' ';
+            esc[j++] = c;
+        }
+        esc[j] = '\0';
+        cw_printf(&cw, "%s\"", esc);
+    }
+    cw_printf(&cw, "]}");
+    return cw_finish(&cw);
+}
+
 /* ---------- Deauth detector handlers ---------- */
 
 /* POST /api/deauth/detect -> start the deauth detector */
@@ -1535,6 +1574,7 @@ esp_err_t web_server_start(void)
     REGISTER_URI("/api/wardrive/antisurv",  HTTP_POST, api_wardrive_antisurv_post);
     REGISTER_URI("/api/wardrive/blacklist", HTTP_GET,  api_wardrive_blacklist_get);
     REGISTER_URI("/api/wardrive/blacklist", HTTP_POST, api_wardrive_blacklist_post);
+    REGISTER_URI("/api/serial",             HTTP_GET,  api_serial_get);
     REGISTER_URI("/api/deauth/detect",      HTTP_POST, api_deauth_detect_post);
     REGISTER_URI("/api/deauth/detected",    HTTP_GET,  api_deauth_detected_get);
     REGISTER_URI("/api/sniffer/results", HTTP_GET,  api_sniffer_results_get);

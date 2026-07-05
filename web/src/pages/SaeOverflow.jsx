@@ -4,6 +4,7 @@ import { api } from '../api';
 import { getState } from '../store';
 import { showToast } from '../components/Toast';
 import { wsAddListener } from '../ws';
+import { AttackMonitor } from '../components/AttackMonitor';
 
 export function SaeOverflow() {
   const [running, setRunning] = useState(false);
@@ -74,6 +75,8 @@ export function SaeOverflow() {
           )}
         </div>
       </section>
+
+      <AttackMonitor title="Serial" attackType="sae" />
     </Layout>
   );
 }

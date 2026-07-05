@@ -1,5 +1,5 @@
 import Router from 'preact-router';
-import { useEffect, useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 import { api } from './api';
 import { wsAddListener, wsConnect } from './ws';
 import {
@@ -70,11 +70,12 @@ function SettingsIcon() {
 /* Bump this on every web change so the footer confirms which build is loaded.
  * If the footer version doesn't match the latest, the browser is serving a
  * cached/stale app.js (hard-refresh or open in a private tab). */
-export const WEB_VERSION = '0004';
+export const WEB_VERSION = '0011';
 
 export function App() {
   const [, forceUpdate] = useState(0);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const syncStatusRef = useRef(null);
 
   useEffect(() => {
     wsConnect();
@@ -139,7 +140,12 @@ export function App() {
 
     syncStatus();
     syncDashboard();
-    const pollStatusId = setInterval(syncStatus, 12000);
+    /* Poll fairly briskly: /api/status just reads the cached FSM state (no
+     * UART round-trip), and the WS attack_stopped event is unreliable here, so
+     * this poll is what clears the top "Current Operation" tile after an attack
+     * ends. 12s felt like a ~20s lag; 3s keeps it snappy. */
+    syncStatusRef.current = syncStatus;
+    const pollStatusId = setInterval(syncStatus, 3000);
 
     const removeWs = wsAddListener((msg) => {
       const st = getState();
@@ -279,7 +285,7 @@ export function App() {
       </header>
 
       <main class="page-shell">
-        <Router onChange={() => window.scrollTo(0, 0)}>
+        <Router onChange={() => { window.scrollTo(0, 0); syncStatusRef.current?.(); }}>
           <Home path="/" />
           <Scan path="/scan" />
           <Deauth path="/deauth" />

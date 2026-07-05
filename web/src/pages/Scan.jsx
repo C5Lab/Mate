@@ -148,7 +148,9 @@ export function Scan() {
   useEffect(() => {
     const removeWs = wsAddListener((msg) => {
       if (msg.type === 'attack_started') {
-        setAttackLive(true);
+        /* Lock is driven locally (set on Launch, cleared on Stop) — not by the
+         * WS, which is unreliable here and auto-completing attacks (handshake)
+         * would otherwise flip the button back to Launch mid-session. */
         pushLine(`${msg.attack || 'operation'} started`);
         if (msg.attack === 'arp') {
           /* Make sure we're polling -- covers the case where the monitor
@@ -160,7 +162,6 @@ export function Scan() {
       }
 
       if (msg.type === 'attack_stopped') {
-        setAttackLive(false);
         pushLine('operation stopped');
         if (monitorAttackRef.current === 'arp') {
           /* One last fetch so we don't miss hosts that landed between the
@@ -194,10 +195,8 @@ export function Scan() {
         pushLine('wifi disconnected');
       }
 
-      if (msg.type === 'uart_line' && msg.data) {
-        pushLine(msg.data);
-        pushMonitorLine(msg.data);
-      }
+      /* Raw serial no longer comes from the WS (it drops frames here) — the
+       * serial poll below feeds pushLine/pushMonitorLine reliably. */
 
       if (msg.type === 'nmap_results') {
         /* Instant update from the device-side incremental broadcast. The
@@ -228,7 +227,23 @@ export function Scan() {
       }
     });
 
+    /* Reliable serial + attack-lock via HTTP polling (the WS drops frames in
+     * some environments, which left the Serial panel blank and the attack
+     * lock flapping). */
+    let serialSeq = 0;
+    const serialTimer = setInterval(async () => {
+      try {
+        const res = await api.serialTail(serialSeq);
+        if (!res?.ok) return;
+        serialSeq = res.seq || 0;
+        if (Array.isArray(res.lines)) {
+          for (const ln of res.lines) { pushLine(ln); pushMonitorLine(ln); }
+        }
+      } catch (e) { /* ignore */ }
+    }, 1000);
+
     return () => {
+      clearInterval(serialTimer);
       stopPolling();
       stopArpPolling();
       stopNmapPolling();
@@ -239,7 +254,7 @@ export function Scan() {
   function pushLine(text) {
     const trimmed = String(text || '').trim();
     if (!trimmed) return;
-    setSerialLines((prev) => [...prev, trimmed].slice(-3));
+    setSerialLines((prev) => [...prev, trimmed].slice(-8));
   }
 
   function openMonitor(nextAttack, title) {
@@ -782,6 +797,7 @@ export function Scan() {
 
   async function stopAll() {
     await api.stop();
+    setAttackLive(false);
     setState({ status: 'idle' });
     showToast('Stop sent', 'warning');
   }
@@ -806,8 +822,8 @@ export function Scan() {
       <NetworkList
         networks={st.networks}
         selected={st.selected}
-        onToggle={toggleNetwork}
-        onToggleAll={setAllNetworks}
+        onToggle={attackLive ? () => {} : toggleNetwork}
+        onToggleAll={attackLive ? () => {} : setAllNetworks}
       />
 
       <section class="glass-card card-body reveal">
@@ -820,21 +836,34 @@ export function Scan() {
               key={opt.id}
               class={`attack-chip ${attack === opt.id ? 'active' : ''} ${opt.available ? '' : 'coming-soon'}`}
               onClick={() => setAttack(opt.id)}
+              disabled={attackLive}
             >
               {opt.label}
               {!opt.available ? <span class="chip-mini">Soon</span> : null}
             </button>
           ))}
         </div>
-        {attack === 'nmap' ? (
+        {attack === 'nmap' && !attackLive ? (
           <div class="alert info">
             After launch you'll pick a profile (quick / medium / heavy) and a host
             (or ALL = full subnet) once host discovery finishes.
           </div>
         ) : null}
-        <button class="btn btn-primary" onClick={launchAttack} disabled={!st.selected.size || scanning}>
-          Launch {selectedAttack?.label}
-        </button>
+        {attackLive ? (
+          <>
+            <div class="alert info">
+              Attack running on {st.selected.size} selected network(s). Selection is
+              locked — press Stop to change targets.
+            </div>
+            <button class="btn btn-danger" onClick={stopAll}>
+              Stop {selectedAttack?.label}
+            </button>
+          </>
+        ) : (
+          <button class="btn btn-primary" onClick={launchAttack} disabled={!st.selected.size || scanning}>
+            Launch {selectedAttack?.label}
+          </button>
+        )}
       </section>
 
       <section class="glass-card card-body reveal">

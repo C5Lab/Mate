@@ -79,6 +79,39 @@ static dynvec_t             s_wd_blacklist;   /* char[18] MAC strings */
 static bool                 s_wd_blacklist_valid = false; /* list fetched at least once */
 static wardrive_status_t    s_wd_status;      /* live status, polled over HTTP */
 static dynvec_t             s_deauth_events;  /* deauth_event_t, polled over HTTP */
+
+/* Serial console ring buffer (raw UART lines), polled over HTTP. */
+#define SERIAL_RING 100
+static serial_line_t        s_serial_ring[SERIAL_RING];
+static uint32_t             s_serial_seq = 0;
+
+static void serial_append(const char *line)
+{
+    if (!line || !line[0]) return;
+    uint32_t seq = ++s_serial_seq;
+    int idx = (int)(seq % SERIAL_RING);
+    strncpy(s_serial_ring[idx].text, line, SERIAL_LINE_LEN - 1);
+    s_serial_ring[idx].text[SERIAL_LINE_LEN - 1] = '\0';
+    s_serial_ring[idx].seq = seq;   /* written last so a poller sees a whole line */
+}
+
+uint32_t cmd_serial_snapshot(uint32_t since, serial_line_t *out, int max, int *n_out)
+{
+    uint32_t cur = s_serial_seq;
+    int n = 0;
+    uint32_t start = since + 1;
+    /* Clamp to what the ring still holds. */
+    if (cur > SERIAL_RING && start < cur - SERIAL_RING + 1) start = cur - SERIAL_RING + 1;
+    for (uint32_t s = start; s <= cur && n < max; s++) {
+        int idx = (int)(s % SERIAL_RING);
+        if (s_serial_ring[idx].seq == s) {
+            out[n] = s_serial_ring[idx];
+            n++;
+        }
+    }
+    if (n_out) *n_out = n;
+    return cur;
+}
 static dynvec_t             s_probes;         /* parsed_probe_t */
 static dynvec_t             s_probes_build;   /* parsed_probe_t */
 static cmd_state_t          s_probe_resume_state = STATE_IDLE;
@@ -1044,6 +1077,10 @@ static void on_uart_line(const char *line, void *ctx)
 {
     (void)ctx;
     s_last_uart_ms = esp_timer_get_time() / 1000;
+
+    /* Capture every raw line into the serial ring so the web can poll it
+     * (reliable even when the WebSocket drops frames). */
+    serial_append(line);
 
     /* Sub-GHz event lines are state-independent; they can arrive at any time
      * while listening (RSSI/RX/RAW) or at any moment a TX completes. RSSI
