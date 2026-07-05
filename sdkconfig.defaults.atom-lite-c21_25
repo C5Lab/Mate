@@ -1,0 +1,6 @@
+# M5Stack Atom Lite C21_25 specific (ESP32-PICO-D4: 4MB flash, no display)
+# Based on Atom Lite, but with external UART pins: TX=G21, RX=G25
+CONFIG_JANOS_BOARD_ATOM_LITE_C21_25=y
+CONFIG_IDF_TARGET="esp32"
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_4mb.csv"

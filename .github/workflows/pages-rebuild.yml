@@ -1,0 +1,102 @@
+name: Pages (rebuild flasher)
+
+# Redeploy the web flasher WITHOUT rebuilding firmware. Use this after editing
+# docs/** (the flasher HTML) or the manifest generator: it pulls the per-board
+# ZIPs from an existing GitHub Release, unpacks the bins, regenerates the
+# manifests + boards.json, and redeploys GitHub Pages.
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to source the bins from (e.g. v0.1.0). Empty = latest release."
+        required: false
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - 'tools/gen_web_flasher.py'
+      - 'tools/build_all.py'
+      - '.github/workflows/pages-rebuild.yml'
+
+# GitHub Pages allows one deployment at a time; don't stack redeploys.
+concurrency:
+  group: github-pages
+  cancel-in-progress: true
+
+jobs:
+  pages:
+    name: Rebuild + deploy Pages
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve release tag
+        id: meta
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          TAG="${INPUT_TAG:-}"
+          if [ -z "$TAG" ]; then
+            TAG="$(gh api "/repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name)"
+          fi
+          if [ -z "$TAG" ]; then
+            echo "Could not resolve a release tag — publish a release first." >&2
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Using tag: $TAG"
+
+      - name: Download per-board ZIPs from the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          rm -rf _zips docs/firmware
+          mkdir -p _zips docs/firmware
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" --dir _zips --pattern 'mate-*.zip'
+
+          # Each mate-<board>.zip holds that board's bins flat at its root.
+          for z in _zips/mate-*.zip; do
+            [ -f "$z" ] || continue
+            base="$(basename "$z" .zip)"   # mate-<board>
+            board="${base#mate-}"
+            mkdir -p "docs/firmware/${board}"
+            unzip -o -j "$z" '*.bin' -d "docs/firmware/${board}"
+          done
+          ls -R docs/firmware
+
+      - name: Generate manifests + boards.json
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          version="${TAG#v}"
+          python3 tools/gen_web_flasher.py \
+            --firmware-dir docs/firmware \
+            --out-dir docs \
+            --version "$version" \
+            --build "$TAG"
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v4
+        with:
+          enablement: true
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
+
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v4

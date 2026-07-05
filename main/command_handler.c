@@ -49,6 +49,13 @@ static void broadcast_json(const char *fmt, ...)
  * expensive (consuming several KB of scarce internal DRAM at boot). */
 static scan_results_t       s_scan;
 static int                  s_scan_expected = -1;
+/* Observer two-phase launch: when the web asks Mate to "start the observer",
+ * Mate runs scan_networks itself and then auto-fires start_sniffer_noscan once
+ * the scan completes. Keeping this handoff in the firmware (not the browser)
+ * means the observer still launches if the phone navigates away / disconnects
+ * between the scan finishing and the sniffer start. Mirrors Tab5's
+ * observer_start_task (which runs the same scan->sniffer sequence device-side). */
+static volatile bool        s_observer_pending = false;
 static dynvec_t             s_portals;        /* parsed_portal_file_t */
 static dynvec_t             s_passwords;      /* parsed_password_t */
 /* True once we've seen JanOS echo back our `show_pass evil` command. Until
@@ -145,6 +152,19 @@ static dynvec_t             s_nmap_hosts;     /* nmap_host_t */
 static nmap_state_t         s_nmap_state = {0};
 static int                  s_nmap_current_idx = -1; /* index into s_nmap_hosts */
 static bool                 s_nmap_active = false;   /* set by cmd_do_nmap, cleared on completion */
+
+/* Mesh Recon (Zigbee/802.15.4) caches. The Monster streams key=value
+ * "[ZIG] status|pan|node|edge" lines in response to zig_recon_* poll commands;
+ * we upsert them (keyed by pan id / addr / from-to) so the graph is stable
+ * across poll cycles and survives WS/web reconnects, exactly like the ARP and
+ * nmap caches. State-independent parsing (the [ZIG] prefix is unambiguous). */
+#define ZIG_MAX_PANS   32
+#define ZIG_MAX_NODES  128
+#define ZIG_MAX_EDGES  128
+static dynvec_t             s_zig_pans;       /* zig_pan_t */
+static dynvec_t             s_zig_nodes;      /* zig_node_t */
+static dynvec_t             s_zig_edges;      /* zig_edge_t */
+static zig_status_t         s_zig_status = {0};
 
 static bool is_prompt_line(const char *line)
 {
@@ -489,6 +509,193 @@ static void handle_arp_discovery_line(const char *line)
             if (!dynvec_push(&s_arp_hosts, &host)) log_drop("arp_hosts");
             xSemaphoreGive(s_mutex);
         }
+    }
+}
+
+/* ---------- Mesh Recon (Zigbee) line parsing ---------- */
+
+/* Extract "key=value" (value runs to the next space). false if key absent. */
+static bool zig_get_value(const char *line, const char *key, char *out, size_t out_len)
+{
+    if (!line || !key || !out || out_len == 0) return false;
+    char pattern[32];
+    snprintf(pattern, sizeof(pattern), "%s=", key);
+    const char *p = strstr(line, pattern);
+    if (!p) return false;
+    p += strlen(pattern);
+    size_t i = 0;
+    while (p[i] && p[i] != ' ' && p[i] != '\r' && p[i] != '\n' && i < out_len - 1) {
+        out[i] = p[i];
+        i++;
+    }
+    out[i] = '\0';
+    return i > 0;
+}
+
+static int zig_get_int(const char *line, const char *key, int fallback)
+{
+    char value[24];
+    if (!zig_get_value(line, key, value, sizeof(value))) return fallback;
+    char *end = NULL;
+    long v = strtol(value, &end, 0);   /* base 0 => "0x.." hex and decimal */
+    if (end == value) return fallback;
+    return (int)v;
+}
+
+static uint32_t zig_get_u32(const char *line, const char *key, uint32_t fallback)
+{
+    char value[24];
+    if (!zig_get_value(line, key, value, sizeof(value))) return fallback;
+    return (uint32_t)strtoul(value, NULL, 0);
+}
+
+/* Channel bitmask (bits 11..26) -> "11,15,20". */
+static void zig_format_channels(uint32_t mask, char *out, size_t out_len)
+{
+    if (!out || out_len == 0) return;
+    out[0] = '\0';
+    for (int ch = 11; ch <= 26; ch++) {
+        if ((mask & (1UL << ch)) == 0) continue;
+        size_t used = strlen(out);
+        if (used >= out_len - 1) break;
+        snprintf(out + used, out_len - used, "%s%d", used > 0 ? "," : "", ch);
+    }
+    if (out[0] == '\0') snprintf(out, out_len, "--");
+}
+
+/* All three store helpers UPSERT so the graph is stable across polls; callers
+ * hold s_mutex. Broadcast PANs are hidden (Tab5 parity). */
+static void zig_store_pan_locked(const char *line)
+{
+    char kind[24] = {0};
+    zig_get_value(line, "kind", kind, sizeof(kind));
+    if (strcmp(kind, "broadcast") == 0) return;
+
+    char id[16] = {0};
+    if (!zig_get_value(line, "id", id, sizeof(id))) return;
+
+    zig_pan_t *pan = NULL;
+    for (size_t i = 0; i < s_zig_pans.count; i++) {
+        zig_pan_t *p = (zig_pan_t *)dynvec_at(&s_zig_pans, i);
+        if (p && strcmp(p->id, id) == 0) { pan = p; break; }
+    }
+    if (!pan) {
+        if ((int)s_zig_pans.count >= ZIG_MAX_PANS) return;
+        zig_pan_t fresh = {0};
+        pan = (zig_pan_t *)dynvec_push(&s_zig_pans, &fresh);
+        if (!pan) { log_drop("zig_pans"); return; }
+        strncpy(pan->id, id, sizeof(pan->id) - 1);
+    }
+    zig_get_value(line, "proto", pan->proto, sizeof(pan->proto));
+    zig_get_value(line, "confidence", pan->confidence, sizeof(pan->confidence));
+    pan->nodes   = zig_get_int(line, "nodes", pan->nodes);
+    pan->packets = zig_get_int(line, "packets", pan->packets);
+    pan->rssi    = zig_get_int(line, "best_rssi", zig_get_int(line, "last_rssi", pan->rssi));
+    pan->age_ms  = zig_get_int(line, "age_ms", -1);
+    zig_format_channels(zig_get_u32(line, "channels", 0), pan->channels, sizeof(pan->channels));
+}
+
+static void zig_store_node_locked(const char *line)
+{
+    char pan[16] = {0};
+    if (!zig_get_value(line, "pan", pan, sizeof(pan))) return;
+
+    /* Build a display addr: short "0x1234", or "EXT ...ABCD" for ext-only. */
+    char addr[24] = {0};
+    char addr_type[16] = {0}, short_addr[24] = {0}, ext_addr[32] = {0};
+    zig_get_value(line, "addr_type", addr_type, sizeof(addr_type));
+    zig_get_value(line, "short", short_addr, sizeof(short_addr));
+    zig_get_value(line, "ext", ext_addr, sizeof(ext_addr));
+    if (strcmp(addr_type, "ext") == 0 || strcmp(short_addr, "na") == 0) {
+        size_t el = strlen(ext_addr);
+        if (strncmp(ext_addr, "0x", 2) == 0 && el > 6)
+            snprintf(addr, sizeof(addr), "EXT ...%s", ext_addr + el - 4);
+        else
+            snprintf(addr, sizeof(addr), "EXT");
+    } else {
+        snprintf(addr, sizeof(addr), "%s", short_addr[0] ? short_addr : "0x????");
+    }
+
+    zig_node_t *node = NULL;
+    for (size_t i = 0; i < s_zig_nodes.count; i++) {
+        zig_node_t *n = (zig_node_t *)dynvec_at(&s_zig_nodes, i);
+        if (n && strcmp(n->pan, pan) == 0 && strcmp(n->addr, addr) == 0) { node = n; break; }
+    }
+    if (!node) {
+        if ((int)s_zig_nodes.count >= ZIG_MAX_NODES) return;
+        zig_node_t fresh = {0};
+        node = (zig_node_t *)dynvec_push(&s_zig_nodes, &fresh);
+        if (!node) { log_drop("zig_nodes"); return; }
+        strncpy(node->pan, pan, sizeof(node->pan) - 1);
+        strncpy(node->addr, addr, sizeof(node->addr) - 1);
+    }
+    zig_get_value(line, "role", node->role, sizeof(node->role));
+    zig_get_value(line, "vendor", node->vendor, sizeof(node->vendor));
+    zig_get_value(line, "device_hint", node->device_hint, sizeof(node->device_hint));
+    node->packets      = zig_get_int(line, "packets", node->packets);
+    node->rssi         = zig_get_int(line, "last_rssi", zig_get_int(line, "best_rssi", node->rssi));
+    node->lqi          = zig_get_int(line, "lqi", -1);
+    node->last_channel = zig_get_int(line, "last_channel", node->last_channel);
+    node->age_ms       = zig_get_int(line, "age_ms", -1);
+}
+
+static void zig_store_edge_locked(const char *line)
+{
+    char pan[16] = {0}, from[24] = {0}, to[24] = {0};
+    if (!zig_get_value(line, "pan", pan, sizeof(pan))) return;
+    if (!zig_get_value(line, "from", from, sizeof(from))) return;
+    if (!zig_get_value(line, "to", to, sizeof(to))) return;
+
+    zig_edge_t *edge = NULL;
+    for (size_t i = 0; i < s_zig_edges.count; i++) {
+        zig_edge_t *e = (zig_edge_t *)dynvec_at(&s_zig_edges, i);
+        if (e && strcmp(e->pan, pan) == 0 && strcmp(e->from, from) == 0 && strcmp(e->to, to) == 0) {
+            edge = e; break;
+        }
+    }
+    if (!edge) {
+        if ((int)s_zig_edges.count >= ZIG_MAX_EDGES) return;
+        zig_edge_t fresh = {0};
+        edge = (zig_edge_t *)dynvec_push(&s_zig_edges, &fresh);
+        if (!edge) { log_drop("zig_edges"); return; }
+        strncpy(edge->pan, pan, sizeof(edge->pan) - 1);
+        strncpy(edge->from, from, sizeof(edge->from) - 1);
+        strncpy(edge->to, to, sizeof(edge->to) - 1);
+    }
+    zig_get_value(line, "kind", edge->kind, sizeof(edge->kind));
+    edge->packets = zig_get_int(line, "packets", edge->packets);
+    edge->rssi    = zig_get_int(line, "last_rssi", zig_get_int(line, "rssi", edge->rssi));
+    edge->age_ms  = zig_get_int(line, "age_ms", -1);
+}
+
+/* Parse a single "[ZIG] ..." line into the mesh caches. State-independent:
+ * the [ZIG] prefix is unambiguous, so it works no matter which zig_recon_*
+ * poll is outstanding. "[ZIG] END" and unknown subtypes are ignored. */
+static void handle_zig_line(const char *line)
+{
+    if (!line || strncmp(line, "[ZIG] ", 6) != 0) return;
+
+    if (strncmp(line, "[ZIG] status ", 13) == 0) {
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        s_zig_status.active  = zig_get_int(line, "active", 0) != 0;
+        s_zig_status.channel = zig_get_int(line, "channel", 0);
+        s_zig_status.packets = zig_get_int(line, "packets", 0);
+        s_zig_status.pans    = zig_get_int(line, "pans", 0);
+        s_zig_status.dropped = zig_get_int(line, "dropped", 0);
+        s_zig_status.at_ms   = (uint32_t)(esp_timer_get_time() / 1000);
+        xSemaphoreGive(s_mutex);
+    } else if (strncmp(line, "[ZIG] pan ", 10) == 0) {
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        zig_store_pan_locked(line);
+        xSemaphoreGive(s_mutex);
+    } else if (strncmp(line, "[ZIG] node ", 11) == 0) {
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        zig_store_node_locked(line);
+        xSemaphoreGive(s_mutex);
+    } else if (strncmp(line, "[ZIG] edge ", 11) == 0) {
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        zig_store_edge_locked(line);
+        xSemaphoreGive(s_mutex);
     }
 }
 
@@ -1100,6 +1307,10 @@ static void on_uart_line(const char *line, void *ctx)
      * `Host:`/`port/tcp open` rows in a state-independent helper. */
     handle_nmap_line(line);
 
+    /* Mesh Recon: "[ZIG] pan|node|edge|status" lines arrive in response to the
+     * zig_recon_* polls; parse them regardless of FSM state. */
+    handle_zig_line(line);
+
     /* Update display if available */
     if (s_display_cb) {
         s_display_cb(NULL, line);
@@ -1203,6 +1414,16 @@ static void on_uart_line(const char *line, void *ctx)
         xSemaphoreGive(s_mutex);
         broadcast_json("{\"type\":\"scan_complete\",\"count\":%d}", s_scan.count);
         ESP_LOGI(TAG, "Scan complete: %d networks", s_scan.count);
+        /* Observer phase 2: this scan was launched as the first half of an
+         * observer start, so fire the sniffer now that JanOS has scan results
+         * to reuse. We're past the s_mutex give above, so cmd_do_sniffer_noscan
+         * (which re-takes it) is safe here. Independent of the web client, so
+         * the observer launches even if the phone left mid-scan. */
+        if (s_observer_pending) {
+            s_observer_pending = false;
+            ESP_LOGI(TAG, "Observer: scan done, auto-starting sniffer");
+            cmd_do_sniffer_noscan();
+        }
         break;
     }
 
@@ -1914,6 +2135,9 @@ void cmd_handler_init(void)
     dynvec_init(&s_subghz_build,   sizeof(subghz_signal_t),      8);
     dynvec_init(&s_arp_hosts,      sizeof(arp_host_t),           8);
     dynvec_init(&s_nmap_hosts,     sizeof(nmap_host_t),          8);
+    dynvec_init(&s_zig_pans,       sizeof(zig_pan_t),            8);
+    dynvec_init(&s_zig_nodes,      sizeof(zig_node_t),           8);
+    dynvec_init(&s_zig_edges,      sizeof(zig_edge_t),           8);
     reset_sniffer_build();
 
     uart_bridge_register_line_cb(on_uart_line, NULL);
@@ -1974,6 +2198,7 @@ const char *cmd_state_name(cmd_state_t s)
     case STATE_SUBGHZ_LIST:       return "subghz_list";
     case STATE_SUBGHZ_IMPORT:     return "subghz_import";
     case STATE_SUBGHZ_EXPORT:     return "subghz_export";
+    case STATE_ZIG_RECON:         return "zig_recon";
     }
     return "unknown";
 }
@@ -2088,6 +2313,7 @@ static bool set_state_if_idle(cmd_state_t new_state)
 bool cmd_do_scan(void)
 {
     if (!set_state_if_idle(STATE_SCANNING)) return false;
+    s_observer_pending = false;   /* a bare scan must not auto-start the sniffer */
     scan_clear();
     s_scan_expected = -1;
     if (s_display_cb) s_display_cb("scan_networks", NULL);
@@ -2188,6 +2414,64 @@ bool cmd_do_sniffer_noscan(void)
     if (s_display_cb) s_display_cb("start_sniffer_noscan", NULL);
     uart_bridge_send("start_sniffer_noscan");
     broadcast_json("{\"type\":\"attack_started\",\"attack\":\"sniffer\"}");
+    return true;
+}
+
+/* Observer launch (phase 1). Runs a scan; the scan_done handler in
+ * on_uart_line fires cmd_do_sniffer_noscan once results are in. cmd_do_scan
+ * clears s_observer_pending, so we arm it only after the scan has started. */
+bool cmd_do_observer_start(void)
+{
+    if (!cmd_do_scan()) return false;
+    s_observer_pending = true;
+    return true;
+}
+
+/* ---------- Mesh Recon (Zigbee) commands ---------- */
+
+static void zig_reset_locked(void)
+{
+    dynvec_clear(&s_zig_pans);
+    dynvec_clear(&s_zig_nodes);
+    dynvec_clear(&s_zig_edges);
+    memset(&s_zig_status, 0, sizeof(s_zig_status));
+}
+
+bool cmd_do_zig_recon_start(void)
+{
+    if (!set_state_if_idle(STATE_ZIG_RECON)) return false;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    zig_reset_locked();
+    xSemaphoreGive(s_mutex);
+    if (s_display_cb) s_display_cb("start_zig_recon", NULL);
+    uart_bridge_send("start_zig_recon all 250");
+    broadcast_json("{\"type\":\"attack_started\",\"attack\":\"zig_recon\"}");
+    return true;
+}
+
+bool cmd_do_zig_recon_refresh(void)
+{
+    if (cmd_get_state() != STATE_ZIG_RECON) return false;
+    /* One query per call, rotating, so we never blast three commands into the
+     * Monster's CLI at once (JanOS processes input a line at a time). The web
+     * polls this ~1.3s, so status / PANs / nodes each refresh every ~4s —
+     * matching Tab5's pacing. Responses ([ZIG] lines) are parsed async by
+     * handle_zig_line into the caches the /api/zigbee/results endpoint reads. */
+    static int rot = 0;
+    switch (rot++ % 3) {
+        case 0:  uart_bridge_send("zig_recon_status");    break;
+        case 1:  uart_bridge_send("zig_recon_list all");  break;
+        default: uart_bridge_send("zig_recon_nodes all"); break;
+    }
+    return true;
+}
+
+bool cmd_do_zig_recon_clear(void)
+{
+    uart_bridge_send("zig_recon_clear");
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    zig_reset_locked();
+    xSemaphoreGive(s_mutex);
     return true;
 }
 
@@ -2379,6 +2663,7 @@ bool cmd_do_stop(void)
 
     s_sniffer_collecting = false;
     s_wd_status.active = false;
+    s_observer_pending = false;   /* cancel any pending observer scan->sniffer handoff */
     s_probe_resume_state = STATE_IDLE;
     s_subghz_import_count = 0;
 
@@ -2745,6 +3030,52 @@ void cmd_get_nmap_state(nmap_state_t *out)
     if (!out) return;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     *out = s_nmap_state;
+    xSemaphoreGive(s_mutex);
+}
+
+/* ---------- Mesh Recon (Zigbee) getters ---------- */
+
+int cmd_get_zig_pans(zig_pan_t *out, int max)
+{
+    if (!out || max <= 0) return 0;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    int n = (int)s_zig_pans.count < max ? (int)s_zig_pans.count : max;
+    if (n > 0) memcpy(out, s_zig_pans.data, (size_t)n * sizeof(zig_pan_t));
+    xSemaphoreGive(s_mutex);
+    return n;
+}
+
+int cmd_get_zig_pan_count(void) { return (int)s_zig_pans.count; }
+
+int cmd_get_zig_nodes(zig_node_t *out, int max)
+{
+    if (!out || max <= 0) return 0;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    int n = (int)s_zig_nodes.count < max ? (int)s_zig_nodes.count : max;
+    if (n > 0) memcpy(out, s_zig_nodes.data, (size_t)n * sizeof(zig_node_t));
+    xSemaphoreGive(s_mutex);
+    return n;
+}
+
+int cmd_get_zig_node_count(void) { return (int)s_zig_nodes.count; }
+
+int cmd_get_zig_edges(zig_edge_t *out, int max)
+{
+    if (!out || max <= 0) return 0;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    int n = (int)s_zig_edges.count < max ? (int)s_zig_edges.count : max;
+    if (n > 0) memcpy(out, s_zig_edges.data, (size_t)n * sizeof(zig_edge_t));
+    xSemaphoreGive(s_mutex);
+    return n;
+}
+
+int cmd_get_zig_edge_count(void) { return (int)s_zig_edges.count; }
+
+void cmd_get_zig_status(zig_status_t *out)
+{
+    if (!out) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    *out = s_zig_status;
     xSemaphoreGive(s_mutex);
 }
 

@@ -27,6 +27,9 @@ export const api = {
   handshake:      ()          => post('/api/attack/handshake'),
   sniffer:        ()          => post('/api/attack/sniffer'),
   snifferNoscan:  ()          => post('/api/attack/sniffer_noscan'),
+  /* Firmware-orchestrated observer: Mate scans then auto-starts the sniffer,
+   * so the launch survives the web disconnecting mid-scan (see cmd_do_observer_start). */
+  observer:       ()          => post('/api/attack/observer'),
   karma:          (index)     => post('/api/attack/karma', { index }),
   mitm:           ()          => post('/api/attack/mitm'),
   nmap:           (level, ip) => post('/api/attack/nmap', { level, ip }),
@@ -55,6 +58,12 @@ export const api = {
   wardriveBlacklistGet: ()    => get('/api/wardrive/blacklist'),
   wardriveBlacklistEdit: (action, mac) =>
                                  post('/api/wardrive/blacklist', { action, mac: mac || '' }),
+  /* Mesh Recon (Zigbee/802.15.4). start begins the on-device capture; refresh
+   * pulls one rotating snapshot query; results reads the parsed cache. */
+  zigbeeStart:    ()          => post('/api/zigbee/start'),
+  zigbeeRefresh:  ()          => post('/api/zigbee/refresh'),
+  zigbeeResults:  ()          => get('/api/zigbee/results'),
+  zigbeeClear:    ()          => post('/api/zigbee/clear'),
   status:         ()          => get('/api/status'),
   serialTail:     (since)     => get(`/api/serial?since=${since || 0}`),
   dashboard:      ()          => get('/api/dashboard'),

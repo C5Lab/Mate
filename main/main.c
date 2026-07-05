@@ -17,6 +17,28 @@ static const char *TAG = "janos_wc";
 
 #define JANOS_WC_VERSION "0.1.0"
 
+/* Heartbeat: how often Mate pings the Monster while idle to keep the link
+ * indicator (cmd_is_c5_connected, 15s window) fresh. The boot ping alone can't
+ * do this — an idle Monster sends nothing, so without a periodic ping the link
+ * would (falsely) read "No Link" a few seconds after any activity stops. */
+#define JANOS_HEARTBEAT_PERIOD_MS 5000
+
+/* Periodic ping, IDLE ONLY. We deliberately skip the ping while the FSM is
+ * busy so we never inject "ping" into a command/attack stream the Monster is
+ * mid-parsing; during those states the operation's own UART output keeps the
+ * link timer fresh. When the Monster is genuinely gone, pongs stop arriving and
+ * cmd_is_c5_connected() flips to false on its own. */
+static void heartbeat_task(void *arg)
+{
+    (void)arg;
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(JANOS_HEARTBEAT_PERIOD_MS));
+        if (cmd_get_state() == STATE_IDLE) {
+            uart_bridge_send("ping");
+        }
+    }
+}
+
 void app_main(void)
 {
     ESP_LOGI(TAG, "=== JanOS Web Client v%s ===", JANOS_WC_VERSION);
@@ -73,9 +95,14 @@ void app_main(void)
     /* HTTP server + WebSocket + SPIFFS */
     ESP_ERROR_CHECK(web_server_start());
 
-    /* Send ping to Monster to verify connection */
+    /* Send ping to Monster to verify connection (fast one-shot check) */
     vTaskDelay(pdMS_TO_TICKS(500));
     uart_bridge_send("ping");
+
+    /* Keep the link indicator honest with a periodic idle ping. Small stack:
+     * it only does a state check + a short UART write. Priority below the
+     * uart_rx task (10) so RX is never starved by the heartbeat. */
+    xTaskCreate(heartbeat_task, "heartbeat", 2560, NULL, 5, NULL);
 
     ESP_LOGI(TAG, "=== Ready. Connect to '%s' (pw: %s) ===",
              wifi_ap_get_ssid(), CONFIG_JANOS_AP_PASSWORD);

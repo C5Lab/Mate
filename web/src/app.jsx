@@ -7,6 +7,7 @@ import {
   clearArpHosts,
   getState,
   setArpHosts,
+  setAttackRunning,
   setQuickActions,
   setState,
   subscribe,
@@ -31,6 +32,7 @@ import { GlobalAttacks } from './pages/GlobalAttacks';
 import { SDData } from './pages/SDData';
 import { Bluetooth } from './pages/Bluetooth';
 import { Wardrive } from './pages/Wardrive';
+import { MeshRecon } from './pages/MeshRecon';
 import { Karma } from './pages/Karma';
 import { DeauthDetector } from './pages/DeauthDetector';
 import { Portal } from './pages/Portal';
@@ -46,6 +48,21 @@ function normalizeStatus(value) {
   if (value === 'scan') return 'scanning';
   return value;
 }
+
+/* Device FSM states (mirrors the firmware `cmd_state_name` strings) that count
+ * as a foreground attack for the global Scan lock. Scanning / listing /
+ * wardrive / antisurv / subghz are deliberately excluded — they have their own
+ * UI and run flags. */
+const ATTACK_RUNNING_STATES = new Set([
+  'deauth', 'eviltwin', 'rogueap', 'portal', 'sae', 'handshake',
+  'sniffer', 'blackout', 'mitm', 'nmap', 'arp', 'arp_ban', 'karma',
+]);
+
+/* Don't let the poll clear a just-armed lock during the sliver between an
+ * optimistic launch and the device reporting the new state. A wrongly-cleared
+ * lock also self-heals on the next poll (the device is really busy), so this is
+ * only about avoiding a cosmetic unlock→relock flicker right after Launch. */
+const ATTACK_LOCK_GRACE_MS = 5000;
 
 function WifiMetricIcon({ connected }) {
   return (
@@ -70,7 +87,7 @@ function SettingsIcon() {
 /* Bump this on every web change so the footer confirms which build is loaded.
  * If the footer version doesn't match the latest, the browser is serving a
  * cached/stale app.js (hard-refresh or open in a private tab). */
-export const WEB_VERSION = '0011';
+export const WEB_VERSION = '0014';
 
 export function App() {
   const [, forceUpdate] = useState(0);
@@ -109,6 +126,23 @@ export function App() {
           else wardrivePatch({ running: false, gps: 'idle' });
         }
         if (s.antisurv.running !== asRun) antisurvPatch({ running: asRun });
+
+        /* Reconcile the global attack lock from the authoritative FSM state.
+         * This is what un-sticks the Scan page's "Attack running" lock after
+         * the Monster has gone idle while the web was disconnected (or the
+         * attack was stopped from the device / auto-completed). Arm on any
+         * attack state; clear once the device is no longer attacking, honoring
+         * a short grace window so a launch-time in-flight poll can't wipe the
+         * freshly-armed lock. */
+        const attackNow = ATTACK_RUNNING_STATES.has(data.state);
+        if (attackNow) {
+          if (!s.attackRunning) setAttackRunning(true);
+        } else if (
+          s.attackRunning &&
+          Date.now() - (s.attackRunningSince || 0) > ATTACK_LOCK_GRACE_MS
+        ) {
+          setAttackRunning(false);
+        }
       } catch (e) {
         /* ignore status polling errors */
       }
@@ -172,6 +206,12 @@ export function App() {
 
       if (msg.type === 'attack_started') {
         setState({ status: normalizeStatus(msg.attack) });
+        /* Fast-path arm of the global lock (the 3s poll is the safety net).
+         * attack_stopped intentionally does NOT clear it here — clearing is
+         * left to the authoritative /api/status reconcile, which avoids a
+         * spurious WS-stop event (or an auto-completing attack) flipping the
+         * Scan button back to Launch mid-session. */
+        if (ATTACK_RUNNING_STATES.has(msg.attack)) setAttackRunning(true);
         /* Only (re)initialize if not already running. This frame can arrive
          * AFTER the one-shot "GPS fix obtained" line and the first CSV rows
          * (WS vs uart_line are separate transports), so blindly resetting
@@ -299,6 +339,7 @@ export function App() {
           <SDData path="/sddata" />
           <Bluetooth path="/bluetooth" />
           <Wardrive path="/wardrive" />
+          <MeshRecon path="/mesh" />
           <Karma path="/karma" />
           <Portal path="/portal" />
           <DeauthDetector path="/detector" />

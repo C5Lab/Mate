@@ -131,10 +131,9 @@ export function Sniffer() {
       try {
         const status = await api.status();
         if (status?.ok && status.state === 'sniffer') {
-          setRunning(true);
-          await loadSnifferResults();
-          await loadProbes();
-          startRefreshLoop();
+          /* Observer already running on the device (e.g. we reconnected after
+           * launching it and leaving) — pick it straight back up. */
+          beginObserverMonitoring();
         } else {
           await loadSnifferResults();
           await loadProbes();
@@ -159,7 +158,10 @@ export function Sniffer() {
       }
 
       if (msg.type === 'attack_started' && msg.attack === 'sniffer') {
-        setRunning(true);
+        /* Fast path: the observer's firmware-driven scan just finished and the
+         * sniffer is live. Begin the results refresh loop (the status watch in
+         * start() is the reliable fallback if this WS frame is dropped). */
+        beginObserverMonitoring();
       }
 
       if (msg.type === 'attack_stopped') {
@@ -245,23 +247,27 @@ export function Sniffer() {
     refreshTimerRef.current = setInterval(tickRefresh, REFRESH_INTERVAL_MS);
   }
 
-  async function startSnifferAfterScan() {
-    const res = await api.snifferNoscan();
-    if (!res.ok) {
-      showToast(res.error || 'Failed to start observer', 'error');
-      setIsScanning(false);
-      return;
+  /* The Monster is now sniffing (Mate fired start_sniffer_noscan after its
+   * scan). Stop the status watch and start polling results. Idempotent and
+   * safe to call from the WS attack_started fast-path, the status watch, or the
+   * initial mount detection; returns true only on the transition that actually
+   * begins monitoring so the caller can toast exactly once. */
+  function beginObserverMonitoring() {
+    if (refreshTimerRef.current) return false;
+    if (scanPollRef.current) {
+      clearInterval(scanPollRef.current);
+      scanPollRef.current = null;
     }
-
+    if (scanTimeoutRef.current) {
+      clearTimeout(scanTimeoutRef.current);
+      scanTimeoutRef.current = null;
+    }
     setRunning(true);
     setIsScanning(false);
-    setPacketCount(0);
-    setAps([]);
-    setProbes([]);
-    await loadSnifferResults();
-    await loadProbes();
+    loadSnifferResults();
+    loadProbes();
     startRefreshLoop();
-    showToast('Network Observer started', 'success');
+    return true;
   }
 
   async function start() {
@@ -274,36 +280,33 @@ export function Sniffer() {
     setState({ networks: [], selected: new Set(), status: 'scanning' });
 
     try {
-      const res = await api.scan();
+      /* One request: Mate scans, then auto-starts the sniffer on its own (see
+       * cmd_do_observer_start). Unlike the old scan->poll->snifferNoscan dance
+       * that lived here, the launch now survives navigating away / disconnecting
+       * mid-scan — the observer starts on the Monster regardless of the web. */
+      const res = await api.observer();
       if (!res.ok) {
-        showToast(res.error || 'Scan failed', 'error');
+        showToast(res.error || 'Failed to start observer', 'error');
         setIsScanning(false);
         return;
       }
     } catch (e) {
-      showToast('Scan failed', 'error');
+      showToast('Failed to start observer', 'error');
       setIsScanning(false);
       return;
     }
 
+    /* Watch the device state until the firmware flips to 'sniffer', then begin
+     * monitoring. Display-only: if we disconnect here the observer is already
+     * launching on the Monster and the next mount picks it up. The WS
+     * attack_started frame is the fast path; this poll is the reliable one. */
     scanPollRef.current = setInterval(async () => {
       try {
-        const data = await api.scanResults();
-        if (!data.ok) return;
-
-        setState({ networks: data.networks || [], selected: new Set() });
-
-        if (data.complete) {
-          if (scanPollRef.current) {
-            clearInterval(scanPollRef.current);
-            scanPollRef.current = null;
+        const s = await api.status();
+        if (s?.ok && s.state === 'sniffer') {
+          if (beginObserverMonitoring()) {
+            showToast('Network Observer started', 'success');
           }
-          if (scanTimeoutRef.current) {
-            clearTimeout(scanTimeoutRef.current);
-            scanTimeoutRef.current = null;
-          }
-          showToast(`Scan complete: ${data.count} networks`, 'success');
-          await startSnifferAfterScan();
         }
       } catch (e) {
         /* ignore poll error */
@@ -313,7 +316,7 @@ export function Sniffer() {
     scanTimeoutRef.current = setTimeout(() => {
       stopAllTimers();
       setIsScanning(false);
-      showToast('Scan timed out', 'warning');
+      showToast('Observer start timed out', 'warning');
     }, SCAN_TIMEOUT_MS);
   }
 
@@ -364,7 +367,8 @@ export function Sniffer() {
         </div>
 
         <div class="section-note">
-          Start runs one scan, then launches sniffer (noscan) and refreshes clients + probes every 4s.
+          Start tells the Monster to scan then launch the sniffer itself (keeps
+          running if you disconnect); clients + probes refresh every 4s.
         </div>
       </section>
 

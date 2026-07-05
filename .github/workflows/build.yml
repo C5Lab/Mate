@@ -15,6 +15,7 @@ on:
       - 'partitions_*.csv'
       - 'CMakeLists.txt'
       - 'tools/build_all.py'
+      - 'tools/gen_web_flasher.py'
       - '.github/workflows/build.yml'
     tags:
       - 'v*'
@@ -125,6 +126,8 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
     if: >-
       startsWith(github.ref, 'refs/tags/v') ||
       (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
@@ -185,3 +188,69 @@ jobs:
             --title "Mate $TAG" \
             --notes-file release_notes.md \
             release_zips/*.zip
+
+  # ---------------------------------------------------------------------------
+  # Web flasher: deploy the browser-based esptool-js flasher (docs/) to GitHub
+  # Pages, arranging every board's bins under docs/firmware/<board>/ and
+  # generating a per-board manifest + boards.json (the dropdown). needs release
+  # => only publishes once every board is green AND a release was cut, so the
+  # flasher never points at a half-built matrix.
+  # ---------------------------------------------------------------------------
+  pages:
+    name: Web Flasher (Pages)
+    needs: [prepare, build, release]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all firmware artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: _artifacts
+          pattern: firmware-*
+
+      # Each artifact "firmware-<board>" holds that board's bins at its root.
+      # Fan them out into docs/firmware/<board>/ so the manifests (and Pages)
+      # can serve firmware/<board>/<file>.bin by relative URL.
+      - name: Arrange firmware under docs/firmware/
+        run: |
+          set -euo pipefail
+          rm -rf docs/firmware
+          mkdir -p docs/firmware
+          for d in _artifacts/firmware-*; do
+            [ -d "$d" ] || continue
+            board="${d#_artifacts/firmware-}"
+            mkdir -p "docs/firmware/${board}"
+            cp "$d"/*.bin "docs/firmware/${board}/"
+          done
+          ls -R docs/firmware
+
+      - name: Generate manifests + boards.json
+        run: |
+          python3 tools/gen_web_flasher.py \
+            --firmware-dir docs/firmware \
+            --out-dir docs \
+            --version "${{ needs.prepare.outputs.wc_version }}" \
+            --build "${{ needs.release.outputs.tag }}"
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v4
+        with:
+          enablement: true
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
+
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v4

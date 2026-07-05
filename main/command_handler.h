@@ -37,6 +37,54 @@ typedef struct {
     uint32_t at_ms;           /* monotonic timestamp of last update */
 } nmap_state_t;
 
+/* ---------- Zigbee / 802.15.4 mesh recon (Mesh Recon tile) ----------
+ * The Monster emits key=value lines prefixed "[ZIG] status|pan|node|edge",
+ * each response burst terminated by "[ZIG] END". We upsert them into the caches
+ * below (keyed by pan id / addr / from-to) so the graph survives poll cycles
+ * and web reconnects. Mirrors Tab5's iot_recon_* data model. */
+typedef struct {
+    char id[16];          /* PAN id, e.g. "0x1A2B" */
+    char proto[24];       /* zigbee | thread | ieee802154 | ... */
+    char confidence[16];
+    char channels[48];    /* human list, e.g. "11,15,20" (from channel bitmask) */
+    int  nodes;
+    int  packets;
+    int  rssi;
+    int  age_ms;
+} zig_pan_t;
+
+typedef struct {
+    char pan[16];
+    char addr[24];        /* short "0x1234" or "EXT ...ABCD" */
+    char role[24];        /* coordinator | router | end_device | ... */
+    char vendor[32];
+    char device_hint[32];
+    int  packets;
+    int  rssi;
+    int  lqi;
+    int  last_channel;
+    int  age_ms;
+} zig_node_t;
+
+typedef struct {
+    char pan[16];
+    char from[24];
+    char to[24];
+    char kind[24];        /* parent-child | sibling | ... */
+    int  packets;
+    int  rssi;
+    int  age_ms;
+} zig_edge_t;
+
+typedef struct {
+    bool     active;
+    int      channel;
+    int      packets;
+    int      pans;
+    int      dropped;
+    uint32_t at_ms;
+} zig_status_t;
+
 typedef enum {
     STATE_IDLE = 0,
     STATE_SCANNING,
@@ -71,6 +119,7 @@ typedef enum {
     STATE_SUBGHZ_LIST,
     STATE_SUBGHZ_IMPORT,
     STATE_SUBGHZ_EXPORT,
+    STATE_ZIG_RECON,            /* start_zig_recon streaming (Mesh Recon) */
 } cmd_state_t;
 
 typedef struct {
@@ -148,6 +197,11 @@ bool cmd_do_sniffer(void);
 /** Start sniffer using existing scan results (no fresh scan). */
 bool cmd_do_sniffer_noscan(void);
 
+/** Start the Network Observer: runs a scan, then auto-starts the sniffer
+ *  (start_sniffer_noscan) once results are in. The scan->sniffer handoff
+ *  happens in firmware so it survives the web client disconnecting mid-scan. */
+bool cmd_do_observer_start(void);
+
 /** Request indexed probe list (start_karma uses these indices). */
 bool cmd_do_list_probes(void);
 
@@ -168,6 +222,17 @@ bool cmd_do_arp(void);
 
 /** Start ARP ban (poison) for a single host MAC, optionally with IP. */
 bool cmd_do_arp_ban(const char *mac, const char *ip);
+
+/** Mesh Recon (Zigbee/802.15.4): start capture (start_zig_recon all 250). */
+bool cmd_do_zig_recon_start(void);
+
+/** Mesh Recon: pull the latest snapshot from the Monster (sends the
+ *  zig_recon_status / zig_recon_list all / zig_recon_nodes all queries). The
+ *  [ZIG] response lines are parsed asynchronously into the caches below. */
+bool cmd_do_zig_recon_refresh(void);
+
+/** Mesh Recon: clear on-device + local caches (zig_recon_clear). */
+bool cmd_do_zig_recon_clear(void);
 
 /** Connect STA to selected AP SSID. */
 bool cmd_do_wifi_connect(const char *ssid, const char *password);
@@ -362,6 +427,15 @@ uint32_t cmd_get_arp_hosts_at_ms(void);
 /** Get cached Nmap results. Returns count of hosts copied (capped at `max`). */
 int cmd_get_nmap_hosts(nmap_host_t *out, int max);
 int cmd_get_nmap_hosts_count(void);
+
+/** Mesh Recon caches. Each getter copies a snapshot under the module mutex. */
+int  cmd_get_zig_pans(zig_pan_t *out, int max);
+int  cmd_get_zig_pan_count(void);
+int  cmd_get_zig_nodes(zig_node_t *out, int max);
+int  cmd_get_zig_node_count(void);
+int  cmd_get_zig_edges(zig_edge_t *out, int max);
+int  cmd_get_zig_edge_count(void);
+void cmd_get_zig_status(zig_status_t *out);
 
 /** Snapshot the scan-level Nmap state (level, total hosts, currently-scanning IP,
  *  port progress, completion flag, last-update timestamp). */

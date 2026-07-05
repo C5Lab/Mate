@@ -24,6 +24,17 @@ let state = {
   heapFree: 0,
   heapInternal: 0,
   status: 'idle',
+  /* Global foreground-attack lock. Mirrors whether the Monster is running a
+   * Scan-page attack (deauth/handshake/mitm/nmap/arp/…). Kept here — not in the
+   * Scan component's local state — so it survives navigation, WS reconnects and
+   * the disconnect→return case: the /api/status poll reconciles it against the
+   * authoritative device FSM, so the Scan lock can no longer stay stuck on
+   * "Attack running" after the Monster has actually gone idle.
+   * `attackRunningSince` timestamps the optimistic launch so the poll won't
+   * clear a freshly-armed lock in the brief window before the device reports
+   * the new state (see setAttackRunning + the reconcile in app.jsx). */
+  attackRunning: false,
+  attackRunningSince: 0,
   networks: [],
   selected: new Set(),
   scanCount: 0,
@@ -94,6 +105,16 @@ export function setAllNetworks(selectAll) {
   const next = new Set();
   if (selectAll) state.networks.forEach((n) => next.add(n.index));
   setState({ selected: next });
+}
+
+/* Arm/disarm the global attack lock. Callers set it optimistically on launch
+ * (true) and on Stop (false); the /api/status poll in app.jsx reconciles it
+ * against the real device state afterwards. */
+export function setAttackRunning(running) {
+  setState({
+    attackRunning: !!running,
+    attackRunningSince: running ? Date.now() : 0,
+  });
 }
 
 export function clearArpHosts() {

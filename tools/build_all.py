@@ -141,6 +141,22 @@ BOARDS = {
         "flash_size":         "4MB",
         "flash_mode":         "dio",
         "flash_freq":         "40m",
+        "default_baud":        115200,
+        "default_no_stub":     True,
+        "boot_offset":        "0x1000",
+        "ptable_offset":      "0x8000",
+        "app_offset":         "0x10000",
+        "spiffs_offset":      "0x1D0000",  # 0x10000 + 0x1C0000 (partitions_4mb.csv)
+    },
+    "atom-lite-c21_25": {
+        "idf_target":         "esp32",
+        "sdkconfig_defaults": "sdkconfig.defaults;sdkconfig.defaults.atom-lite-c21_25",
+        "chip":               "esp32",
+        "flash_size":         "4MB",
+        "flash_mode":         "dio",
+        "flash_freq":         "40m",
+        "default_baud":        115200,
+        "default_no_stub":     True,
         "boot_offset":        "0x1000",
         "ptable_offset":      "0x8000",
         "app_offset":         "0x10000",
@@ -391,7 +407,8 @@ CHIP          = "{chip}"
 FLASH_SIZE    = "{flash_size}"
 FLASH_MODE    = "{flash_mode}"
 FLASH_FREQ    = "{flash_freq}"
-DEFAULT_BAUD  = 460800
+DEFAULT_BAUD  = {default_baud}
+DEFAULT_NO_STUB = {default_no_stub}
 MIN_ESPTOOL   = "5.2.0"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -485,6 +502,18 @@ def check_files():
 def list_ports():
     return {{p.device for p in serial.tools.list_ports.comports()}}
 
+def flash_size_bytes():
+    s = FLASH_SIZE.strip().upper()
+    if s.endswith("MB"):
+        return int(s[:-2]) * 1024 * 1024
+    if s.endswith("M"):
+        return int(s[:-1]) * 1024 * 1024
+    if s.endswith("KB"):
+        return int(s[:-2]) * 1024
+    if s.endswith("K"):
+        return int(s[:-1]) * 1024
+    return int(s, 0)
+
 def wait_for_port(before, timeout=30.0):
     print(f"{{CYAN}}Hold BOOT and connect the board (or press BOOT + RESET).{{RESET}}")
     sp = ["|", "/", "-", "\\\\"]
@@ -500,16 +529,20 @@ def wait_for_port(before, timeout=30.0):
     print(f"\\n{{RED}}Timeout — no new port detected.{{RESET}}")
     sys.exit(1)
 
-def erase(port, baud):
+def erase(port, baud, no_stub=False):
     cmd = [sys.executable, "-m", "esptool",
            "-p", port, "-b", str(baud),
-           "--chip", CHIP, "--before", "default-reset", "--after", "no_reset",
-           "erase_flash"]
-    print(f"{{CYAN}}Erasing flash...{{RESET}}")
-    r = subprocess.run(cmd)
-    if r.returncode:
-        print(f"{{RED}}Erase failed ({{r.returncode}}).{{RESET}}")
-        sys.exit(r.returncode)
+           "--chip", CHIP, "--before", "default-reset", "--after", "no-reset"]
+    if no_stub:
+        cmd.append("--no-stub")
+        size = flash_size_bytes()
+        cmd += ["erase-region", "0x0", hex(size)]
+        mode = " (--no-stub erase-region 0x0..0x%X @ %d)" % (size, baud)
+    else:
+        cmd.append("erase-flash")
+        mode = " (@ %d)" % baud
+    print(f"{{CYAN}}Erasing flash{{mode}}...{{RESET}}")
+    return subprocess.run(cmd).returncode
 
 def flash(port, baud, no_stub=False):
     cmd = [sys.executable, "-m", "esptool",
@@ -561,7 +594,10 @@ def main():
     ap.add_argument("--baud",    type=int, default=DEFAULT_BAUD)
     ap.add_argument("--no-erase", action="store_true", help="Skip the full erase (faster; same-board reflash only)")
     ap.add_argument("--monitor", action="store_true", help="Serial monitor after flash")
-    ap.add_argument("--no-stub", action="store_true", help="Flash without the stub (slower, robust for finicky ESP32 modules)")
+    ap.add_argument("--no-stub", action="store_true", default=DEFAULT_NO_STUB,
+                    help="Flash without the stub (slower, robust for finicky ESP32 modules)")
+    ap.add_argument("--stub", action="store_false", dest="no_stub",
+                    help="Use the RAM stub flasher even on boards that default to --no-stub")
     args = ap.parse_args()
 
     check_files()
@@ -574,7 +610,13 @@ def main():
     print(f"{{GREEN}}Port: {{port}}{{RESET}}")
 
     if not args.no_erase:
-        erase(port, args.baud)
+        rc = erase(port, args.baud, no_stub=args.no_stub)
+        if rc and (not args.no_stub or args.baud != 115200):
+            print(f"{{YELLOW}}Erase failed at {{args.baud}} baud — retrying with --no-stub @ 115200...{{RESET}}")
+            rc = erase(port, 115200, no_stub=True)
+        if rc:
+            print(f"{{RED}}Erase failed ({{rc}}).{{RESET}}")
+            sys.exit(rc)
 
     rc = flash(port, args.baud, no_stub=args.no_stub)
     if rc and not args.no_stub:
@@ -607,6 +649,8 @@ def generate_flasher(board: str, out_dir: Path) -> None:
         ptable_offset  = cfg["ptable_offset"],
         app_offset     = cfg["app_offset"],
         spiffs_offset  = cfg["spiffs_offset"],
+        default_baud   = cfg.get("default_baud", 460800),
+        default_no_stub = "True" if cfg.get("default_no_stub", False) else "False",
     )
     dest = out_dir / "flash_board.py"
     dest.write_text(content, encoding="utf-8")

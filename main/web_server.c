@@ -443,6 +443,7 @@ static esp_err_t api_attack_post(httpd_req_t *req)
     else if (strstr(uri, "/eviltwin"))   ok = cmd_do_evil_twin();
     else if (strstr(uri, "/sae"))        ok = cmd_do_sae();
     else if (strstr(uri, "/handshake"))  ok = cmd_do_handshake();
+    else if (strstr(uri, "/observer"))   ok = cmd_do_observer_start();
     else if (strstr(uri, "/sniffer_noscan")) ok = cmd_do_sniffer_noscan();
     else if (strstr(uri, "/sniffer"))    ok = cmd_do_sniffer();
     else if (strstr(uri, "/mitm"))       ok = cmd_do_mitm();
@@ -863,6 +864,87 @@ static esp_err_t api_nmap_results_get(httpd_req_t *req)
     }
     cw_printf(&cw, "]}");
     free(hosts);
+    return cw_finish(&cw);
+}
+
+/* ---------- Mesh Recon (Zigbee) ---------- */
+
+static esp_err_t api_zigbee_start_post(httpd_req_t *req)
+{
+    send_json(req, cmd_do_zig_recon_start()
+        ? "{\"ok\":true}" : "{\"ok\":false,\"error\":\"busy\"}");
+    return ESP_OK;
+}
+
+static esp_err_t api_zigbee_refresh_post(httpd_req_t *req)
+{
+    send_json(req, cmd_do_zig_recon_refresh()
+        ? "{\"ok\":true}" : "{\"ok\":false,\"error\":\"not running\"}");
+    return ESP_OK;
+}
+
+static esp_err_t api_zigbee_clear_post(httpd_req_t *req)
+{
+    cmd_do_zig_recon_clear();
+    send_json(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
+static esp_err_t api_zigbee_results_get(httpd_req_t *req)
+{
+    zig_status_t st;
+    cmd_get_zig_status(&st);
+
+    int np = cmd_get_zig_pan_count();
+    int nn = cmd_get_zig_node_count();
+    int ne = cmd_get_zig_edge_count();
+    zig_pan_t  *pans  = NULL;
+    zig_node_t *nodes = NULL;
+    zig_edge_t *edges = NULL;
+    if (np > 0) { pans  = psram_malloc((size_t)np * sizeof(*pans));  np = pans  ? cmd_get_zig_pans(pans, np)   : 0; }
+    if (nn > 0) { nodes = psram_malloc((size_t)nn * sizeof(*nodes)); nn = nodes ? cmd_get_zig_nodes(nodes, nn) : 0; }
+    if (ne > 0) { edges = psram_malloc((size_t)ne * sizeof(*edges)); ne = edges ? cmd_get_zig_edges(edges, ne) : 0; }
+
+    chunked_writer_t cw;
+    cw_init(&cw, req);
+    cw_printf(&cw,
+        "{\"ok\":true,\"running\":%s,\"active\":%s,\"channel\":%d,\"packets\":%d,"
+        "\"pans_seen\":%d,\"dropped\":%d,\"at\":%u,\"pans\":[",
+        cmd_get_state() == STATE_ZIG_RECON ? "true" : "false",
+        st.active ? "true" : "false", st.channel, st.packets,
+        st.pans, st.dropped, (unsigned)st.at_ms);
+    for (int i = 0; i < np; i++) {
+        cw_printf(&cw,
+            "%s{\"id\":\"%s\",\"proto\":\"%s\",\"confidence\":\"%s\","
+            "\"channels\":\"%s\",\"nodes\":%d,\"packets\":%d,\"rssi\":%d,\"age_ms\":%d}",
+            i > 0 ? "," : "",
+            pans[i].id, pans[i].proto, pans[i].confidence, pans[i].channels,
+            pans[i].nodes, pans[i].packets, pans[i].rssi, pans[i].age_ms);
+    }
+    cw_printf(&cw, "],\"nodes\":[");
+    for (int i = 0; i < nn; i++) {
+        cw_printf(&cw,
+            "%s{\"pan\":\"%s\",\"addr\":\"%s\",\"role\":\"%s\",\"vendor\":\"%s\","
+            "\"device_hint\":\"%s\",\"packets\":%d,\"rssi\":%d,\"lqi\":%d,"
+            "\"last_channel\":%d,\"age_ms\":%d}",
+            i > 0 ? "," : "",
+            nodes[i].pan, nodes[i].addr, nodes[i].role, nodes[i].vendor,
+            nodes[i].device_hint, nodes[i].packets, nodes[i].rssi, nodes[i].lqi,
+            nodes[i].last_channel, nodes[i].age_ms);
+    }
+    cw_printf(&cw, "],\"edges\":[");
+    for (int i = 0; i < ne; i++) {
+        cw_printf(&cw,
+            "%s{\"pan\":\"%s\",\"from\":\"%s\",\"to\":\"%s\",\"kind\":\"%s\","
+            "\"packets\":%d,\"rssi\":%d,\"age_ms\":%d}",
+            i > 0 ? "," : "",
+            edges[i].pan, edges[i].from, edges[i].to, edges[i].kind,
+            edges[i].packets, edges[i].rssi, edges[i].age_ms);
+    }
+    cw_printf(&cw, "]}");
+    free(pans);
+    free(nodes);
+    free(edges);
     return cw_finish(&cw);
 }
 
@@ -1488,10 +1570,12 @@ esp_err_t web_server_start(void)
      * (classic stack-smash signature). 8 KB gives the SPI/LCD path
      * comfortable headroom. */
     config.stack_size       = 8192;
-    config.max_uri_handlers = 48;   /* ~36 handlers today; headroom so the
+    config.max_uri_handlers = 64;   /* 40 handlers today (incl. the 4 zigbee
+                                     * endpoints); generous headroom so the
                                      * last-registered wildcard SPA route never
                                      * gets dropped -> "Nothing matches the
-                                     * given URI" 404 on every page. */
+                                     * given URI" 404 on every page. Bump this
+                                     * whenever you add REGISTER_URI entries. */
     config.max_open_sockets = 7;
     config.lru_purge_enable = true;
     config.recv_wait_timeout  = 10;
@@ -1583,6 +1667,10 @@ esp_err_t web_server_start(void)
     REGISTER_URI("/api/probes",          HTTP_POST, api_probes_refresh_post);
     REGISTER_URI("/api/arp/hosts",       HTTP_GET,  api_arp_hosts_get);
     REGISTER_URI("/api/nmap/results",    HTTP_GET,  api_nmap_results_get);
+    REGISTER_URI("/api/zigbee/start",    HTTP_POST, api_zigbee_start_post);
+    REGISTER_URI("/api/zigbee/refresh",  HTTP_POST, api_zigbee_refresh_post);
+    REGISTER_URI("/api/zigbee/clear",    HTTP_POST, api_zigbee_clear_post);
+    REGISTER_URI("/api/zigbee/results",  HTTP_GET,  api_zigbee_results_get);
     REGISTER_URI("/api/status",        HTTP_GET,  api_status_get);
     REGISTER_URI("/api/dashboard",     HTTP_GET,  api_dashboard_get);
     REGISTER_URI("/api/subghz/list",   HTTP_GET,  api_subghz_list_get);

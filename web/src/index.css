@@ -1411,6 +1411,142 @@ button:not(:disabled) {
   text-transform: uppercase;
 }
 
+/* ---------- Mesh Recon ---------- */
+.mesh-pan-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+}
+
+.mesh-pan {
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: var(--surface-2);
+  overflow: hidden;
+}
+
+.mesh-pan.open {
+  border-color: rgba(168, 85, 247, 0.5);
+}
+
+.mesh-pan-head {
+  width: 100%;
+  color: var(--text);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 13px 14px;
+  text-align: left;
+}
+
+.mesh-chevron {
+  color: var(--text-dim);
+  display: inline-block;
+  transition: transform 0.15s ease;
+}
+
+.mesh-chevron.open {
+  transform: rotate(90deg);
+}
+
+.mesh-pan-id {
+  font-weight: 800;
+  font-family: var(--font-mono);
+}
+
+.mesh-pan-proto {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.mesh-pan-rssi {
+  margin-left: auto;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.mesh-pan-body {
+  padding: 0 14px 14px;
+  display: grid;
+  gap: 12px;
+}
+
+.mesh-pan-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.mesh-graph {
+  width: 100%;
+  height: auto;
+  max-height: 260px;
+  background: radial-gradient(circle at 50% 45%, rgba(168, 85, 247, 0.10), transparent 70%);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  color: var(--text-soft);
+}
+
+.mesh-node-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 5px;
+}
+
+.mesh-node {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 10px;
+  border-radius: 10px;
+  background: #0b0b0c;
+  font-size: 12px;
+}
+
+.mesh-node.empty {
+  background: transparent;
+  color: var(--text-muted);
+}
+
+.mesh-node-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex: none;
+}
+
+.mesh-node-addr {
+  font-family: var(--font-mono);
+  color: var(--text);
+  min-width: 84px;
+}
+
+.mesh-node-role {
+  color: var(--text-soft);
+}
+
+.mesh-node-vendor {
+  min-width: 0;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mesh-node-rssi {
+  margin-left: auto;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
 .reveal {
   animation: reveal 0.22s ease both;
 }

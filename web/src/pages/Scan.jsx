@@ -3,7 +3,7 @@ import { useEffect, useRef, useState } from 'preact/hooks';
 import { Layout } from '../components/Layout';
 import { NetworkList } from '../components/NetworkList';
 import { api } from '../api';
-import { clearArpHosts, getState, setAllNetworks, setArpHosts, setState, subscribe, toggleNetwork } from '../store';
+import { clearArpHosts, getState, setAllNetworks, setArpHosts, setAttackRunning, setState, subscribe, toggleNetwork } from '../store';
 import { showToast } from '../components/Toast';
 import { wsAddListener } from '../ws';
 
@@ -98,7 +98,6 @@ function stopPolling() {
 export function Scan() {
   const [attack, setAttack] = useState('deauth');
   const [serialLines, setSerialLines] = useState([]);
-  const [attackLive, setAttackLive] = useState(false);
 
   const [connectOpen, setConnectOpen] = useState(false);
   const [connectSsid, setConnectSsid] = useState('');
@@ -136,6 +135,9 @@ export function Scan() {
   const nmapDiscoveryActiveRef = useRef(false);
 
   const st = getState();
+  /* Attack lock now lives in the global store (reconciled from /api/status in
+   * app.jsx) so it survives navigation, WS reconnects and disconnect→return. */
+  const attackLive = st.attackRunning;
   const scanning = st.status === 'scanning' || st.status === 'scan';
   const selectedAttack = ATTACK_OPTIONS.find((opt) => opt.id === attack);
   const arpRows = st.arpHosts || [];
@@ -148,9 +150,10 @@ export function Scan() {
   useEffect(() => {
     const removeWs = wsAddListener((msg) => {
       if (msg.type === 'attack_started') {
-        /* Lock is driven locally (set on Launch, cleared on Stop) — not by the
-         * WS, which is unreliable here and auto-completing attacks (handshake)
-         * would otherwise flip the button back to Launch mid-session. */
+        /* The attack lock itself is global now (st.attackRunning): armed
+         * optimistically on Launch + on the WS attack_started fast-path in
+         * app.jsx, and reconciled/cleared by the /api/status poll. This local
+         * handler only maintains the serial breadcrumb + ARP polling. */
         pushLine(`${msg.attack || 'operation'} started`);
         if (msg.attack === 'arp') {
           /* Make sure we're polling -- covers the case where the monitor
@@ -350,7 +353,7 @@ export function Scan() {
 
     const res = await api.nmap(nmapLevel, targetIp);
     if (res?.ok) {
-      setAttackLive(true);
+      setAttackRunning(true);
       showToast(`nmap ${nmapLevel} started`, 'success');
     } else {
       pushMonitorLine(`Error: ${res?.error || 'nmap rejected'}`);
@@ -429,7 +432,7 @@ export function Scan() {
     setArpBanBusy(false);
     if (res?.ok) {
       setArpBanTarget(host);
-      setAttackLive(true);
+      setAttackRunning(true);
       showToast(`ARP poisoning ${host.ip}`, 'success');
       pushMonitorLine(`arp_ban started for ${host.mac}`);
     } else {
@@ -518,7 +521,7 @@ export function Scan() {
     if (res.ok) {
       if (attackId !== 'nmap') {
         showToast(`${attackId} started`, 'success');
-        setAttackLive(true);
+        setAttackRunning(true);
         pushLine(`${attackId} started`);
       }
       if (attackId === 'sniffer') route('/sniffer');
@@ -626,7 +629,7 @@ export function Scan() {
        * picked a host and the actual `start_nmap` command has fired. Don't
        * mislead them by claiming nmap is live just because list_hosts ran. */
       if (pending.id !== 'nmap') {
-        setAttackLive(true);
+        setAttackRunning(true);
         showToast(`${pending.id} started`, 'success');
       }
     } else {
@@ -776,7 +779,7 @@ export function Scan() {
     const res = await runner();
     if (res.ok) {
       showToast(`${attack} started`, 'success');
-      setAttackLive(true);
+      setAttackRunning(true);
       pushLine(`${attack} started`);
       if (attack === 'sniffer') route('/sniffer');
     } else {
@@ -786,7 +789,7 @@ export function Scan() {
 
   async function stopAndClosePopup() {
     await api.stop();
-    setAttackLive(false);
+    setAttackRunning(false);
     setConnectOpen(false);
     closeMonitor();
     pendingRef.current = null;
@@ -797,7 +800,7 @@ export function Scan() {
 
   async function stopAll() {
     await api.stop();
-    setAttackLive(false);
+    setAttackRunning(false);
     setState({ status: 'idle' });
     showToast('Stop sent', 'warning');
   }

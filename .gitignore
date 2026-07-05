@@ -1,1 +1,7 @@
 .vscode/settings.json
+
+# Web flasher: firmware bins + manifests are generated in CI from build
+# artifacts, not committed. Only the static flasher HTML lives in docs/.
+docs/firmware/
+docs/boards.json
+docs/manifest-*.json

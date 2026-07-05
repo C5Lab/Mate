@@ -15,7 +15,7 @@ partition layout, display driver, and Grove UART pins — all selected through
 
 | Board          | MCU              | Flash | Display            | UART TX/RX (Grove) | Notes                          |
 |----------------|------------------|-------|--------------------|--------------------|--------------------------------|
-| `xiao-c6`      | ESP32-C6         | 4 MB  | —                  | 21 / 20            | Default board in Kconfig       |
+| `xiao-c6`      | ESP32-C6         | 4 MB  | —                  | 7 / 6              | Default board in Kconfig       |
 | `nanoc6`       | ESP32-C6         | 4 MB  | —                  | 2 / 1              | M5Stack NanoC6                 |
 | `cores3`       | ESP32-S3         | 16 MB | ILI9342C 320×240   | 2 / 1              | CoreS3 SE                      |
 | `atoms3r`      | ESP32-S3         | 8 MB  | GC9107 128×128     | 5 / 6              | AtomS3R Dev Kit                |
@@ -23,7 +23,11 @@ partition layout, display driver, and Grove UART pins — all selected through
 | `atoms3-lite`  | ESP32-S3FN8      | 8 MB  | —                  | 2 / 1              | No display                     |
 | `stickc-plus2` | ESP32            | 8 MB  | ST7789V2 135×240   | 32 / 33            | Bootloader @ 0x1000            |
 | `sticks3`      | ESP32-S3         | 8 MB  | ST7789P3 135×240   | 9 / 10             | M5PM1 PMIC (5V boost + L3B)    |
-| `atom-lite`    | ESP32-PICO-D4    | 4 MB  | —                  | 26 / 32            | Needs no-stub flashing fallback|
+| `atom-lite`    | ESP32-PICO-D4    | 4 MB  | —                  | 26 / 32            | Defaults to no-stub @ 115200   |
+| `atom-lite-c21_25` | ESP32-PICO-D4 | 4 MB  | —                  | 21 / 25            | C21_25 variant; no-stub @ 115200 |
+| `atom-matrix`  | ESP32-PICO-D4    | 4 MB  | —                  | 26 / 32            | 5×5 RGB LED (no LCD); no-stub   |
+| `coreink`      | ESP32            | 4 MB  | GDEW0154M09 200×200| 32 / 33            | E-paper; bootloader @ 0x1000    |
+| `atoms3u`      | ESP32-S3FN8      | 8 MB  | —                  | 2 / 1              | No display (USB stick, mic)     |
 
 > UART TX is the Grove **yellow** wire, RX the **white** wire. If the Monster does
 > not respond or you see garbage on RX, swap TX/RX in `main/Kconfig.projbuild`.
@@ -205,6 +209,7 @@ python flash_board.py --baud 115200   # slower, more robust link
 python flash_board.py --no-erase      # skip erase (faster; same-board reflash only)
 python flash_board.py --monitor       # open serial monitor after flashing
 python flash_board.py --no-stub       # force the no-stub path (see below)
+python flash_board.py --stub          # force the faster RAM stub where supported
 ```
 
 > **The flasher erases the whole chip by default.** A plain `write-flash` already
@@ -214,10 +219,13 @@ python flash_board.py --no-stub       # force the no-stub path (see below)
 > that's browser cache, not the flash — check the `v####` footer and use
 > incognito; see §3 Web UI.)
 
-**Automatic no-stub fallback:** some ESP32 modules (notably the **ESP32-PICO-D4**
-on Atom Lite) drop the esptool *stub* when the baud is bumped, failing with
-`The chip stopped responding`. The generated flasher detects a failed flash and
-automatically retries once with `--no-stub -b 115200` (slower but reliable).
+**Atom Lite slow path:** some ESP32 modules (notably the **ESP32-PICO-D4** on
+Atom Lite) drop the esptool *stub* when the baud is bumped, failing with
+`The chip stopped responding`. Atom Lite flashers therefore default to
+`--no-stub -b 115200`; because the ESP32 ROM loader does not support
+`erase-flash`, the flasher erases the full chip with `erase-region 0x0 <size>`
+on that path. Other boards still default to the faster stub path, with an
+automatic retry to `--no-stub -b 115200` if erase or write fails.
 
 ### Manual esptool (fallback)
 
@@ -231,7 +239,7 @@ python -m esptool --chip esp32s3 -p COM13 -b 460800 \
   0x3d0000 storage-sticks3.bin
 ```
 
-> Classic-ESP32 boards (`stickc-plus2`, `atom-lite`) place the bootloader at
+> Classic-ESP32 boards (`stickc-plus2`, `atom-lite`, `atom-lite-c21_25`) place the bootloader at
 > **0x1000**, not 0x0. The per-board flasher handles this automatically.
 
 ### Output layout
@@ -257,8 +265,8 @@ Boards with `JANOS_HAS_DISPLAY=y` show a 4-row UI:
   line, RX line count.
 
 The view switches automatically on Wi-Fi AP STA connect/disconnect events.
-Headless boards (`*-lite`, `xiao-c6`, `nanoc6`) confirm success via the serial
-log (`RX: ping` / `RX: pong` against the Monster).
+Headless boards (`*-lite`, `xiao-c6`, `nanoc6`, `atom-matrix`, `atoms3u`) confirm
+success via the serial log (`RX: ping` / `RX: pong` against the Monster).
 
 ### StickS3 power note
 
@@ -309,7 +317,7 @@ Checklist:
 | Log shows wrong UART pins, build warns *"Default value … mismatch … Using default value from sdkconfig"* | Stale `sdkconfig` keeps old per-board values; Kconfig defaults are ignored when the symbol already exists | Delete `sdkconfig` (and `sdkconfig.old`) before reconfiguring — `idf.py clean` does **not** remove it |
 | Display geometry wrong (e.g. `320x240` on a 135×240 board) | Built with the wrong `JANOS_BOARD_*` | Rebuild with the correct `sdkconfig.defaults.<board>`; confirm `CONFIG_JANOS_BOARD_*` in the generated `sdkconfig` |
 | Bootloop with `octal_psram: PSRAM chip is not connected` / `Failed to init external RAM` | `CONFIG_SPIRAM=y` on a no-PSRAM module (e.g. ESP32-S3**FN8** AtomS3/Lite) — leaked from a PSRAM board's config | No-PSRAM board defaults explicitly carry `# CONFIG_SPIRAM is not set`; `build_all.py` applies defaults via `-D` per board and verifies the generated `sdkconfig` afterwards. Rebuild via `build_all.py` and reflash |
-| `esptool ... The chip stopped responding` after *"Changing baud rate"* | ESP32-PICO-D4 stub drops at high baud | `python flash_board.py --baud 115200`, or rely on the auto no-stub fallback, or `--no-stub` manually. Try another USB cable/port |
+| `esptool ... The chip stopped responding` after *"Changing baud rate"* | ESP32-PICO-D4 stub drops at high baud | Rebuild/regenerate the flasher; Atom Lite now defaults to `--no-stub -b 115200`. For old flashers use `python flash_board.py --baud 115200 --no-stub`. Try another USB cable/port if it still drops |
 | StickS3: no 5 V on Grove | M5PM1 5V boost disabled by default | `power_sticks3.c` sets `PWR_CFG` bit3 at boot — ensure the board is built as `sticks3` |
 | StickS3: LCD dark after enabling Grove 5V | Enabling the boost dropped the L3B rail | `power_sticks3.c` forces M5PM1 GPIO2 (L3B) on, before `display_init()` |
 | `binaries/` lost custom files after a build | `build_all.py` wipes `binaries/` each run | Don't store hand-made files under `binaries/`; keep tooling in `tools/` |

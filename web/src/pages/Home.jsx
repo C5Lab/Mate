@@ -10,6 +10,7 @@ const MODULES = [
   { id: 'subghz', title: 'SubGHZ', note: 'RF tools', icon: 'radio', path: '/subghz', accent: 'violet' },
   { id: 'observer', title: 'Observer', note: 'Telemetry', icon: 'eye', path: '/sniffer', accent: 'slate' },
   { id: 'wardrive', title: 'Wardrive', note: 'GPS logs', icon: 'map', path: '/wardrive', accent: 'yellow' },
+  { id: 'mesh', title: 'Mesh Recon', note: 'Zigbee/802.15.4', icon: 'mesh', path: '/mesh', accent: 'violet' },
   { id: 'bluetooth', title: 'Bluetooth', note: 'BT scan', icon: 'bt', path: '/bluetooth', accent: 'green' },
   { id: 'data', title: 'Data', note: 'Files', icon: 'disk', path: '/sddata', accent: 'cyan' },
 ];
@@ -99,6 +100,14 @@ function Glyph({ name }) {
         <path d="M5.5 5.5a9 9 0 0 0 0 13M18.5 5.5a9 9 0 0 1 0 13" />
       </svg>
     ),
+    mesh: (
+      <svg {...common}>
+        <circle cx="12" cy="5" r="2.2" />
+        <circle cx="5" cy="18" r="2.2" />
+        <circle cx="19" cy="18" r="2.2" />
+        <path d="M10.7 6.7 6.3 16.3M13.3 6.7 17.7 16.3M7.2 18h9.6" />
+      </svg>
+    ),
   };
 
   return icons[name] || icons.wifi;
@@ -137,6 +146,7 @@ function operationLabel(status) {
     wardrive_run: 'Wardrive',
     antisurv: 'Anti-Surveillance',
     antisurv_run: 'Anti-Surveillance',
+    zig_recon: 'Mesh Recon',
   };
   if (labels[status]) return labels[status];
   if (!status) return 'Chillin';
