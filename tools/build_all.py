@@ -62,6 +62,18 @@ BOARDS = {
         "app_offset":         "0x10000",
         "spiffs_offset":      "0x1D0000",  # 0x10000 + 0x1C0000 (partitions_4mb.csv)
     },
+    "cardkb2": {
+        "idf_target":         "esp32c61",
+        "sdkconfig_defaults": "sdkconfig.defaults;sdkconfig.defaults.cardkb2",
+        "chip":               "esp32c61",
+        "flash_size":         "4MB",
+        "flash_mode":         "dio",
+        "flash_freq":         "80m",
+        "boot_offset":        "0x0",
+        "ptable_offset":      "0x8000",
+        "app_offset":         "0x10000",
+        "spiffs_offset":      "0x1D0000",  # 0x10000 + 0x1C0000 (partitions_4mb.csv)
+    },
     "cores3": {
         "idf_target":         "esp32s3",
         "sdkconfig_defaults": "sdkconfig.defaults;sdkconfig.defaults.cores3",

@@ -28,6 +28,7 @@ partition layout, display driver, and Grove UART pins — all selected through
 | `atom-matrix`  | ESP32-PICO-D4    | 4 MB  | —                  | 26 / 32            | 5×5 RGB LED (no LCD); no-stub   |
 | `coreink`      | ESP32            | 4 MB  | GDEW0154M09 200×200| 32 / 33            | E-paper; bootloader @ 0x1000    |
 | `atoms3u`      | ESP32-S3FN8      | 8 MB  | —                  | 2 / 1              | No display (USB stick, mic)     |
+| `cardkb2`      | ESP32-C61        | 4 MB  | —                  | 26 / 25            | Keyboard unit; flashing repurposes its C61 as headless WebClient |
 
 > UART TX is the Grove **yellow** wire, RX the **white** wire. If the Monster does
 > not respond or you see garbage on RX, swap TX/RX in `main/Kconfig.projbuild`.
@@ -371,8 +372,9 @@ Boards with `JANOS_HAS_DISPLAY=y` show a 4-row UI:
   line, RX line count.
 
 The view switches automatically on Wi-Fi AP STA connect/disconnect events.
-Headless boards (`*-lite`, `xiao-c6`, `nanoc6`, `atom-matrix`, `atoms3u`) confirm
-success via the serial log (`RX: ping` / `RX: pong` against the Monster).
+Headless boards (`*-lite`, `xiao-c6`, `nanoc6`, `atom-matrix`, `atoms3u`,
+`cardkb2`) confirm success via the serial log (`RX: ping` / `RX: pong` against
+the Monster).
 
 ### StickS3 power note
 

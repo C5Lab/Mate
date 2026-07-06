@@ -47,13 +47,15 @@ LABELS = {
     "atom-matrix":  "M5Stack Atom Matrix",
     "coreink":      "M5Stack CoreInk",
     "atoms3u":      "M5Stack AtomS3U",
+    "cardkb2":      "M5Stack CardKB2",
 }
 
 # idf_target/chip -> esptool-js / ESP Web Tools chipFamily string.
 CHIP_FAMILY = {
-    "esp32":   "ESP32",
-    "esp32c6": "ESP32-C6",
-    "esp32s3": "ESP32-S3",
+    "esp32":    "ESP32",
+    "esp32c6":  "ESP32-C6",
+    "esp32c61": "ESP32-C61",
+    "esp32s3":  "ESP32-S3",
 }
 
 # (BOARDS offset key, filename template) in flash order. Mate always ships a

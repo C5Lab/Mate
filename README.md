@@ -37,6 +37,7 @@ The WebClient translates these into UART commands to Monster and parses response
 | M5StickC PLUS2     | ESP32      | ST7789V2 135x240     | 8MB   |
 | AtomS3R Dev Kit    | ESP32-S3   | GC9107 128x128       | 8MB   |
 | Atom Lite          | ESP32-Pico | None                 | 4MB   |
+| CardKB2            | ESP32-C61  | None                 | 4MB   |
 
 ## ⚡ Quick Start
 
