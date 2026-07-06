@@ -43,7 +43,7 @@ LABELS = {
     "stickc-plus2": "M5StickC PLUS2",
     "sticks3":      "M5Stack StickS3",
     "atom-lite":    "M5Stack Atom Lite",
-    "atom-lite-c21_25": "M5Stack Atom Lite C21_25",
+    "atom-lite-c25_21": "M5Stack Atom Lite C25_21",
     "atom-matrix":  "M5Stack Atom Matrix",
     "coreink":      "M5Stack CoreInk",
     "atoms3u":      "M5Stack AtomS3U",

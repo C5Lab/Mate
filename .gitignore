@@ -5,3 +5,16 @@
 docs/firmware/
 docs/boards.json
 docs/manifest-*.json
+
+# Python bytecode (regenerated on every run; was accidentally tracked before).
+__pycache__/
+*.pyc
+
+# ccache store used by tools/build_all_cache.py (compiler cache; can be huge).
+.ccache/
+
+# Per-board build output, logs and isolated sdkconfigs
+# (tools/build_all.py / build_all_cache.py — transient, never committed).
+build-*/
+build-*.log
+sdkconfig.build-*

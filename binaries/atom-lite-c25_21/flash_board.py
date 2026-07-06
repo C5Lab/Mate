@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-flash_board.py – Mate firmware flasher for atom-lite-c21_25
+flash_board.py – Mate firmware flasher for atom-lite-c25_21
 Chip: esp32 | Flash: 4MB | Mode: dio @ 40m
 
 Auto-installs esptool and pyserial into a local .venv if needed.
@@ -28,7 +28,7 @@ YELLOW = "\033[93m"
 CYAN   = "\033[96m"
 RESET  = "\033[0m"
 
-BOARD         = "atom-lite-c21_25"
+BOARD         = "atom-lite-c25_21"
 CHIP          = "esp32"
 FLASH_SIZE    = "4MB"
 FLASH_MODE    = "dio"
@@ -41,10 +41,10 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 VENV_DIR   = os.environ.get("FLASH_BOARD_VENV", os.path.join(SCRIPT_DIR, ".venv"))
 
 FILES = {
-    "bootloader":      ("0x1000",   "bootloader-atom-lite-c21_25.bin"),
-    "partition-table": ("0x8000", "partition-table-atom-lite-c21_25.bin"),
-    "app":             ("0x10000",    "mate-atom-lite-c21_25.bin"),
-    "storage":         ("0x1D0000", "storage-atom-lite-c21_25.bin"),
+    "bootloader":      ("0x1000",   "bootloader-atom-lite-c25_21.bin"),
+    "partition-table": ("0x8000", "partition-table-atom-lite-c25_21.bin"),
+    "app":             ("0x10000",    "mate-atom-lite-c25_21.bin"),
+    "storage":         ("0x1D0000", "storage-atom-lite-c25_21.bin"),
 }
 
 # ---------------------------------------------------------------------------
@@ -186,7 +186,7 @@ def flash(port, baud, no_stub=False):
         if os.path.exists(full):
             cmd += [offset, full]
     mode = " (--no-stub @ %d)" % baud if no_stub else ""
-    print(f"{CYAN}Flashing atom-lite-c21_25{mode}...{RESET}")
+    print(f"{CYAN}Flashing atom-lite-c25_21{mode}...{RESET}")
     return subprocess.run(cmd).returncode
 
 def reset_to_app(port):

@@ -148,9 +148,9 @@ BOARDS = {
         "app_offset":         "0x10000",
         "spiffs_offset":      "0x1D0000",  # 0x10000 + 0x1C0000 (partitions_4mb.csv)
     },
-    "atom-lite-c21_25": {
+    "atom-lite-c25_21": {
         "idf_target":         "esp32",
-        "sdkconfig_defaults": "sdkconfig.defaults;sdkconfig.defaults.atom-lite-c21_25",
+        "sdkconfig_defaults": "sdkconfig.defaults;sdkconfig.defaults.atom-lite-c25_21",
         "chip":               "esp32",
         "flash_size":         "4MB",
         "flash_mode":         "dio",

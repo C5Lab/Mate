@@ -285,18 +285,6 @@ static void sniffer_results_clear(sniffer_results_t *r)
     r->empty        = false;
 }
 
-static void sniffer_results_free_buffers(sniffer_results_t *r)
-{
-    if (!r) return;
-    if (r->aps) {
-        for (int i = 0; i < r->count; i++) sniffer_ap_free(&r->aps[i]);
-        free(r->aps);
-        r->aps = NULL;
-    }
-    r->count = 0;
-    r->cap   = 0;
-}
-
 static bool sniffer_results_push_ap(sniffer_results_t *r, const parsed_sniffer_ap_t *ap)
 {
     if (!r || !ap) return false;

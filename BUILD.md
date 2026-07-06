@@ -24,7 +24,7 @@ partition layout, display driver, and Grove UART pins — all selected through
 | `stickc-plus2` | ESP32            | 8 MB  | ST7789V2 135×240   | 32 / 33            | Bootloader @ 0x1000            |
 | `sticks3`      | ESP32-S3         | 8 MB  | ST7789P3 135×240   | 9 / 10             | M5PM1 PMIC (5V boost + L3B)    |
 | `atom-lite`    | ESP32-PICO-D4    | 4 MB  | —                  | 26 / 32            | Defaults to no-stub @ 115200   |
-| `atom-lite-c21_25` | ESP32-PICO-D4 | 4 MB  | —                  | 21 / 25            | C21_25 variant; no-stub @ 115200 |
+| `atom-lite-c25_21` | ESP32-PICO-D4 | 4 MB  | —                  | 25 / 21            | C25_21 variant; no-stub @ 115200 |
 | `atom-matrix`  | ESP32-PICO-D4    | 4 MB  | —                  | 26 / 32            | 5×5 RGB LED (no LCD); no-stub   |
 | `coreink`      | ESP32            | 4 MB  | GDEW0154M09 200×200| 32 / 33            | E-paper; bootloader @ 0x1000    |
 | `atoms3u`      | ESP32-S3FN8      | 8 MB  | —                  | 2 / 1              | No display (USB stick, mic)     |
@@ -121,6 +121,112 @@ Requirements:
 > A **subset build** (`--targets ...`) only clears the targeted boards'
 > subdirectories, leaving siblings intact. Either way, don't store hand-made
 > files under `binaries/` — keep tooling in `tools/`.
+
+### Method A+ — `tools/build_all_cache.py` (fast local builds: ccache + target lanes)
+
+Same output as `build_all.py`, but built for **fast local/repeat builds**. On a
+24-core / 96 GB box the full 13-board matrix dropped from **1140 s → 301 s
+(3.8×)**, and a repeat build of a single board from **53 s → 32 s** at **100 %
+ccache hits**:
+
+| stage | full matrix | ccache |
+|---|---|---|
+| `build_all.py` (reference) | 1140 s | — |
+| + in-container build dir + named-volume cache | 486 s | 0 % |
+| + working ccache (siblings, single run) | 368 s | 77 % |
+| **+ working ccache (warm repeat)** | **301 s** | **100 %** |
+
+Getting there took **four** fixes stacked on top of each other — the naive "just
+add ccache and build N boards in parallel" gets a flat **0 % hit rate**, and each
+fix below only reveals the next. If you touch this script, keep all four.
+
+```bash
+python tools/build_all_cache.py                 # all boards, auto lanes, ccache
+python tools/build_all_cache.py -n 3            # up to 3 target-lanes at once
+python tools/build_all_cache.py -n 2 --targets cores3,atoms3,nanoc6,xiao-c6
+python tools/build_all_cache.py --ccache-max 30G --build-cpus 8 --verbose
+```
+
+#### How ccache is keyed (and how it gets busted)
+
+ccache reuses a compiled object when its key — **preprocessed source + compiler
+identity + the compiler arguments** — matches a previous compile. Four things
+silently broke that key here; each was hidden behind the previous one:
+
+1. **Per-board build directory.** Building board `X` into `build-X/` puts
+   `-I build-X/config` on the command line; board `Y` uses `-I build-Y/config`.
+   Different args → different cache key → **every file misses**, even when the
+   `.c` is byte-identical. This is why the first attempt saw `0 hits / 11950`.
+
+   **Fix:** build inside the container at a **fixed path** `/tmp/idfbuild` for
+   *every* board. Identical `-I` across boards → same-target siblings share the
+   cache. Bonus: the build tree lives on the container's fast fs instead of the
+   slow Windows bind mount, so builds are quicker too. The 4 images + sdkconfig
+   are copied out to `binaries/<board>/` at the end.
+
+2. **Same target compiled concurrently.** If two `esp32c6` boards compile at the
+   same moment they **both miss** — neither's objects are cached yet. And two
+   *different* targets never share a cache anyway (different arch/flags).
+
+   **Fix — target lanes:** group boards by `idf_target`. Boards of the **same
+   target run sequentially** (board 1 primes the cache, boards 2..N are near-full
+   hits); **different targets run in parallel** (up to `-n` lanes). For this
+   matrix that's 3 lanes (`esp32`, `esp32c6`, `esp32s3`).
+
+3. **Direct-mode header hashing** (the sneaky one — kept ccache at 0 % even after
+   fixes 1 & 2). ccache's default *direct mode* hashes the full **content** of
+   every included header, and nearly every ESP-IDF source includes the
+   **per-board `sdkconfig.h`** (different `CONFIG_JANOS_BOARD_*`, UART pins, …) —
+   so even same-target siblings miss on ~every file.
+
+   **Fix:** run ccache in **preprocessor mode** (`CCACHE_NODIRECT=1`). It hashes
+   the *preprocessed* output instead, so a file that includes `sdkconfig.h` but
+   doesn't reference the board-specific `CONFIG_JANOS_*` defines produces
+   identical output across same-target boards → hit. Only the handful of files
+   in `main/` that actually read those defines miss (correctly).
+   `CCACHE_SLOPPINESS=time_macros` stops `__DATE__`/`__TIME__` from busting it.
+
+4. **Compiler hashed by mtime, on a bind-mounted toolchain** (the sneakiest —
+   kept it at 0 % even after fixes 1–3, *including* on an identical rebuild of
+   the *same* board). ccache's default `compiler_check = mtime` folds the
+   compiler binary's mtime into the key. The IDF toolchain lives on the
+   bind-mounted `.espressif/` (Windows), and virtiofs reports an **unstable
+   mtime across container instances** — so every `docker run` got a fresh key
+   and missed everything.
+
+   **Fix:** `CCACHE_COMPILERCHECK=content` — hash the compiler's *content*, which
+   is stable across containers. This is what finally flipped a repeat build to
+   **100 % hits (53 s → 32 s** for one board). Diagnosis trick: if `ccache -s`
+   shows 0 hits even when you build the *same* target twice, it's almost always
+   `compiler_check`.
+
+Before any concurrency, one board is built as a **warmup** (sequential) to
+populate the shared component-manager cache (`managed_components/` +
+`dependencies.lock`) so the parallel lanes only *read* it.
+
+#### What to expect
+
+- **First board of each target = cold** (full compile). Every sibling after it
+  in the lane = mostly cache hits → much faster.
+- The run prints a live `[n/13] ✓/✗` counter and a ccache summary at the end
+  (`ccache: 71 % hit (…) · 1.9/20 GiB`). Stats are **per-run** (`ccache -z` at
+  start). `-n` = max concurrent lanes (default: number of distinct targets);
+  `--build-cpus` auto-splits CPUs across lanes (`~ncpu/lanes`).
+- `--no-docker` keeps the per-board build-dir path (for CI, where each board is
+  a separate runner and cross-board sharing doesn't apply).
+
+The ccache store lives in a **Docker named volume** `mate_ccache` (not a
+bind-mounted `.ccache/` — bind-mounting a Windows dir makes ccache *store* but
+never *hit*, because virtiofs breaks its atomic lookups; the named volume is on
+ext4 in the WSL2 VM where ccache works and is faster). Inspect/clear it with
+`docker volume inspect mate_ccache` / `docker volume rm mate_ccache`. Per-board
+logs are `build-<board>.log`, isolated configs `sdkconfig.build-*` (both
+git-ignored). `--no-docker` uses the host `.ccache/` instead.
+
+> `build_all.py` (the plain one) is still the reference for CI and clean
+> reproducible artifacts. `build_all_cache.py` is the local speed tool — it
+> imports the board matrix + helpers from `build_all.py`, so there's one source
+> of truth.
 
 ### Method B — local `idf.py` (fast single-board iteration)
 
@@ -239,7 +345,7 @@ python -m esptool --chip esp32s3 -p COM13 -b 460800 \
   0x3d0000 storage-sticks3.bin
 ```
 
-> Classic-ESP32 boards (`stickc-plus2`, `atom-lite`, `atom-lite-c21_25`) place the bootloader at
+> Classic-ESP32 boards (`stickc-plus2`, `atom-lite`, `atom-lite-c25_21`) place the bootloader at
 > **0x1000**, not 0x0. The per-board flasher handles this automatically.
 
 ### Output layout
