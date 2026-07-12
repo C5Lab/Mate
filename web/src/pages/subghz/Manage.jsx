@@ -3,6 +3,7 @@ import { Layout } from '../../components/Layout';
 import { api } from '../../api';
 import { showToast } from '../../components/Toast';
 import { wsAddListener } from '../../ws';
+import { fetchSubghzListAfterRefresh } from '../../subghzUtil';
 
 export function SubGhzManage() {
   const [signals, setSignals] = useState([]);
@@ -14,9 +15,8 @@ export function SubGhzManage() {
   async function refresh() {
     setLoading(true);
     try {
-      const cached = await api.subghzList();
-      if (cached.ok) setSignals(cached.signals || []);
-      await api.subghzListRefresh();
+      const res = await fetchSubghzListAfterRefresh('sd');
+      if (res.ok) setSignals(res.signals || []);
     } catch (e) {
       showToast('Failed to load signals', 'error');
     } finally {
@@ -47,7 +47,7 @@ export function SubGhzManage() {
       setImportCount(0);
       /* Backend also auto-refreshes, but trigger from here too as a safety
        * net so the table never gets stuck on the old contents. */
-      api.subghzListRefresh().catch(() => {});
+      api.subghzListRefresh('sd').catch(() => {});
     } else if (msg.type === 'subghz_export_done') {
       showToast('Export complete', 'success');
       setBusy(null);
@@ -59,7 +59,7 @@ export function SubGhzManage() {
     if (res.ok) {
       showToast(`Deleted #${idx}`, 'success');
       setBusy('list');
-      await api.subghzListRefresh();
+      await api.subghzListRefresh('sd');
     } else {
       showToast(res.error || 'Delete failed', 'error');
     }
@@ -69,10 +69,9 @@ export function SubGhzManage() {
     setConfirmClear(false);
     const res = await api.subghzClear();
     if (res.ok) {
-      showToast('All signals cleared', 'success');
-      setSignals([]);
+      showToast('Captured (RAM) signals cleared', 'success');
       setBusy('list');
-      await api.subghzListRefresh();
+      await api.subghzListRefresh('sd');
     } else {
       showToast(res.error || 'Clear failed', 'error');
     }
@@ -106,13 +105,11 @@ export function SubGhzManage() {
         <div class="btn-row">
           <button class="btn btn-info" onClick={doExport} disabled={busy === 'export'}>
             {busy === 'export' ? <span class="spinner" /> : null}
-            {busy === 'export' ? 'Exporting...' : 'Export All to SD'}
+            {busy === 'export' ? 'Saving...' : 'Save Captured to SD'}
           </button>
           <button class="btn btn-success" onClick={doImport} disabled={busy === 'import'}>
             {busy === 'import' ? <span class="spinner" /> : null}
-            {busy === 'import'
-              ? `Importing... (${importCount})`
-              : 'Import All from SD'}
+            {busy === 'import' ? 'Reloading...' : 'Reload SD Library'}
           </button>
         </div>
       </section>
@@ -168,7 +165,7 @@ export function SubGhzManage() {
               </table>
             </div>
             <button class="btn btn-danger btn-block" onClick={() => setConfirmClear(true)}>
-              Clear All Signals
+              Clear Captured (RAM)
             </button>
           </>
         ) : (
@@ -182,9 +179,9 @@ export function SubGhzManage() {
         <div class="settings-overlay" onClick={() => setConfirmClear(false)}>
           <section class="glass-card settings-panel" onClick={(e) => e.stopPropagation()}>
             <div class="section-head">
-              <h3 class="section-title">Clear All Signals?</h3>
+              <h3 class="section-title">Clear Captured (RAM)?</h3>
             </div>
-            <p>This will permanently remove all captured signals from device memory.</p>
+            <p>This clears the volatile capture buffer (RAM) only. Signals already saved to the SD library are kept.</p>
             <div class="btn-row">
               <button class="btn btn-soft" onClick={() => setConfirmClear(false)}>Cancel</button>
               <button class="btn btn-danger" onClick={clearAll}>Clear All</button>

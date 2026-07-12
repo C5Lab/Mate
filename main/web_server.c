@@ -146,7 +146,7 @@ static esp_err_t cw_finish(chunked_writer_t *cw)
 
 /* ---------- WS send queue (decouples UART task from httpd) ---------- */
 
-#define WS_QUEUE_SIZE  16
+#define WS_QUEUE_SIZE  32
 #define WS_MSG_MAX_LEN 2048
 
 /* Queue stores a heap-allocated pointer — only 8 bytes per slot (16 slots = 128 bytes).
@@ -1057,9 +1057,16 @@ static esp_err_t api_subghz_post(httpd_req_t *req)
             ok = cmd_do_subghz_tx_preset(preset);
         } else {
             int idx = 0;
+            char source[8] = {0};
             json_get_int(body, "\"index\"", &idx);
-            ok = cmd_do_subghz_tx(idx);
+            json_get_string(body, "\"source\"", source, sizeof(source));
+            ok = cmd_do_subghz_tx(idx, source[0] ? source : NULL);
         }
+    }
+    else if (strstr(uri, "/save")) {
+        int idx = 0;
+        json_get_int(body, "\"index\"", &idx);
+        ok = cmd_do_subghz_save(idx);
     }
     else if (strstr(uri, "/delete")) {
         int idx = 0;
@@ -1076,7 +1083,9 @@ static esp_err_t api_subghz_post(httpd_req_t *req)
         ok = cmd_do_subghz_import();
     }
     else if (strstr(uri, "/list/refresh")) {
-        ok = cmd_do_subghz_list_refresh();
+        char source[8] = {0};
+        json_get_string(body, "\"source\"", source, sizeof(source));
+        ok = cmd_do_subghz_list_refresh(source[0] ? source : NULL);
     }
 
     if (ok) {
@@ -1131,6 +1140,22 @@ static esp_err_t api_subghz_list_get(httpd_req_t *req)
     cw_printf(&cw, "]}");
     free(sigs);
     return cw_finish(&cw);
+}
+
+/* Live RSSI fallback for the Listen waterfall: the WS `subghz_rssi` stream
+ * is the primary path, but this lets the UI poll the latest sample so the
+ * waterfall keeps advancing even if the WS is momentarily unavailable. The
+ * `seq` lets the client draw only genuinely new samples. */
+static esp_err_t api_subghz_rssi_get(httpd_req_t *req)
+{
+    int rssi = 0;
+    uint32_t seq = 0;
+    cmd_get_subghz_rssi(&rssi, &seq);
+    char buf[64];
+    snprintf(buf, sizeof(buf),
+             "{\"ok\":true,\"seq\":%u,\"rssi\":%d}", (unsigned)seq, rssi);
+    send_json(req, buf);
+    return ESP_OK;
 }
 
 /* ---------- Root / SPA handler ---------- */
@@ -1213,7 +1238,14 @@ esp_err_t web_server_start(void)
      * comfortable headroom. */
     config.stack_size       = 8192;
     config.max_uri_handlers = 32;
-    config.max_open_sockets = 7;
+    /* LWIP allows 16 sockets (CONFIG_LWIP_MAX_SOCKETS=16). The send-only
+     * WebSocket registers no recv activity, so with a tight cap + LRU purge
+     * it becomes the eviction victim whenever the browser opens short-lived
+     * HTTP polls (status/dashboard/subghz-list) — killing every broadcast
+     * (stuck Last RSSI, blank waterfall, Transmit needing a manual refresh).
+     * 12 leaves headroom for the WS plus concurrent HTTP without starving
+     * lwip internals. */
+    config.max_open_sockets = 12;
     config.lru_purge_enable = true;
     config.recv_wait_timeout  = 10;
     config.send_wait_timeout  = 10;
@@ -1297,6 +1329,7 @@ esp_err_t web_server_start(void)
     REGISTER_URI("/api/status",        HTTP_GET,  api_status_get);
     REGISTER_URI("/api/dashboard",     HTTP_GET,  api_dashboard_get);
     REGISTER_URI("/api/subghz/list",   HTTP_GET,  api_subghz_list_get);
+    REGISTER_URI("/api/subghz/rssi",   HTTP_GET,  api_subghz_rssi_get);
     REGISTER_URI("/api/subghz/*",      HTTP_POST, api_subghz_post);
 
     /* Captive portal detection endpoints */

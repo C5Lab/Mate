@@ -1,8 +1,14 @@
-import { useEffect, useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 import { Layout } from '../../components/Layout';
 import { api } from '../../api';
 import { showToast } from '../../components/Toast';
 import { wsAddListener } from '../../ws';
+import { fetchSubghzListAfterRefresh } from '../../subghzUtil';
+
+// If the WS `subghz_tx_done` confirmation is lost, resolve the "Sending..."
+// status after this long so the UI never gets stuck. A replay is a short
+// burst, so a few seconds is plenty.
+const TX_CONFIRM_TIMEOUT_MS = 4000;
 
 export function SubGhzTransmit() {
   const [signals, setSignals] = useState([]);
@@ -10,16 +16,20 @@ export function SubGhzTransmit() {
   const [confirm, setConfirm] = useState(null);
   const [status, setStatus] = useState('Idle');
 
+  // Track the in-flight TX so the WS confirmation and the timeout fallback
+  // don't race, and so a stale confirmation can't clobber a newer send.
+  const pendingTxRef = useRef(null);
+  const txTimerRef = useRef(null);
+
   async function load() {
     setLoading(true);
     try {
-      const cached = await api.subghzList();
-      if (cached.ok) {
-        setSignals(cached.signals || []);
+      const res = await fetchSubghzListAfterRefresh('sd');
+      if (res.ok) {
+        setSignals(res.signals || []);
       } else {
-        showToast(cached.error || 'list fetch failed', 'error');
+        showToast(res.error || 'list fetch failed', 'error');
       }
-      await api.subghzListRefresh();
     } catch (e) {
       showToast('Failed to load signals', 'error');
     } finally {
@@ -31,25 +41,51 @@ export function SubGhzTransmit() {
     load();
   }, []);
 
-  useEffect(() => wsAddListener((msg) => {
-    if (msg.type === 'subghz_list_end') {
-      api.subghzList().then((res) => {
-        if (res.ok) setSignals(res.signals || []);
-      });
-    } else if (msg.type === 'subghz_tx_done') {
-      setStatus(`Transmitted #${msg.idx}`);
-      showToast(`TX done #${msg.idx}`, 'success');
-    }
-  }), []);
+  useEffect(() => {
+    const removeWs = wsAddListener((msg) => {
+      if (msg.type === 'subghz_list_end') {
+        api.subghzList().then((res) => {
+          if (res.ok) setSignals(res.signals || []);
+        });
+      } else if (msg.type === 'subghz_tx_done') {
+        if (txTimerRef.current) {
+          clearTimeout(txTimerRef.current);
+          txTimerRef.current = null;
+        }
+        pendingTxRef.current = null;
+        setStatus(`Transmitted #${msg.idx}`);
+        showToast(`TX done #${msg.idx}`, 'success');
+      }
+    });
+    return () => {
+      removeWs();
+      if (txTimerRef.current) clearTimeout(txTimerRef.current);
+    };
+  }, []);
 
   async function transmit(idx) {
     setConfirm(null);
-    const res = await api.subghzTx(idx);
-    if (res.ok) {
-      setStatus(`Sending #${idx}...`);
-    } else {
-      showToast(res.error || 'TX failed', 'error');
+    if (txTimerRef.current) {
+      clearTimeout(txTimerRef.current);
+      txTimerRef.current = null;
     }
+    const res = await api.subghzTx(idx, 'sd');
+    if (!res.ok) {
+      pendingTxRef.current = null;
+      showToast(res.error || 'TX failed', 'error');
+      return;
+    }
+    setStatus(`Sending #${idx}...`);
+    pendingTxRef.current = idx;
+    // Fallback: the command was accepted by the host; if the WS confirmation
+    // never arrives, don't leave the UI stuck on "Sending...".
+    txTimerRef.current = setTimeout(() => {
+      if (pendingTxRef.current === idx) {
+        pendingTxRef.current = null;
+        txTimerRef.current = null;
+        setStatus(`Sent #${idx}`);
+      }
+    }, TX_CONFIRM_TIMEOUT_MS);
   }
 
   return (

@@ -263,29 +263,41 @@ bool cmd_do_subghz_listen(float freq_mhz, bool raw);
 /** Start jammer on the given frequency (MHz). */
 bool cmd_do_subghz_jam(float freq_mhz);
 
-/** Transmit a stored signal by 1-based index. */
-bool cmd_do_subghz_tx(int index);
+/** Transmit a stored signal by 1-based index from the given source
+ *  ("mem" volatile cache or "sd" persistent library). NULL/invalid → "sd". */
+bool cmd_do_subghz_tx(int index, const char *source);
 
 /** Transmit a named preset (e.g. "tesla"). Sets the preset's freq first if known. */
 bool cmd_do_subghz_tx_preset(const char *preset);
 
-/** Delete a stored signal by 1-based index. */
+/** Delete a stored signal by 1-based index (SD library only). */
 bool cmd_do_subghz_delete(int index);
 
-/** Clear all stored signals. */
+/** Clear the volatile (mem) capture cache. The SD library is untouched. */
 bool cmd_do_subghz_clear(void);
 
-/** Export all stored signals to SD card. */
+/** Promote all volatile (mem) captures into the persistent SD library
+ *  (`subghz_save all`). */
 bool cmd_do_subghz_export(void);
 
-/** Import all signals from SD card. */
+/** Promote a single volatile (mem) capture to the SD library by 1-based
+ *  mem index (`subghz_save <index>`). Works during an active listen. */
+bool cmd_do_subghz_save(int index);
+
+/** Reload the SD library view (kept for the legacy "Import from SD" button). */
 bool cmd_do_subghz_import(void);
 
-/** Refresh the cached signals list from the device. */
-bool cmd_do_subghz_list_refresh(void);
+/** Refresh the cached signals list from the device for the given source
+ *  ("mem" or "sd"). NULL/invalid → "sd". */
+bool cmd_do_subghz_list_refresh(const char *source);
 
 /** Get cached SubGHZ signals. */
 int cmd_get_subghz_signals(subghz_signal_t *out, int max);
 
 /** Number of cached SubGHZ signals (cheap getter for sizing buffers). */
 int cmd_get_subghz_count(void);
+
+/** Latest RSSI sample + a monotonic sequence number from an active
+ *  `subghz_rx`. Lets the Listen waterfall poll RSSI over HTTP as a
+ *  fallback when the WebSocket is unavailable. Either arg may be NULL. */
+void cmd_get_subghz_rssi(int *rssi_out, uint32_t *seq_out);

@@ -82,6 +82,12 @@ static bool                 s_wifi_connect_saw_failure = false;
 static dynvec_t             s_subghz_signals; /* subghz_signal_t */
 static dynvec_t             s_subghz_build;   /* subghz_signal_t */
 static int                  s_subghz_import_count = 0;
+/* Latest RSSI sample from an active `subghz_rx`, cached so the Listen
+ * waterfall can poll it over HTTP as a fallback when the WS is flapping.
+ * `s_subghz_rssi_seq` increments on every new sample so the UI only draws
+ * a column when the value actually changed. */
+static int                  s_subghz_last_rssi = 0;
+static uint32_t             s_subghz_rssi_seq = 0;
 /* Discovered hosts from `list_hosts` (ARP attack). Cached on the device so
  * the web UI can poll for them even if the WS dropped during the discovery
  * burst (e.g. after the softAP channel hops to follow the STA). */
@@ -810,12 +816,23 @@ static void parse_subghz_rx_fields(const char *data, subghz_signal_t *out)
             snprintf(out->type, sizeof(out->type), "RAW");
         }
     }
-    /* mf=... runs to end-of-line (or up to " te=") so spaced manufacturer
-     * names like "BENINCA TO.GO" survive intact. */
+    /* mf=... may contain spaces (e.g. "BENINCA TO.GO"), so it can't be read
+     * with %s. It runs until the next " <key>=" token or end-of-line. JanOS
+     * emits mf in varying positions and now appends ` cnt=`/`name=` after it,
+     * so bound against every field that can legitimately follow mf rather
+     * than only " te=" (otherwise mf captures "- cnt=0 name=..."). */
     if ((p = strstr(data, "mf="))) {
         p += 3;
-        const char *te = strstr(p, " te=");
-        size_t n = te ? (size_t)(te - p) : strlen(p);
+        static const char *const mf_delims[] = {
+            " te=", " cnt=", " name=", " learn=", " proto=",
+            " id=", " serial=", " btn=", " bits=", " freq=", " edges=",
+        };
+        const char *end = p + strlen(p);
+        for (size_t d = 0; d < sizeof(mf_delims) / sizeof(mf_delims[0]); d++) {
+            const char *hit = strstr(p, mf_delims[d]);
+            if (hit && hit < end) end = hit;
+        }
+        size_t n = (size_t)(end - p);
         /* Trim trailing CR/LF/space */
         while (n > 0 && (p[n - 1] == '\r' || p[n - 1] == '\n' || p[n - 1] == ' ')) n--;
         if (n >= sizeof(out->mf)) n = sizeof(out->mf) - 1;
@@ -867,7 +884,32 @@ static bool handle_subghz_event_line(const char *line)
         }
         s_last_rssi_ms = now_ms;
         int rssi = atoi(m + 13);
-        broadcast_json("{\"type\":\"subghz_rssi\",\"rssi\":%d}", rssi);
+        s_subghz_last_rssi = rssi;
+        s_subghz_rssi_seq++;
+        broadcast_json("{\"type\":\"subghz_rssi\",\"rssi\":%d,\"seq\":%u}",
+                       rssi, (unsigned)s_subghz_rssi_seq);
+        return true;
+    }
+
+    /* [SUBGHZ_RX_DROP] fires for every burst the noise gate rejects — on a
+     * noisy band or a clone CC1101 that is many times per second. It carries
+     * no GUI value, so consume it here. Crucially this stops it from reaching
+     * broadcast_uart_line(): otherwise the flood saturates the 16-deep WS
+     * queue and the throttled [SUBGHZ_RSSI] / [SUBGHZ_RX] frames get dropped,
+     * which is exactly why the Listen waterfall stays blank and the captured
+     * count never moves even though the RX events show up on the UART log. */
+    if (strstr(line, "[SUBGHZ_RX_DROP]") != NULL) {
+        return true;
+    }
+
+    /* Decode-sideband lines that precede [SUBGHZ_RX] — verbose only, not
+     * meant for GUI parsing. Dropping them here keeps the WS queue headroom
+     * for subghz_rssi / subghz_rx during an active listen. */
+    if (strstr(line, "[KL_DEC]") != NULL ||
+        strstr(line, "[KAT_RX]") != NULL ||
+        strstr(line, "[REPLAY_SEG]") != NULL ||
+        strstr(line, "[REPLAY]") != NULL ||
+        strstr(line, "SubGHz: key saved") != NULL) {
         return true;
     }
 
@@ -927,6 +969,44 @@ static bool handle_subghz_event_line(const char *line)
         const char *p = strstr(m, "idx=");
         if (p) idx = atoi(p + 4);
         broadcast_json("{\"type\":\"subghz_tx_done\",\"idx\":%d}", idx);
+        return true;
+    }
+
+    /* Per-entry save result. Emitted by both `subghz_save <idx>` (inline
+     * Save-to-SD on the Listen page) and `subghz_save all` (Manage export).
+     * Handled state-independently so the Listen page gets feedback while RX
+     * is still running. NOTE: only the per-entry `[SUBGHZ_SAVE]` line is
+     * consumed here — `[SUBGHZ_SAVE_END]` is intentionally left to fall
+     * through to the STATE_SUBGHZ_EXPORT FSM handler which needs it to
+     * finish the "save all" flow. */
+    if ((m = strstr(line, "[SUBGHZ_SAVE] ")) != NULL) {
+        int idx = 0;
+        const char *p = strstr(m, "idx=");
+        if (p) idx = atoi(p + 4);
+        char name[64] = {0};
+        const char *np = strstr(m, "name=");
+        if (np) {
+            np += 5;
+            size_t n = strlen(np);
+            while (n > 0 && (np[n - 1] == '\r' || np[n - 1] == '\n' || np[n - 1] == ' ')) n--;
+            if (n >= sizeof(name)) n = sizeof(name) - 1;
+            memcpy(name, np, n);
+            name[n] = '\0';
+        }
+        broadcast_json("{\"type\":\"subghz_save_done\",\"idx\":%d,\"name\":\"%s\"}",
+                       idx, name);
+        return true;
+    }
+
+    if ((m = strstr(line, "[SUBGHZ_SAVE_ERR]")) != NULL) {
+        int idx = 0;
+        const char *p = strstr(m, "idx=");
+        if (p) idx = atoi(p + 4);
+        char reason[32] = {0};
+        const char *rp = strstr(m, "reason=");
+        if (rp) sscanf(rp, "reason=%31s", reason);
+        broadcast_json("{\"type\":\"subghz_save_err\",\"idx\":%d,\"reason\":\"%s\"}",
+                       idx, reason);
         return true;
     }
 
@@ -1520,7 +1600,18 @@ static void on_uart_line(const char *line, void *ctx)
     case STATE_SUBGHZ_LIST: {
         /* [SUBGHZ_LIST] / [SUBGHZ_LIST_END] are handled in
          * handle_subghz_event_line so they work regardless of state.
-         * Nothing else interesting can arrive while a list is in flight. */
+         *
+         * If JanOS rejects the list (e.g. a bad/missing `<mem|sd>` source
+         * prints "Usage: subghz_list ..." + a CLI prompt and NO
+         * [SUBGHZ_LIST_END]), fall back to the prompt so we don't wedge the
+         * whole SubGHz subsystem in STATE_SUBGHZ_LIST — that would block the
+         * next listen/tx/list until the 8s silence timeout, which never
+         * fires while an RX flood keeps the UART busy. */
+        if (is_prompt_line(line)) {
+            xSemaphoreTake(s_mutex, portMAX_DELAY);
+            if (s_state == STATE_SUBGHZ_LIST) s_state = STATE_IDLE;
+            xSemaphoreGive(s_mutex);
+        }
         break;
     }
 
@@ -1544,10 +1635,10 @@ static void on_uart_line(const char *line, void *ctx)
                 broadcast_json("{\"type\":\"subghz_import_done\",\"count\":%d}",
                                s_subghz_import_count);
             }
-            /* Auto-refresh the in-memory list from JanOS so the Manage table
-             * shows imported entries without the frontend having to chase
-             * another round-trip. */
-            cmd_do_subghz_list_refresh();
+            /* Auto-refresh the SD library so the Manage table shows the
+             * imported entries without the frontend chasing another
+             * round-trip. */
+            cmd_do_subghz_list_refresh("sd");
             break;
         }
         if (strstr(line, "[SUBGHZ_IMPORT]")) {
@@ -1559,11 +1650,17 @@ static void on_uart_line(const char *line, void *ctx)
     }
 
     case STATE_SUBGHZ_EXPORT: {
-        if (strstr(line, "[SUBGHZ_EXPORT_END]") || is_prompt_line(line)) {
+        /* `subghz_save all` finishes on [SUBGHZ_SAVE_END]; accept the legacy
+         * [SUBGHZ_EXPORT_END] and a bare prompt as fallbacks. */
+        if (strstr(line, "[SUBGHZ_SAVE_END]") ||
+            strstr(line, "[SUBGHZ_EXPORT_END]") ||
+            is_prompt_line(line)) {
             xSemaphoreTake(s_mutex, portMAX_DELAY);
             if (s_state == STATE_SUBGHZ_EXPORT) s_state = STATE_IDLE;
             xSemaphoreGive(s_mutex);
             broadcast_json("{\"type\":\"subghz_export_done\"}");
+            /* Reflect the freshly-saved entries in the SD library view. */
+            cmd_do_subghz_list_refresh("sd");
         }
         break;
     }
@@ -2318,11 +2415,21 @@ bool cmd_do_subghz_jam(float freq_mhz)
     return true;
 }
 
-bool cmd_do_subghz_tx(int index)
+/* JanOS commands that touch a stored signal (list / tx / info) require an
+ * explicit storage source. Normalize whatever the frontend sent to exactly
+ * "mem" or "sd"; anything unrecognized (or NULL) falls back to "sd", the
+ * persistent library the Transmit/Manage pages are built around. */
+static const char *subghz_norm_source(const char *source)
+{
+    if (source && strcmp(source, "mem") == 0) return "mem";
+    return "sd";
+}
+
+bool cmd_do_subghz_tx(int index, const char *source)
 {
     if (index <= 0) return false;
-    char cmd[32];
-    snprintf(cmd, sizeof(cmd), "subghz_tx %d", index);
+    char cmd[40];
+    snprintf(cmd, sizeof(cmd), "subghz_tx %d %s", index, subghz_norm_source(source));
     if (s_display_cb) s_display_cb(cmd, NULL);
     uart_bridge_send(cmd);
     return true;
@@ -2361,22 +2468,37 @@ bool cmd_do_subghz_clear(void)
 
 bool cmd_do_subghz_export(void)
 {
+    /* New JanOS API: promote every volatile (mem) capture into the
+     * persistent SD library. Replaces the removed `subghz_export all`. */
     if (!set_state_if_idle(STATE_SUBGHZ_EXPORT)) return false;
-    if (s_display_cb) s_display_cb("subghz_export all", NULL);
-    uart_bridge_send("subghz_export all");
+    if (s_display_cb) s_display_cb("subghz_save all", NULL);
+    uart_bridge_send("subghz_save all");
+    return true;
+}
+
+bool cmd_do_subghz_save(int index)
+{
+    /* Promote a single volatile (mem) capture to the SD library. NOT
+     * idle-gated (like subghz_tx) so the Listen page can save a signal
+     * without stopping RX; JanOS replies [SUBGHZ_SAVE]/[SUBGHZ_SAVE_ERR]
+     * which are handled state-independently in handle_subghz_event_line. */
+    if (index <= 0) return false;
+    char cmd[32];
+    snprintf(cmd, sizeof(cmd), "subghz_save %d", index);
+    if (s_display_cb) s_display_cb(cmd, NULL);
+    uart_bridge_send(cmd);
     return true;
 }
 
 bool cmd_do_subghz_import(void)
 {
-    if (!set_state_if_idle(STATE_SUBGHZ_IMPORT)) return false;
-    s_subghz_import_count = 0;
-    if (s_display_cb) s_display_cb("subghz_import all", NULL);
-    uart_bridge_send("subghz_import all");
-    return true;
+    /* There is no longer a distinct "import" step — the SD directory *is*
+     * the library. Treat the legacy button as a plain reload of the SD
+     * library so it stays useful instead of erroring on a dead command. */
+    return cmd_do_subghz_list_refresh("sd");
 }
 
-bool cmd_do_subghz_list_refresh(void)
+bool cmd_do_subghz_list_refresh(const char *source)
 {
     /* `subghz_list` is a cheap query — accept it even if the FSM is
      * still in STATE_SUBGHZ_LIST from a previous in-flight refresh, and
@@ -2403,8 +2525,10 @@ bool cmd_do_subghz_list_refresh(void)
     }
 
     dynvec_clear(&s_subghz_build);
-    if (s_display_cb) s_display_cb("subghz_list", NULL);
-    uart_bridge_send("subghz_list");
+    char cmd[24];
+    snprintf(cmd, sizeof(cmd), "subghz_list %s", subghz_norm_source(source));
+    if (s_display_cb) s_display_cb(cmd, NULL);
+    uart_bridge_send(cmd);
     return true;
 }
 
@@ -2418,4 +2542,10 @@ int cmd_get_subghz_signals(subghz_signal_t *out, int max)
 int cmd_get_subghz_count(void)
 {
     return (int)s_subghz_signals.count;
+}
+
+void cmd_get_subghz_rssi(int *rssi_out, uint32_t *seq_out)
+{
+    if (rssi_out) *rssi_out = s_subghz_last_rssi;
+    if (seq_out)  *seq_out  = s_subghz_rssi_seq;
 }

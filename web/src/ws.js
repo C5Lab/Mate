@@ -64,6 +64,23 @@ export function wsAddListener(fn) {
   };
 }
 
+/** Resolve when the next WS message with the given `type` arrives. */
+export function waitForWs(type, timeoutMs = 4000) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      remove();
+      reject(new Error(`ws timeout: ${type}`));
+    }, timeoutMs);
+    const remove = wsAddListener((msg) => {
+      if (msg.type === type) {
+        clearTimeout(timer);
+        remove();
+        resolve(msg);
+      }
+    });
+  });
+}
+
 export function wsIsConnected() {
   return socket && socket.readyState === 1;
 }
