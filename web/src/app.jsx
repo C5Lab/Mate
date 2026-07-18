@@ -104,8 +104,7 @@ export function App() {
           gpsFix: !!data.gps_fix,
           gpsLat: data.gps_lat || 0,
           gpsLon: data.gps_lon || 0,
-          sdFreeGb: data.sd_free_gb ?? -1,
-          sdTotalGb: data.sd_total_gb ?? -1,
+          sdPresent: data.sd_present ?? -1,
           staConnected: !!data.sta_connected,
           staSsid: data.sta_ssid || '',
         });
@@ -117,6 +116,9 @@ export function App() {
     syncStatus();
     syncDashboard();
     const pollStatusId = setInterval(syncStatus, 12000);
+    /* Refresh dashboard-only fields (handshake count, SD status, GPS) so they
+     * appear once the C5 link comes up, not just on the very first mount. */
+    const pollDashboardId = setInterval(syncDashboard, 15000);
 
     const removeWs = wsAddListener((msg) => {
       const st = getState();
@@ -193,6 +195,7 @@ export function App() {
 
     return () => {
       clearInterval(pollStatusId);
+      clearInterval(pollDashboardId);
       removeWs();
       removeSub();
     };

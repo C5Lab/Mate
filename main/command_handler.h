@@ -68,6 +68,12 @@ typedef enum {
     STATE_SUBGHZ_EXPORT,
 } cmd_state_t;
 
+/** Captured-password category (matches JanOS `show_pass [evil|portal]`). */
+typedef enum {
+    PW_KIND_EVIL = 0,
+    PW_KIND_PORTAL,
+} pw_kind_t;
+
 typedef struct {
     int   idx;
     char  type[16];
@@ -179,14 +185,17 @@ bool cmd_do_list_portals(void);
 /** Select an HTML portal file by index. */
 bool cmd_do_select_portal(int index);
 
-/** Request evil twin passwords. */
-bool cmd_do_list_passwords(void);
+/** Request captured passwords for the given category (evil twin / portal). */
+bool cmd_do_list_passwords(pw_kind_t kind);
 
 /** Request sniffer results. */
 bool cmd_do_sniffer_results(void);
 
-/** Request handshake file count from SD card. */
+/** Request handshake file listing (count + filenames) from SD card. */
 bool cmd_do_list_handshake_count(void);
+
+/** Probe SD card presence (`sd_status` -> SD_OK/SD_NONE). */
+bool cmd_do_sd_status(void);
 
 /** Request wardrive log files from SD card. */
 bool cmd_do_list_wardrive_logs(void);
@@ -204,9 +213,10 @@ const scan_results_t *cmd_get_scan_results(void);
 int cmd_get_portal_files(parsed_portal_file_t *out, int max);
 int cmd_get_portal_files_count(void);
 
-/** Copy up to `max` cached passwords into `out`; returns count copied. */
-int cmd_get_passwords(parsed_password_t *out, int max);
-int cmd_get_passwords_count(void);
+/** Copy up to `max` cached passwords of the given category into `out`;
+ *  returns count copied. */
+int cmd_get_passwords(pw_kind_t kind, parsed_password_t *out, int max);
+int cmd_get_passwords_count(pw_kind_t kind);
 
 /** Get cached network observer results. The returned pointer's `aps` array
  *  is heap-backed; per-AP client MACs live in `aps[i].clients` (flat,
@@ -215,6 +225,13 @@ const sniffer_results_t *cmd_get_sniffer_results(void);
 
 /** Get cached handshake .pcap count from SD card listing. */
 int cmd_get_handshake_count(void);
+
+/** Copy up to `max` cached handshake files into `out`; returns count copied. */
+int cmd_get_handshakes(parsed_portal_file_t *out, int max);
+int cmd_get_handshakes_count(void);
+
+/** SD card presence: 1 = present, 0 = absent, -1 = unknown (not probed yet). */
+int cmd_sd_present(void);
 
 /** Whether the initial handshake count fetch already completed at least once
  *  for this boot. Used to gate the dashboard auto-trigger to a one-shot. */

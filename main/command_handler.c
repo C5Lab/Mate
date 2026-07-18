@@ -50,8 +50,12 @@ static void broadcast_json(const char *fmt, ...)
 static scan_results_t       s_scan;
 static int                  s_scan_expected = -1;
 static dynvec_t             s_portals;        /* parsed_portal_file_t */
-static dynvec_t             s_passwords;      /* parsed_password_t */
-/* True once we've seen JanOS echo back our `show_pass evil` command. Until
+static dynvec_t             s_passwords_evil;   /* parsed_password_t (show_pass evil) */
+static dynvec_t             s_passwords_portal; /* parsed_password_t (show_pass portal) */
+/* Which category the in-flight STATE_LISTING_PASSWORDS reply belongs to, so
+ * the line parser routes rows to the right cache. Set in cmd_do_list_passwords. */
+static pw_kind_t            s_passwords_kind = PW_KIND_EVIL;
+/* True once we've seen JanOS echo back our `show_pass ...` command. Until
  * then, any incoming "> " prompt belongs to a *previous* command (commonly
  * select_networks fired right before us by the MITM flow) and must NOT be
  * treated as the end of our listing — otherwise STATE_LISTING_PASSWORDS
@@ -63,9 +67,27 @@ static sniffer_results_t    s_sniffer;
 static sniffer_results_t    s_sniffer_build;
 static bool                 s_sniffer_collecting = false;
 static int                  s_sniffer_ap_index = -1;
+/* Echo guards: while the sniffer attack runs, JanOS keeps emitting background
+ * "> Sniffer packet count: N" lines that is_prompt_line() would otherwise treat
+ * as the end of a `show_sniffer_results` / `list_probes` reply, prematurely
+ * finishing the snapshot with an empty buffer. Only honor a terminating prompt
+ * once we've seen the command echo. Reset when the command is (re)issued. */
+static bool                 s_sniffer_echo_seen = false;
+static bool                 s_probes_echo_seen = false;
 static int                  s_handshake_count = -1;
 static bool                 s_handshake_initial_done = false;
+/* Header guard for `list_dir` replies. JanOS echoes the command back as a
+ * "> list_dir ..." line, which is_prompt_line() treats as a CLI prompt; if we
+ * ended the listing there we'd flip to IDLE before any file rows arrive. Only
+ * start parsing (and only honor a terminating prompt) after the "Files in ..."
+ * header. */
+static bool                 s_handshake_header_seen = false;
+static bool                 s_wardrive_header_seen = false;
+static dynvec_t             s_handshakes;     /* parsed_portal_file_t */
 static dynvec_t             s_wardrive_logs;  /* parsed_portal_file_t */
+/* SD presence from `sd_status`: 1 present, 0 absent, -1 unknown. */
+static int                  s_sd_present = -1;
+static esp_timer_handle_t   s_keepalive_timer = NULL;
 static dynvec_t             s_probes;         /* parsed_probe_t */
 static dynvec_t             s_probes_build;   /* parsed_probe_t */
 static cmd_state_t          s_probe_resume_state = STATE_IDLE;
@@ -306,6 +328,7 @@ static void begin_sniffer_snapshot(void)
 {
     reset_sniffer_build();
     s_sniffer_collecting = true;
+    s_sniffer_echo_seen  = false;
 }
 
 /* ---------- ARP host cache helpers ---------- */
@@ -1098,6 +1121,13 @@ static void on_uart_line(const char *line, void *ctx)
         s_display_cb(NULL, line);
     }
 
+    /* `sd_status` reply is state-independent (SD_OK / SD_NONE on its own line). */
+    if (strstr(line, "SD_OK")) {
+        s_sd_present = 1;
+    } else if (strstr(line, "SD_NONE")) {
+        s_sd_present = 0;
+    }
+
     const char *gps = strstr(line, "GPS fix obtained:");
     if (!gps) gps = strstr(line, "GPS fix recovered:");
     if (gps) {
@@ -1249,6 +1279,10 @@ static void on_uart_line(const char *line, void *ctx)
         if (ev.type == ATTACK_EVENT_SNIFFER_COUNT) {
             s_sniffer.packet_count = ev.int_val;
             broadcast_json("{\"type\":\"sniffer_count\",\"count\":%d}", ev.int_val);
+            /* Background count lines arrive prompt-prefixed ("> Sniffer packet
+             * count: N"); stop here so they never reach the is_prompt_line
+             * check below and prematurely finish the snapshot. */
+            break;
         } else if (ev.type == ATTACK_EVENT_STOP_ACK) {
             s_sniffer_collecting = false;
             xSemaphoreTake(s_mutex, portMAX_DELAY);
@@ -1260,6 +1294,13 @@ static void on_uart_line(const char *line, void *ctx)
         if (s_sniffer_collecting) {
             parsed_sniffer_ap_t ap;
             char client[SNIFFER_CLIENT_LEN];
+
+            /* Only trust a terminating prompt once we've seen our command echo;
+             * a stray background "> " before that is not our result's end. */
+            if (!s_sniffer_echo_seen && strstr(line, "show_sniffer_results") != NULL) {
+                s_sniffer_echo_seen = true;
+                break;
+            }
 
             if (parse_sniffer_empty_line(line)) {
                 finish_sniffer_snapshot();
@@ -1292,7 +1333,7 @@ static void on_uart_line(const char *line, void *ctx)
                 break;
             }
 
-            if (is_prompt_line(line)) {
+            if (is_prompt_line(line) && s_sniffer_echo_seen) {
                 finish_sniffer_snapshot();
                 break;
             }
@@ -1484,8 +1525,14 @@ static void on_uart_line(const char *line, void *ctx)
         }
 
         parsed_password_t pw;
-        if (parse_password_line(line, &pw)) {
-            if (!dynvec_push(&s_passwords, &pw)) log_drop("passwords");
+        bool parsed = (s_passwords_kind == PW_KIND_PORTAL)
+                          ? parse_portal_password_line(line, &pw)
+                          : parse_password_line(line, &pw);
+        if (parsed) {
+            dynvec_t *dst = (s_passwords_kind == PW_KIND_PORTAL)
+                                ? &s_passwords_portal
+                                : &s_passwords_evil;
+            if (!dynvec_push(dst, &pw)) log_drop("passwords");
             break;
         }
 
@@ -1546,16 +1593,29 @@ static void on_uart_line(const char *line, void *ctx)
     }
 
     case STATE_LISTING_HANDSHAKES: {
-        const char *p = line;
-        while (*p == ' ') p++;
-        if (*p >= '0' && *p <= '9' && strstr(line, ".pcap") && !strstr(line, ".hccapx")) {
-            if (s_handshake_count < 0) s_handshake_count = 0;
-            s_handshake_count++;
+        /* Ignore the "> list_dir ..." echo; only parse after the header. */
+        if (strstr(line, "Files in ")) {
+            s_handshake_header_seen = true;
+            break;
         }
 
-        if ((strstr(line, "Found ") && strstr(line, "file(s) in")) || is_prompt_line(line)) {
+        if (s_handshake_header_seen) {
+            parsed_portal_file_t f;
+            if (parse_portal_file_line(line, &f)) {
+                if (!dynvec_push(&s_handshakes, &f)) log_drop("handshakes");
+                if (strstr(line, ".pcap") && !strstr(line, ".hccapx")) {
+                    if (s_handshake_count < 0) s_handshake_count = 0;
+                    s_handshake_count++;
+                }
+                break;
+            }
+        }
+
+        if ((strstr(line, "Found ") && strstr(line, "file(s) in")) ||
+            (s_handshake_header_seen && is_prompt_line(line))) {
             if (s_handshake_count < 0) s_handshake_count = 0;
             s_handshake_initial_done = true;
+            s_handshake_header_seen = false;
             xSemaphoreTake(s_mutex, portMAX_DELAY);
             s_state = STATE_IDLE;
             xSemaphoreGive(s_mutex);
@@ -1564,13 +1624,23 @@ static void on_uart_line(const char *line, void *ctx)
     }
 
     case STATE_LISTING_WARDRIVE: {
-        parsed_portal_file_t f;
-        if (parse_portal_file_line(line, &f)) {
-            if (!dynvec_push(&s_wardrive_logs, &f)) log_drop("wardrive_logs");
+        /* Ignore the "> list_dir ..." echo; only parse after the header. */
+        if (strstr(line, "Files in ")) {
+            s_wardrive_header_seen = true;
             break;
         }
 
-        if ((strstr(line, "Found ") && strstr(line, "file(s) in")) || is_prompt_line(line)) {
+        if (s_wardrive_header_seen) {
+            parsed_portal_file_t f;
+            if (parse_portal_file_line(line, &f)) {
+                if (!dynvec_push(&s_wardrive_logs, &f)) log_drop("wardrive_logs");
+                break;
+            }
+        }
+
+        if ((strstr(line, "Found ") && strstr(line, "file(s) in")) ||
+            (s_wardrive_header_seen && is_prompt_line(line))) {
+            s_wardrive_header_seen = false;
             xSemaphoreTake(s_mutex, portMAX_DELAY);
             s_state = STATE_IDLE;
             xSemaphoreGive(s_mutex);
@@ -1666,13 +1736,21 @@ static void on_uart_line(const char *line, void *ctx)
     }
 
     case STATE_LISTING_PROBES: {
+        /* Wait for the `list_probes` echo before honoring a prompt as the end
+         * of the reply. While the sniffer runs, background "> " lines would
+         * otherwise cut the listing short and swap in an empty buffer. */
+        if (!s_probes_echo_seen && strstr(line, "list_probes") != NULL) {
+            s_probes_echo_seen = true;
+            break;
+        }
+
         parsed_probe_t pr;
         if (parse_probe_line(line, &pr)) {
             if (!dynvec_push(&s_probes_build, &pr)) log_drop("probes_build");
             break;
         }
 
-        if (is_prompt_line(line)) {
+        if (is_prompt_line(line) && s_probes_echo_seen) {
             /* Swap so we don't leak the previous live cache; clear build. */
             dynvec_t tmp = s_probes;
             s_probes       = s_probes_build;
@@ -1696,11 +1774,27 @@ static void on_uart_line(const char *line, void *ctx)
 
     sync_display_status();
 
+    /* The sniffer emits "Sniffer packet count: N" every ~200ms; it is already
+     * delivered as a structured `sniffer_count` event, so skip the redundant
+     * raw uart_line here. Otherwise the flood doubles WS traffic and saturates
+     * the send queue, dropping rare frames like `sniffer_results_updated`. */
+    if (strstr(line, "Sniffer packet count:")) {
+        return;
+    }
+
     /* Forward raw line for non-structured lines (network CSV lines return early above) */
     broadcast_uart_line(line);
 }
 
 /* ---------- Public API ---------- */
+
+static void keepalive_timer_cb(void *arg)
+{
+    (void)arg;
+    if (cmd_get_state() == STATE_IDLE) {
+        uart_bridge_send("ping");
+    }
+}
 
 void cmd_handler_init(void)
 {
@@ -1715,9 +1809,11 @@ void cmd_handler_init(void)
      * Initial capacities are small but enough for the most common cases;
      * dynvec_push doubles on demand. */
     scan_clear();
-    dynvec_init(&s_portals,        sizeof(parsed_portal_file_t), 8);
-    dynvec_init(&s_passwords,      sizeof(parsed_password_t),    8);
-    dynvec_init(&s_wardrive_logs,  sizeof(parsed_portal_file_t), 8);
+    dynvec_init(&s_portals,          sizeof(parsed_portal_file_t), 8);
+    dynvec_init(&s_passwords_evil,   sizeof(parsed_password_t),    8);
+    dynvec_init(&s_passwords_portal, sizeof(parsed_password_t),    8);
+    dynvec_init(&s_handshakes,       sizeof(parsed_portal_file_t), 8);
+    dynvec_init(&s_wardrive_logs,    sizeof(parsed_portal_file_t), 8);
     dynvec_init(&s_probes,         sizeof(parsed_probe_t),       8);
     dynvec_init(&s_probes_build,   sizeof(parsed_probe_t),       8);
     dynvec_init(&s_subghz_signals, sizeof(subghz_signal_t),      8);
@@ -1727,6 +1823,20 @@ void cmd_handler_init(void)
     reset_sniffer_build();
 
     uart_bridge_register_line_cb(on_uart_line, NULL);
+
+    /* Keepalive: JanOS only chatters on its own during active work, so an
+     * otherwise-idle C5 would drop below the 15s "connected" window even
+     * though it's perfectly healthy. Ping it periodically while idle; the
+     * pong (or any reply) refreshes s_last_uart_ms. Skipped while a command
+     * is running so we never inject a stray "ping" mid-listing/attack. */
+    const esp_timer_create_args_t ka_args = {
+        .callback = keepalive_timer_cb,
+        .name     = "c5_keepalive",
+    };
+    if (esp_timer_create(&ka_args, &s_keepalive_timer) == ESP_OK) {
+        esp_timer_start_periodic(s_keepalive_timer, 5000000 /* 5s */);
+    }
+
     ESP_LOGI(TAG, "Command handler initialized");
 }
 
@@ -1800,16 +1910,18 @@ int cmd_get_portal_files_count(void)
     return (int)s_portals.count;
 }
 
-int cmd_get_passwords(parsed_password_t *out, int max)
+int cmd_get_passwords(pw_kind_t kind, parsed_password_t *out, int max)
 {
-    int n = (int)s_passwords.count < max ? (int)s_passwords.count : max;
-    if (n > 0 && out) memcpy(out, s_passwords.data, n * sizeof(parsed_password_t));
+    dynvec_t *src = (kind == PW_KIND_PORTAL) ? &s_passwords_portal : &s_passwords_evil;
+    int n = (int)src->count < max ? (int)src->count : max;
+    if (n > 0 && out) memcpy(out, src->data, n * sizeof(parsed_password_t));
     return n;
 }
 
-int cmd_get_passwords_count(void)
+int cmd_get_passwords_count(pw_kind_t kind)
 {
-    return (int)s_passwords.count;
+    dynvec_t *src = (kind == PW_KIND_PORTAL) ? &s_passwords_portal : &s_passwords_evil;
+    return (int)src->count;
 }
 
 const sniffer_results_t *cmd_get_sniffer_results(void)
@@ -2019,6 +2131,7 @@ bool cmd_do_list_probes(void)
     s_state = STATE_LISTING_PROBES;
     xSemaphoreGive(s_mutex);
 
+    s_probes_echo_seen = false;
     dynvec_clear(&s_probes_build);
     if (s_display_cb) s_display_cb("list_probes", NULL);
     uart_bridge_send("list_probes");
@@ -2224,13 +2337,15 @@ bool cmd_do_select_portal(int index)
     return true;
 }
 
-bool cmd_do_list_passwords(void)
+bool cmd_do_list_passwords(pw_kind_t kind)
 {
     if (!set_state_if_idle(STATE_LISTING_PASSWORDS)) return false;
-    dynvec_clear(&s_passwords);
+    s_passwords_kind = kind;
+    dynvec_clear(kind == PW_KIND_PORTAL ? &s_passwords_portal : &s_passwords_evil);
     s_passwords_echo_seen = false;
-    if (s_display_cb) s_display_cb("show_pass evil", NULL);
-    uart_bridge_send("show_pass evil");
+    const char *cmd = (kind == PW_KIND_PORTAL) ? "show_pass portal" : "show_pass evil";
+    if (s_display_cb) s_display_cb(cmd, NULL);
+    uart_bridge_send(cmd);
     return true;
 }
 
@@ -2270,8 +2385,20 @@ bool cmd_do_list_handshake_count(void)
 {
     if (!set_state_if_idle(STATE_LISTING_HANDSHAKES)) return false;
     s_handshake_count = 0;
+    s_handshake_header_seen = false;
+    dynvec_clear(&s_handshakes);
     if (s_display_cb) s_display_cb("list_dir /sdcard/lab/handshakes", NULL);
     uart_bridge_send("list_dir /sdcard/lab/handshakes");
+    return true;
+}
+
+bool cmd_do_sd_status(void)
+{
+    /* Does not change FSM state: the SD_OK/SD_NONE reply is parsed
+     * state-independently in on_uart_line(). Callers gate this on IDLE so we
+     * never inject a stray command mid-listing/attack. */
+    if (s_display_cb) s_display_cb("sd_status", NULL);
+    uart_bridge_send("sd_status");
     return true;
 }
 
@@ -2279,6 +2406,7 @@ bool cmd_do_list_wardrive_logs(void)
 {
     if (!set_state_if_idle(STATE_LISTING_WARDRIVE)) return false;
     dynvec_clear(&s_wardrive_logs);
+    s_wardrive_header_seen = false;
     if (s_display_cb) s_display_cb("list_dir /sdcard/lab/wardrives", NULL);
     uart_bridge_send("list_dir /sdcard/lab/wardrives");
     return true;
@@ -2287,6 +2415,23 @@ bool cmd_do_list_wardrive_logs(void)
 int cmd_get_handshake_count(void)
 {
     return s_handshake_count;
+}
+
+int cmd_get_handshakes(parsed_portal_file_t *out, int max)
+{
+    int n = (int)s_handshakes.count < max ? (int)s_handshakes.count : max;
+    if (n > 0 && out) memcpy(out, s_handshakes.data, n * sizeof(parsed_portal_file_t));
+    return n;
+}
+
+int cmd_get_handshakes_count(void)
+{
+    return (int)s_handshakes.count;
+}
+
+int cmd_sd_present(void)
+{
+    return s_sd_present;
 }
 
 bool cmd_handshake_initial_done(void)

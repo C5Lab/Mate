@@ -46,6 +46,14 @@ typedef struct {
  */
 bool parse_password_line(const char *line, parsed_password_t *pw);
 
+/**
+ * Parse a captive-portal password line with a variable number of fields:
+ *   "SSID", "field1=val1", "field2=val2", ...
+ * The SSID goes into `pw->ssid`; the remaining fields are joined with "; "
+ * into `pw->password` (truncated to fit).
+ */
+bool parse_portal_password_line(const char *line, parsed_password_t *pw);
+
 /* ---------- Portal file list ---------- */
 
 typedef struct {

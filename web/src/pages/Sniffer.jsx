@@ -7,6 +7,7 @@ import { showToast } from '../components/Toast';
 import { wsAddListener } from '../ws';
 
 const REFRESH_INTERVAL_MS = 4000;
+const RESULTS_POLL_MS = 2000;
 const SCAN_POLL_MS = 2000;
 const SCAN_TIMEOUT_MS = 60000;
 
@@ -119,6 +120,7 @@ export function Sniffer() {
   const [aps, setAps] = useState([]);
   const [probes, setProbes] = useState([]);
   const refreshTimerRef = useRef(null);
+  const resultsPollRef = useRef(null);
   const scanPollRef = useRef(null);
   const scanTimeoutRef = useRef(null);
   const refreshTickRef = useRef(0);
@@ -135,6 +137,7 @@ export function Sniffer() {
           await loadSnifferResults();
           await loadProbes();
           startRefreshLoop();
+          startResultsPoll();
         } else {
           await loadSnifferResults();
           await loadProbes();
@@ -179,6 +182,10 @@ export function Sniffer() {
     if (refreshTimerRef.current) {
       clearInterval(refreshTimerRef.current);
       refreshTimerRef.current = null;
+    }
+    if (resultsPollRef.current) {
+      clearInterval(resultsPollRef.current);
+      resultsPollRef.current = null;
     }
     if (scanPollRef.current) {
       clearInterval(scanPollRef.current);
@@ -237,6 +244,12 @@ export function Sniffer() {
     try { await api.refreshSniffer(); } catch (e) { /* ignore */ }
     setTimeout(async () => {
       try { await api.refreshProbes(); } catch (e) { /* ignore */ }
+      /* Pull the freshly-collected snapshot over GET so the button works even
+         when the WS push is lost under the packet-count flood. */
+      setTimeout(() => {
+        loadSnifferResults();
+        loadProbes();
+      }, 1200);
     }, 1000);
   }
 
@@ -244,6 +257,18 @@ export function Sniffer() {
     if (refreshTimerRef.current) return;
     refreshTickRef.current = 0;
     refreshTimerRef.current = setInterval(tickRefresh, REFRESH_INTERVAL_MS);
+  }
+
+  /* Pull results over plain GET, independent of the WS push. The observer's
+     structured events (sniffer_results_updated / probes_updated) can be dropped
+     when the WS queue saturates under the sniffer packet-count flood, so we poll
+     the cached snapshot directly to keep the UI live without a full reload. */
+  function startResultsPoll() {
+    if (resultsPollRef.current) return;
+    resultsPollRef.current = setInterval(() => {
+      loadSnifferResults();
+      loadProbes();
+    }, RESULTS_POLL_MS);
   }
 
   async function startSnifferAfterScan() {
@@ -262,6 +287,7 @@ export function Sniffer() {
     await loadSnifferResults();
     await loadProbes();
     startRefreshLoop();
+    startResultsPoll();
     showToast('Network Observer started', 'success');
   }
 

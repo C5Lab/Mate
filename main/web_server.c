@@ -14,6 +14,7 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_spiffs.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -673,10 +674,24 @@ static esp_err_t api_portal_select_post(httpd_req_t *req)
 
 static esp_err_t api_passwords_get(httpd_req_t *req)
 {
-    int n = cmd_get_passwords_count();
+    /* Category selector: /api/passwords?kind=evil|portal (default evil). */
+    pw_kind_t kind = PW_KIND_EVIL;
+    size_t qlen = httpd_req_get_url_query_len(req) + 1;
+    if (qlen > 1 && qlen < 64) {
+        char q[64];
+        if (httpd_req_get_url_query_str(req, q, qlen) == ESP_OK) {
+            char val[16];
+            if (httpd_query_key_value(q, "kind", val, sizeof(val)) == ESP_OK &&
+                strcmp(val, "portal") == 0) {
+                kind = PW_KIND_PORTAL;
+            }
+        }
+    }
+
+    int n = cmd_get_passwords_count(kind);
 
     if (n == 0) {
-        cmd_do_list_passwords();
+        cmd_do_list_passwords(kind);
         send_json(req, "{\"ok\":true,\"passwords\":[],\"status\":\"loading\"}");
         return ESP_OK;
     }
@@ -686,7 +701,7 @@ static esp_err_t api_passwords_get(httpd_req_t *req)
         send_json(req, "{\"ok\":false,\"error\":\"oom\"}");
         return ESP_OK;
     }
-    n = cmd_get_passwords(pws, n);
+    n = cmd_get_passwords(kind, pws, n);
 
     chunked_writer_t cw;
     cw_init(&cw, req);
@@ -912,6 +927,18 @@ static esp_err_t api_dashboard_get(httpd_req_t *req)
         s_dashboard_hs_attempted = true;
         cmd_do_list_handshake_count();
         hs_loading = true;
+        state = cmd_get_state();
+    }
+
+    /* SD presence probe: cheap `sd_status` query, refreshed at most every
+     * 30s and only while idle so it never collides with an active command. */
+    static int64_t s_dashboard_sd_at = 0;
+    int64_t now_ms = esp_timer_get_time() / 1000;
+    if (state == STATE_IDLE &&
+        cmd_is_c5_connected() &&
+        (s_dashboard_sd_at == 0 || now_ms - s_dashboard_sd_at > 30000)) {
+        s_dashboard_sd_at = now_ms;
+        cmd_do_sd_status();
     }
 
     float lat = 0.0f, lon = 0.0f;
@@ -925,7 +952,7 @@ static esp_err_t api_dashboard_get(httpd_req_t *req)
         "{\"ok\":true,\"c5_connected\":%s,\"ap_clients\":%d,\"heap_free\":%u,"
         "\"heap_internal\":%u,\"handshake_count\":%d,\"handshake_loading\":%s,"
         "\"gps_fix\":%s,\"gps_lat\":%.6f,\"gps_lon\":%.6f,\"last_net_rssi\":%d,"
-        "\"sd_free_gb\":-1,\"sd_total_gb\":-1,\"sta_connected\":%s,\"sta_ssid\":\"%s\"}",
+        "\"sd_present\":%d,\"sta_connected\":%s,\"sta_ssid\":\"%s\"}",
         cmd_is_c5_connected() ? "true" : "false",
         wifi_ap_get_client_count(),
         (unsigned)esp_get_free_heap_size(),
@@ -936,6 +963,7 @@ static esp_err_t api_dashboard_get(httpd_req_t *req)
         has_fix ? lat : 0.0f,
         has_fix ? lon : 0.0f,
         strongest_idx >= 0 ? strongest_rssi : -120,
+        cmd_sd_present(),
         cmd_is_sta_connected() ? "true" : "false",
         sta_ssid ? sta_ssid : ""
     );
@@ -968,23 +996,52 @@ static esp_err_t api_wardrive_logs_get(httpd_req_t *req)
         return cw_finish(&cw);
     }
 
-    if (state == STATE_LISTING_WARDRIVE) {
-        send_json(req, "{\"ok\":true,\"status\":\"loading\"}");
-        return ESP_OK;
+    /* Either the listing is already running, or we're busy with another
+     * command (e.g. the sibling password/handshake listing fired by the same
+     * Data page). Report "loading" so the client keeps polling until the
+     * single-command FSM frees up, instead of a hard 409 the UI treats as a
+     * dead end. If idle, kick off the listing now. */
+    if (state == STATE_IDLE) {
+        cmd_do_list_wardrive_logs();
+    }
+    send_json(req, "{\"ok\":true,\"status\":\"loading\"}");
+    return ESP_OK;
+}
+
+static esp_err_t api_handshakes_get(httpd_req_t *req)
+{
+    int n = cmd_get_handshakes_count();
+    cmd_state_t state = cmd_get_state();
+
+    if (n > 0) {
+        parsed_portal_file_t *files = psram_malloc((size_t)n * sizeof(*files));
+        if (!files) {
+            send_json(req, "{\"ok\":false,\"error\":\"oom\"}");
+            return ESP_OK;
+        }
+        n = cmd_get_handshakes(files, n);
+
+        chunked_writer_t cw;
+        cw_init(&cw, req);
+        cw_printf(&cw, "{\"ok\":true,\"files\":[");
+        for (int i = 0; i < n; i++) {
+            cw_printf(&cw, "%s{\"index\":%d,\"name\":\"%s\"}",
+                      i > 0 ? "," : "", files[i].index, files[i].filename);
+        }
+        cw_printf(&cw, "]}");
+        free(files);
+        return cw_finish(&cw);
     }
 
-    if (state != STATE_IDLE) {
-        httpd_resp_set_status(req, "409 Conflict");
-        send_json(req, "{\"ok\":false,\"error\":\"busy\"}");
-        return ESP_OK;
+    /* Either the listing is already running, or we're busy with another
+     * command (e.g. the sibling password/wardrive listing fired by the same
+     * Data page). Report "loading" so the client keeps polling until the
+     * single-command FSM frees up, instead of a hard 409 the UI treats as a
+     * dead end. If idle, kick off the listing now. */
+    if (state == STATE_IDLE) {
+        cmd_do_list_handshake_count();
     }
-
-    if (cmd_do_list_wardrive_logs()) {
-        send_json(req, "{\"ok\":true,\"status\":\"loading\"}");
-    } else {
-        httpd_resp_set_status(req, "409 Conflict");
-        send_json(req, "{\"ok\":false,\"error\":\"busy\"}");
-    }
+    send_json(req, "{\"ok\":true,\"status\":\"loading\"}");
     return ESP_OK;
 }
 
@@ -1319,6 +1376,7 @@ esp_err_t web_server_start(void)
     REGISTER_URI("/api/portals",       HTTP_GET,  api_portals_get);
     REGISTER_URI("/api/portal/select", HTTP_POST, api_portal_select_post);
     REGISTER_URI("/api/passwords",     HTTP_GET,  api_passwords_get);
+    REGISTER_URI("/api/handshakes",    HTTP_GET,  api_handshakes_get);
     REGISTER_URI("/api/wardrive/logs", HTTP_GET,  api_wardrive_logs_get);
     REGISTER_URI("/api/sniffer/results", HTTP_GET,  api_sniffer_results_get);
     REGISTER_URI("/api/sniffer/results", HTTP_POST, api_sniffer_refresh_post);

@@ -35,8 +35,8 @@ let state = {
   gpsFix: false,
   gpsLat: 0,
   gpsLon: 0,
-  sdFreeGb: -1,
-  sdTotalGb: -1,
+  /* SD presence from JanOS `sd_status`: 1 present, 0 absent, -1 unknown. */
+  sdPresent: -1,
   /* Discovered hosts from `list_hosts` (ARP attack). Populated globally so
    * the data survives navigation and is captured even when the Scan ARP
    * monitor isn't open at the moment the lines arrive over UART. */
