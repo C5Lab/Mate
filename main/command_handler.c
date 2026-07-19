@@ -6,8 +6,10 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 #include <stdarg.h>
 #include <stdlib.h>
+#include <ctype.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "esp_log.h"
@@ -137,6 +139,15 @@ static dynvec_t             s_nmap_hosts;     /* nmap_host_t */
 static nmap_state_t         s_nmap_state = {0};
 static int                  s_nmap_current_idx = -1; /* index into s_nmap_hosts */
 static bool                 s_nmap_active = false;   /* set by cmd_do_nmap, cleared on completion */
+
+/* Bluetooth caches. Like nmap/ARP, BLE results stream in state-independently:
+ * JanOS flips the FSM back to IDLE on the `> scan_bt` prompt echo before the
+ * 10s scan actually finishes, so the device list is parsed in a
+ * state-independent helper and cached so /api/bt/devices survives WS drops. */
+static dynvec_t             s_bt_devices;     /* bt_device_t */
+static bool                 s_bt_scan_active = false;  /* armed by cmd_do_bt_scan */
+static bool                 s_bt_track_active = false; /* armed by cmd_do_bt_track */
+static bool                 s_airtag_active = false;   /* armed by cmd_do_airtag */
 
 static bool is_prompt_line(const char *line)
 {
@@ -880,6 +891,196 @@ static void handle_nmap_line(const char *line)
     }
 }
 
+/* ---------- Bluetooth (scan_bt / scan_airtag) ---------- */
+
+/* Skip leading whitespace and an optional JanOS prompt ("> ") so lines like
+ * "> 1,0" (airtag counts) or "> AA:BB:.. RSSI:" (tracking) parse the same as
+ * their bare forms. */
+static const char *bt_skip_prompt(const char *line)
+{
+    const char *p = line;
+    while (*p == ' ') p++;
+    if (p[0] == '>' && p[1] == ' ') {
+        p += 2;
+        while (*p == ' ') p++;
+    }
+    return p;
+}
+
+/* True if `p` starts with an "AA:BB:CC:DD:EE:FF" MAC. */
+static bool bt_is_mac_at(const char *p)
+{
+    if (!p) return false;
+    for (int i = 0; i < 17; i++) {
+        char c = p[i];
+        if (i % 3 == 2) {
+            if (c != ':') return false;
+        } else if (!isxdigit((unsigned char)c)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Append `name` into `dst` as a JSON-escaped string (no surrounding quotes),
+ * trimming trailing whitespace/CR/LF. `dst` must hold at least `2*len+1`. */
+static void bt_escape_name(char *dst, size_t dst_sz, const char *name)
+{
+    size_t j = 0;
+    for (size_t i = 0; name[i] && j < dst_sz - 2; i++) {
+        char c = name[i];
+        if (c == '"' || c == '\\') dst[j++] = '\\';
+        dst[j++] = c;
+    }
+    while (j > 0 && (dst[j - 1] == ' ' || dst[j - 1] == '\r' || dst[j - 1] == '\n')) {
+        j--;
+    }
+    dst[j] = '\0';
+}
+
+/* Find the entry matching `mac` (or append a fresh one). Caller holds mutex.
+ * Returns the index in s_bt_devices or -1 on OOM. */
+static int bt_upsert_device_locked(int index, const char *mac,
+                                   int rssi, const char *name)
+{
+    for (size_t i = 0; i < s_bt_devices.count; i++) {
+        bt_device_t *d = (bt_device_t *)dynvec_at(&s_bt_devices, i);
+        if (d && strcasecmp(d->mac, mac) == 0) {
+            d->rssi = rssi;
+            if (index > 0) d->index = index;
+            if (name && name[0]) {
+                strncpy(d->name, name, sizeof(d->name) - 1);
+                d->name[sizeof(d->name) - 1] = '\0';
+            }
+            return (int)i;
+        }
+    }
+
+    bt_device_t fresh = {0};
+    fresh.index = index > 0 ? index : (int)s_bt_devices.count + 1;
+    fresh.rssi  = rssi;
+    strncpy(fresh.mac, mac, sizeof(fresh.mac) - 1);
+    if (name && name[0]) strncpy(fresh.name, name, sizeof(fresh.name) - 1);
+    if (!dynvec_push(&s_bt_devices, &fresh)) {
+        log_drop("bt_devices");
+        return -1;
+    }
+    return (int)s_bt_devices.count - 1;
+}
+
+/* Parse the trailing "  Name: <rest>" off a scan_bt line into `out`. */
+static void bt_parse_name(const char *line, char *out, size_t out_sz)
+{
+    out[0] = '\0';
+    const char *n = strstr(line, "Name:");
+    if (!n) return;
+    n += 5;
+    while (*n == ' ') n++;
+    size_t j = 0;
+    while (*n && j < out_sz - 1) out[j++] = *n++;
+    out[j] = '\0';
+    while (j > 0 && (out[j - 1] == ' ' || out[j - 1] == '\r' || out[j - 1] == '\n')) {
+        out[--j] = '\0';
+    }
+}
+
+/* State-independent Bluetooth line parser. JanOS flips the FSM back to IDLE on
+ * the `> scan_bt` prompt echo before the 10s scan finishes, so (like nmap/ARP)
+ * we parse regardless of state, gated on the arm flags set by cmd_do_bt_*. */
+/* Returns true if the line was a Bluetooth result so the outer dispatcher can
+ * suppress the redundant raw uart_line broadcast (keeps the 16-deep WS queue
+ * from saturating during the burst of device rows, which was dropping the
+ * bt_scan_complete frame and wedging the web UI's "Scanning" spinner). */
+static bool handle_bt_line(const char *line)
+{
+    if (!line) return false;
+
+    /* Device list row: "  1. 09:2B:56:0E:1C:E0  RSSI: -82 dBm  [Name: X]" */
+    if (s_bt_scan_active && strstr(line, "RSSI:")) {
+        const char *p = bt_skip_prompt(line);
+        int index = 0;
+        char mac[18] = {0};
+        if (isdigit((unsigned char)*p) &&
+            sscanf(p, "%d. %17s", &index, mac) == 2 && bt_is_mac_at(mac)) {
+            const char *r = strstr(line, "RSSI:");
+            int rssi = r ? atoi(r + 5) : 0;
+            char name[40];
+            bt_parse_name(line, name, sizeof(name));
+
+            xSemaphoreTake(s_mutex, portMAX_DELAY);
+            bt_upsert_device_locked(index, mac, rssi, name);
+            xSemaphoreGive(s_mutex);
+
+            char esc[80];
+            bt_escape_name(esc, sizeof(esc), name);
+            broadcast_json(
+                "{\"type\":\"bt_device\",\"index\":%d,\"mac\":\"%s\","
+                "\"rssi\":%d,\"name\":\"%s\"}",
+                index, mac, rssi, esc);
+            return true;
+        }
+    }
+
+    /* "Summary: 0 AirTags, 0 SmartTags, 27 total devices" */
+    {
+        const char *p = strstr(line, "Summary:");
+        if (p && strstr(p, "AirTags")) {
+            int airtags = 0, smarttags = 0, total = 0;
+            sscanf(p, "Summary: %d AirTags, %d SmartTags, %d total devices",
+                   &airtags, &smarttags, &total);
+            s_bt_scan_active = false;
+            broadcast_json(
+                "{\"type\":\"bt_scan_complete\",\"airtags\":%d,"
+                "\"smarttags\":%d,\"total\":%d}",
+                airtags, smarttags, total);
+            return true;
+        }
+    }
+
+    /* Tracking row: "F1:2E:71:9F:C8:68  RSSI: -93 dBm  Name: X" (MAC first). */
+    if (s_bt_track_active && strstr(line, "RSSI:")) {
+        const char *p = bt_skip_prompt(line);
+        if (bt_is_mac_at(p)) {
+            char mac[18] = {0};
+            memcpy(mac, p, 17);
+            const char *r = strstr(line, "RSSI:");
+            int rssi = r ? atoi(r + 5) : 0;
+            char name[40];
+            bt_parse_name(line, name, sizeof(name));
+            char esc[80];
+            bt_escape_name(esc, sizeof(esc), name);
+            broadcast_json(
+                "{\"type\":\"bt_track\",\"mac\":\"%s\",\"rssi\":%d,\"name\":\"%s\"}",
+                mac, rssi, esc);
+            return true;
+        }
+    }
+
+    /* AirTag count stream: "<airtags>,<smarttags>" (may be prompt-prefixed as
+     * "> 1,0", so strip the prompt first). */
+    if (s_airtag_active) {
+        const char *p = bt_skip_prompt(line);
+        int airtags = 0, smarttags = 0;
+        char extra = 0;
+        if (isdigit((unsigned char)*p) &&
+            sscanf(p, "%d,%d%c", &airtags, &smarttags, &extra) == 2) {
+            broadcast_json(
+                "{\"type\":\"airtag_count\",\"airtags\":%d,\"smarttags\":%d}",
+                airtags, smarttags);
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void bt_devices_reset(void)
+{
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    dynvec_clear(&s_bt_devices);
+    xSemaphoreGive(s_mutex);
+}
+
 /* ---------- UART line callback ---------- */
 
 static void broadcast_uart_line(const char *line)
@@ -1206,6 +1407,13 @@ static void on_uart_line(const char *line, void *ctx)
      * echo (long before the actual scan results arrive), so we accumulate
      * `Host:`/`port/tcp open` rows in a state-independent helper. */
     handle_nmap_line(line);
+
+    /* Bluetooth (scan_bt / scan_airtag) results also arrive after the FSM has
+     * already flipped back to IDLE on the command echo, so parse them
+     * state-independently too (gated on the arm flags). When a BT line is
+     * consumed we skip the redundant raw uart_line below to spare WS queue
+     * space (see broadcast_uart_line gate at the end). */
+    bool bt_consumed = handle_bt_line(line);
 
     /* Sniffer Dog deauth events likewise stream in regardless of FSM state
      * (a stop echo can flip us to IDLE), so cache them state-independently. */
@@ -1539,6 +1747,40 @@ static void on_uart_line(const char *line, void *ctx)
         if (stop_like) {
             /* Bug 2: arp_ban stop tears down STA on JanOS. */
             mark_sta_disconnected();
+            xSemaphoreTake(s_mutex, portMAX_DELAY);
+            s_state = STATE_IDLE;
+            xSemaphoreGive(s_mutex);
+            broadcast_json("{\"type\":\"attack_stopped\"}");
+        }
+        break;
+    }
+
+    case STATE_ATTACK_BT_SCAN: {
+        /* One-time BLE scan. Device rows + the "Summary:" end marker are
+         * parsed state-independently in handle_bt_line(); here we only flip
+         * the FSM back to IDLE once the scan finishes (Summary) or is
+         * stopped, so the device isn't left stuck "busy". */
+        attack_event_t ev = parse_attack_event(line);
+        bool done = (ev.type == ATTACK_EVENT_STOP_ACK ||
+                     (strstr(line, "Summary:") && strstr(line, "AirTags")));
+        if (done) {
+            xSemaphoreTake(s_mutex, portMAX_DELAY);
+            s_state = STATE_IDLE;
+            xSemaphoreGive(s_mutex);
+            broadcast_json("{\"type\":\"attack_stopped\"}");
+        }
+        break;
+    }
+
+    case STATE_ATTACK_BT_TRACK:
+    case STATE_ATTACK_AIRTAG: {
+        /* Continuous scans: RSSI / count lines are streamed
+         * state-independently in handle_bt_line(); only an explicit stop
+         * acknowledgement ends them. */
+        attack_event_t ev = parse_attack_event(line);
+        if (ev.type == ATTACK_EVENT_STOP_ACK) {
+            s_bt_track_active = false;
+            s_airtag_active = false;
             xSemaphoreTake(s_mutex, portMAX_DELAY);
             s_state = STATE_IDLE;
             xSemaphoreGive(s_mutex);
@@ -1919,6 +2161,12 @@ static void on_uart_line(const char *line, void *ctx)
         return;
     }
 
+    /* BT device rows / RSSI / airtag counts already went out as structured
+     * events; don't also flood the WS queue with their raw copies. */
+    if (bt_consumed) {
+        return;
+    }
+
     /* Forward raw line for non-structured lines (network CSV lines return early above) */
     broadcast_uart_line(line);
 }
@@ -1961,6 +2209,7 @@ void cmd_handler_init(void)
     dynvec_init(&s_subghz_build,   sizeof(subghz_signal_t),      8);
     dynvec_init(&s_arp_hosts,      sizeof(arp_host_t),           8);
     dynvec_init(&s_nmap_hosts,     sizeof(nmap_host_t),          8);
+    dynvec_init(&s_bt_devices,     sizeof(bt_device_t),          16);
     reset_sniffer_build();
 
     uart_bridge_register_line_cb(on_uart_line, NULL);
@@ -2019,6 +2268,9 @@ const char *cmd_state_name(cmd_state_t s)
     case STATE_ATTACK_NMAP:       return "nmap";
     case STATE_ATTACK_ARP:        return "arp";
     case STATE_ATTACK_ARP_BAN:    return "arp_ban";
+    case STATE_ATTACK_BT_SCAN:    return "bt_scan";
+    case STATE_ATTACK_BT_TRACK:   return "bt_track";
+    case STATE_ATTACK_AIRTAG:     return "airtag";
     case STATE_WIFI_CONNECTING:   return "wifi_connecting";
     case STATE_LISTING_PORTALS:   return "listing_portals";
     case STATE_LISTING_PASSWORDS: return "listing_passwords";
@@ -2449,6 +2701,69 @@ bool cmd_do_arp_ban(const char *mac, const char *ip)
     return true;
 }
 
+bool cmd_do_bt_scan(void)
+{
+    if (!set_state_if_idle(STATE_ATTACK_BT_SCAN)) return false;
+    bt_devices_reset();
+    s_bt_track_active = false;
+    s_airtag_active = false;
+    s_bt_scan_active = true;
+    if (s_display_cb) s_display_cb("scan_bt", NULL);
+    uart_bridge_send("scan_bt");
+    broadcast_json("{\"type\":\"attack_started\",\"attack\":\"bt_scan\"}");
+    return true;
+}
+
+bool cmd_do_bt_track(const char *mac)
+{
+    if (!mac || !mac[0]) return false;
+    if (!set_state_if_idle(STATE_ATTACK_BT_TRACK)) return false;
+    s_bt_scan_active = false;
+    s_airtag_active = false;
+    s_bt_track_active = true;
+
+    char cmd[48];
+    snprintf(cmd, sizeof(cmd), "scan_bt %s", mac);
+    if (s_display_cb) s_display_cb(cmd, NULL);
+    uart_bridge_send(cmd);
+    broadcast_json("{\"type\":\"attack_started\",\"attack\":\"bt_track\"}");
+    return true;
+}
+
+bool cmd_do_airtag(void)
+{
+    if (!set_state_if_idle(STATE_ATTACK_AIRTAG)) return false;
+    s_bt_scan_active = false;
+    s_bt_track_active = false;
+    s_airtag_active = true;
+    if (s_display_cb) s_display_cb("scan_airtag", NULL);
+    uart_bridge_send("scan_airtag");
+    broadcast_json("{\"type\":\"attack_started\",\"attack\":\"airtag\"}");
+    return true;
+}
+
+int cmd_get_bt_devices(bt_device_t *out, int max)
+{
+    if (!out || max <= 0) return 0;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    int n = (int)s_bt_devices.count;
+    if (n > max) n = max;
+    for (int i = 0; i < n; i++) {
+        const bt_device_t *d = (const bt_device_t *)dynvec_at(&s_bt_devices, (size_t)i);
+        if (d) out[i] = *d;
+    }
+    xSemaphoreGive(s_mutex);
+    return n;
+}
+
+int cmd_get_bt_devices_count(void)
+{
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    int n = (int)s_bt_devices.count;
+    xSemaphoreGive(s_mutex);
+    return n;
+}
+
 bool cmd_do_wifi_connect(const char *ssid, const char *password)
 {
     if (!ssid || !ssid[0]) return false;
@@ -2493,6 +2808,9 @@ bool cmd_do_stop(void)
     s_sniffer_collecting = false;
     s_probe_resume_state = STATE_IDLE;
     s_subghz_import_count = 0;
+    s_bt_scan_active = false;
+    s_bt_track_active = false;
+    s_airtag_active = false;
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     cmd_state_t prev = s_state;

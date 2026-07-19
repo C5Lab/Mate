@@ -26,6 +26,14 @@ typedef struct {
     nmap_port_t ports[NMAP_MAX_PORTS_PER_HOST];
 } nmap_host_t;
 
+/** A single Bluetooth LE device discovered by `scan_bt`. */
+typedef struct {
+    int  index;
+    char mac[18];
+    char name[40];
+    int  rssi;
+} bt_device_t;
+
 typedef struct {
     char     level[16];
     int      total_hosts;     /* from "Total: N hosts discovered" or "Scanning N host(s)" */
@@ -55,6 +63,9 @@ typedef enum {
     STATE_ATTACK_NMAP,
     STATE_ATTACK_ARP,
     STATE_ATTACK_ARP_BAN,
+    STATE_ATTACK_BT_SCAN,
+    STATE_ATTACK_BT_TRACK,
+    STATE_ATTACK_AIRTAG,
     STATE_WIFI_CONNECTING,
     STATE_LISTING_PORTALS,
     STATE_LISTING_PASSWORDS,
@@ -202,6 +213,19 @@ bool cmd_do_arp(void);
 
 /** Start ARP ban (poison) for a single host MAC, optionally with IP. */
 bool cmd_do_arp_ban(const char *mac, const char *ip);
+
+/** Start a one-time Bluetooth LE device scan (`scan_bt`). Clears cache. */
+bool cmd_do_bt_scan(void);
+
+/** Track RSSI of a single BLE device by MAC (`scan_bt <MAC>`). */
+bool cmd_do_bt_track(const char *mac);
+
+/** Start continuous AirTag/SmartTag count scan (`scan_airtag`). */
+bool cmd_do_airtag(void);
+
+/** Copy up to `max` cached BLE devices (from `scan_bt`) into `out`. */
+int cmd_get_bt_devices(bt_device_t *out, int max);
+int cmd_get_bt_devices_count(void);
 
 /** Connect STA to selected AP SSID. */
 bool cmd_do_wifi_connect(const char *ssid, const char *password);

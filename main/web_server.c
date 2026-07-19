@@ -385,6 +385,31 @@ static esp_err_t api_scan_results_get(httpd_req_t *req)
     return cw_finish(&cw);
 }
 
+static esp_err_t api_bt_devices_get(httpd_req_t *req)
+{
+    int count = cmd_get_bt_devices_count();
+    bt_device_t *devs = NULL;
+    if (count > 0) {
+        devs = calloc((size_t)count, sizeof(bt_device_t));
+        if (devs) count = cmd_get_bt_devices(devs, count);
+        else count = 0;
+    }
+
+    chunked_writer_t cw;
+    cw_init(&cw, req);
+    cw_printf(&cw, "{\"ok\":true,\"count\":%d,\"devices\":[", count);
+    for (int i = 0; i < count; i++) {
+        const bt_device_t *d = &devs[i];
+        cw_printf(&cw,
+            "%s{\"index\":%d,\"mac\":\"%s\",\"name\":\"%s\",\"rssi\":%d}",
+            i > 0 ? "," : "",
+            d->index, d->mac, d->name, d->rssi);
+    }
+    cw_printf(&cw, "]}");
+    free(devs);
+    return cw_finish(&cw);
+}
+
 static esp_err_t api_select_post(httpd_req_t *req)
 {
     char body[256] = {0};
@@ -434,7 +459,19 @@ static esp_err_t api_attack_post(httpd_req_t *req)
     const char *uri = req->uri;
     bool ok = false;
 
-    if (strstr(uri, "/deauth"))         ok = cmd_do_deauth();
+    if (strstr(uri, "/bt_scan"))         ok = cmd_do_bt_scan();
+    else if (strstr(uri, "/bt_track")) {
+        char body[96] = {0};
+        if (req->content_len > 0) {
+            int received = httpd_req_recv(req, body, sizeof(body) - 1);
+            if (received < 0) body[0] = '\0';
+        }
+        char mac[24] = {0};
+        json_get_string(body, "\"mac\"", mac, sizeof(mac));
+        ok = cmd_do_bt_track(mac[0] ? mac : NULL);
+    }
+    else if (strstr(uri, "/airtag"))     ok = cmd_do_airtag();
+    else if (strstr(uri, "/deauth"))     ok = cmd_do_deauth();
     else if (strstr(uri, "/blackout"))   ok = cmd_do_blackout();
     else if (strstr(uri, "/eviltwin"))   ok = cmd_do_evil_twin();
     else if (strstr(uri, "/sae"))        ok = cmd_do_sae();
@@ -1481,6 +1518,7 @@ esp_err_t web_server_start(void)
     REGISTER_URI("/api/portal/captures", HTTP_GET,  api_portal_captures_get);
     REGISTER_URI("/api/sniffer_dog/results", HTTP_GET, api_sniffer_dog_results_get);
     REGISTER_URI("/api/nmap/results",    HTTP_GET,  api_nmap_results_get);
+    REGISTER_URI("/api/bt/devices",      HTTP_GET,  api_bt_devices_get);
     REGISTER_URI("/api/status",        HTTP_GET,  api_status_get);
     REGISTER_URI("/api/dashboard",     HTTP_GET,  api_dashboard_get);
     REGISTER_URI("/api/subghz/list",   HTTP_GET,  api_subghz_list_get);
