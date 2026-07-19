@@ -29,6 +29,8 @@ import { Wardrive } from './pages/Wardrive';
 import { Karma } from './pages/Karma';
 import { DeauthDetector } from './pages/DeauthDetector';
 import { Portal } from './pages/Portal';
+import { SnifferDog } from './pages/SnifferDog';
+import { BeaconSpam } from './pages/BeaconSpam';
 import { SubGhz } from './pages/SubGhz';
 import { SubGhzListen } from './pages/subghz/Listen';
 import { SubGhzTransmit } from './pages/subghz/Transmit';
@@ -261,6 +263,8 @@ export function App() {
           <Wardrive path="/wardrive" />
           <Karma path="/karma" />
           <Portal path="/portal" />
+          <SnifferDog path="/snifferdog" />
+          <BeaconSpam path="/beaconspam" />
           <DeauthDetector path="/detector" />
           <SubGhz path="/subghz" />
           <SubGhzListen path="/subghz/listen" />

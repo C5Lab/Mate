@@ -440,8 +440,46 @@ static esp_err_t api_attack_post(httpd_req_t *req)
     else if (strstr(uri, "/sae"))        ok = cmd_do_sae();
     else if (strstr(uri, "/handshake"))  ok = cmd_do_handshake();
     else if (strstr(uri, "/sniffer_noscan")) ok = cmd_do_sniffer_noscan();
+    else if (strstr(uri, "/sniffer_dog")) ok = cmd_do_sniffer_dog();
     else if (strstr(uri, "/sniffer"))    ok = cmd_do_sniffer();
     else if (strstr(uri, "/mitm"))       ok = cmd_do_mitm();
+    else if (strstr(uri, "/beacon_spam")) {
+        char body[1024] = {0};
+        if (req->content_len > 0) {
+            int received = httpd_req_recv(req, body, sizeof(body) - 1);
+            if (received < 0) body[0] = '\0';
+        }
+
+        /* Parse {"ssids":["a","b",...]}: walk the quoted strings after the
+         * "ssids" key. No fixed cap here beyond JanOS's own 32-SSID limit. */
+        dynvec_t ptrs;   /* char* into ssid_buf */
+        dynvec_init(&ptrs, sizeof(char *), 8);
+        char *ssid_buf = malloc(sizeof(body));
+        int sb = 0;
+        if (ssid_buf) {
+            const char *p = strstr(body, "\"ssids\"");
+            const char *arr = p ? strchr(p, '[') : NULL;
+            const char *arr_end = arr ? strchr(arr, ']') : NULL;
+            const char *c = arr ? arr + 1 : NULL;
+            while (c && arr_end && c < arr_end) {
+                const char *q1 = strchr(c, '"');
+                if (!q1 || q1 >= arr_end) break;
+                const char *q2 = strchr(q1 + 1, '"');
+                if (!q2 || q2 > arr_end) break;
+                char *start = ssid_buf + sb;
+                for (const char *k = q1 + 1; k < q2 && sb < (int)sizeof(body) - 1; k++) {
+                    ssid_buf[sb++] = *k;
+                }
+                ssid_buf[sb++] = '\0';
+                if (start[0]) dynvec_push(&ptrs, &start);
+                c = q2 + 1;
+            }
+            ok = (ptrs.count > 0) &&
+                 cmd_do_beacon_spam((const char *const *)ptrs.data, (int)ptrs.count);
+        }
+        dynvec_free(&ptrs);
+        free(ssid_buf);
+    }
     else if (strstr(uri, "/karma")) {
         char body[96] = {0};
         if (req->content_len > 0) {

@@ -6,6 +6,20 @@ import { api } from '../api';
 import { showToast } from '../components/Toast';
 import { wsAddListener } from '../ws';
 
+function parseFormFields(data) {
+  return String(data || '')
+    .split('&')
+    .map((pair) => {
+      const idx = pair.indexOf('=');
+      if (idx < 0) return { key: pair, value: '' };
+      return {
+        key: decodeURIComponent(pair.slice(0, idx).replace(/\+/g, ' ')),
+        value: decodeURIComponent(pair.slice(idx + 1).replace(/\+/g, ' ')),
+      };
+    })
+    .filter((f) => f.key);
+}
+
 function readQuery() {
   if (typeof window === 'undefined') return { probe: 0, ssid: '' };
   const params = new URLSearchParams(window.location.search || '');
@@ -22,6 +36,7 @@ export function Karma() {
   const [verified, setVerified] = useState(false);
   const [clients, setClients] = useState([]);
   const [stopping, setStopping] = useState(true);
+  const [probes, setProbes] = useState([]);
   const stoppedRef = useRef(false);
 
   useEffect(() => {
@@ -40,6 +55,20 @@ export function Karma() {
         /* ignore -- worst case PortalPicker will retry */
       }
       setStopping(false);
+
+      /* If we arrived without a probe in the URL (e.g. from the Attacks menu),
+       * offer the probe list cached on the device from the last observer run. */
+      const q = readQuery();
+      if (!q.probe) {
+        try {
+          const data = await api.probes();
+          if (data?.ok && Array.isArray(data.probes)) {
+            setProbes(data.probes);
+          }
+        } catch (e) {
+          /* ignore -- fallback button routes to the observer */
+        }
+      }
     })();
 
     const removeWs = wsAddListener((msg) => {
@@ -59,11 +88,27 @@ export function Karma() {
         setClients((prev) => prev.filter((m) => m !== msg.mac));
       }
 
+      if (msg.type === 'portal_data') {
+        const fields = parseFormFields(msg.data);
+        const summary = fields.map((f) => `${f.key}=${f.value}`).join('  ');
+        setPasswords((prev) => [
+          {
+            id: `${Date.now()}-${Math.random().toString(16).slice(2, 6)}`,
+            password: summary,
+            fields,
+            time: new Date().toLocaleTimeString(),
+          },
+          ...prev,
+        ]);
+        showToast(`Credentials captured: ${summary}`, 'success');
+      }
+
       if (msg.type === 'password_received') {
         setPasswords((prev) => [
           {
             id: `${Date.now()}-${Math.random().toString(16).slice(2, 6)}`,
             password: msg.password,
+            fields: [{ key: 'password', value: msg.password }],
             time: new Date().toLocaleTimeString(),
           },
           ...prev,
@@ -139,14 +184,37 @@ export function Karma() {
         </div>
 
         {!probe ? (
-          <div class="alert warn" style="margin-top:12px">
-            No probe in URL. Open the Network Observer, run a scan, and click a probe.
-            <div class="btn-row" style="margin-top:8px">
-              <button class="btn btn-secondary" onClick={() => route('/sniffer')}>
-                Go to Network Observer
-              </button>
+          probes.length > 0 ? (
+            <div style="margin-top:12px">
+              <div class="section-head">
+                <h3 class="section-title">Pick a probe</h3>
+                <span class="badge">{probes.length}</span>
+              </div>
+              <ul class="probe-list">
+                {probes.map((p) => (
+                  <li key={`${p.index}-${p.ssid}`}>
+                    <button
+                      class="probe-item"
+                      onClick={() => setQuery({ probe: p.index, ssid: p.ssid || '' })}
+                    >
+                      <span class="probe-idx">{p.index}</span>
+                      <span class="probe-ssid">{p.ssid || '[hidden]'}</span>
+                      <span class="probe-cta">Select →</span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
             </div>
-          </div>
+          ) : (
+            <div class="alert warn" style="margin-top:12px">
+              No probe selected. Open the Network Observer, run a scan, and click a probe.
+              <div class="btn-row" style="margin-top:8px">
+                <button class="btn btn-secondary" onClick={() => route('/sniffer')}>
+                  Go to Network Observer
+                </button>
+              </div>
+            </div>
+          )
         ) : null}
 
         {!running && !stopping ? <PortalPicker onSelect={(idx) => setPortalSelected(idx > 0)} /> : null}
@@ -205,7 +273,11 @@ export function Karma() {
                 {passwords.map((pw) => (
                   <tr key={pw.id}>
                     <td>{pw.time}</td>
-                    <td>{pw.password}</td>
+                    <td>
+                      {(pw.fields && pw.fields.length) ? pw.fields.map((f) => (
+                        <div key={f.key}><span class="kv-key">{f.key}:</span> {f.value}</div>
+                      )) : pw.password}
+                    </td>
                   </tr>
                 ))}
               </tbody>

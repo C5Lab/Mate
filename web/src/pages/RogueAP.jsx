@@ -6,12 +6,27 @@ import { getState } from '../store';
 import { showToast } from '../components/Toast';
 import { wsAddListener } from '../ws';
 
+function parseFormFields(data) {
+  return String(data || '')
+    .split('&')
+    .map((pair) => {
+      const idx = pair.indexOf('=');
+      if (idx < 0) return { key: pair, value: '' };
+      return {
+        key: decodeURIComponent(pair.slice(0, idx).replace(/\+/g, ' ')),
+        value: decodeURIComponent(pair.slice(idx + 1).replace(/\+/g, ' ')),
+      };
+    })
+    .filter((f) => f.key);
+}
+
 export function RogueAP() {
   const [running, setRunning] = useState(false);
   const [ssid, setSsid] = useState('');
   const [password, setPassword] = useState('');
   const [portalSelected, setPortalSelected] = useState(false);
   const [knownPasswords, setKnownPasswords] = useState([]);
+  const [captured, setCaptured] = useState([]);
   const st = getState();
 
   useEffect(() => {
@@ -21,6 +36,22 @@ export function RogueAP() {
     return wsAddListener((msg) => {
       if (msg.type === 'attack_started' && msg.attack === 'rogueap') setRunning(true);
       if (msg.type === 'attack_stopped') setRunning(false);
+      if (msg.type === 'portal_data') {
+        const fields = parseFormFields(msg.data);
+        const summary = fields.map((f) => `${f.key}=${f.value}`).join('  ');
+        setCaptured((prev) => [
+          { id: `${Date.now()}-${Math.random().toString(16).slice(2, 6)}`, fields, summary, time: new Date().toLocaleTimeString() },
+          ...prev,
+        ]);
+        showToast(`Credentials captured: ${summary}`, 'success');
+      }
+      if (msg.type === 'password_received') {
+        setCaptured((prev) => [
+          { id: `${Date.now()}-${Math.random().toString(16).slice(2, 6)}`, fields: [{ key: 'password', value: msg.password }], summary: msg.password, time: new Date().toLocaleTimeString() },
+          ...prev,
+        ]);
+        showToast(`Password captured: ${msg.password}`, 'success');
+      }
     });
   }, []);
 
@@ -130,6 +161,32 @@ export function RogueAP() {
           )}
         </div>
       </section>
+
+      {captured.length > 0 ? (
+        <section class="glass-card card-body reveal">
+          <div class="section-head">
+            <h3 class="section-title">Captured Credentials</h3>
+            <span class="badge ok">{captured.length}</span>
+          </div>
+          <div class="table-wrap">
+            <table class="table">
+              <thead><tr><th>Time</th><th>Submitted data</th></tr></thead>
+              <tbody>
+                {captured.map((c) => (
+                  <tr key={c.id}>
+                    <td>{c.time}</td>
+                    <td>
+                      {(c.fields && c.fields.length) ? c.fields.map((f) => (
+                        <div key={f.key}><span class="kv-key">{f.key}:</span> {f.value}</div>
+                      )) : c.summary}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      ) : null}
     </Layout>
   );
 }

@@ -48,6 +48,8 @@ typedef enum {
     STATE_ATTACK_SAE,
     STATE_ATTACK_HANDSHAKE,
     STATE_ATTACK_SNIFFER,
+    STATE_ATTACK_SNIFFER_DOG,
+    STATE_ATTACK_BEACON_SPAM,
     STATE_ATTACK_BLACKOUT,
     STATE_ATTACK_MITM,
     STATE_ATTACK_NMAP,
@@ -148,6 +150,12 @@ bool cmd_do_sniffer(void);
 
 /** Start sniffer using existing scan results (no fresh scan). */
 bool cmd_do_sniffer_noscan(void);
+
+/** Start Sniffer Dog (capture AP-STA pairs + targeted deauth). */
+bool cmd_do_sniffer_dog(void);
+
+/** Start beacon spam broadcasting the given SSIDs. */
+bool cmd_do_beacon_spam(const char *const *ssids, int count);
 
 /** Request indexed probe list (start_karma uses these indices). */
 bool cmd_do_list_probes(void);

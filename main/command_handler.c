@@ -1238,6 +1238,17 @@ static void on_uart_line(const char *line, void *ctx)
             broadcast_json("{\"type\":\"client_connected\",\"mac\":\"%s\"}", ev.detail);
         } else if (ev.type == ATTACK_EVENT_PASSWORD_RECEIVED) {
             broadcast_json("{\"type\":\"password_received\",\"password\":\"%s\"}", ev.detail);
+        } else if (ev.type == ATTACK_EVENT_PORTAL_DATA) {
+            char escaped[260];
+            int j = 0;
+            for (int i = 0; ev.detail[i] && j < (int)sizeof(escaped) - 2; i++) {
+                if (ev.detail[i] == '"' || ev.detail[i] == '\\') {
+                    escaped[j++] = '\\';
+                }
+                escaped[j++] = ev.detail[i];
+            }
+            escaped[j] = '\0';
+            broadcast_json("{\"type\":\"portal_data\",\"data\":\"%s\"}", escaped);
         } else if (ev.type == ATTACK_EVENT_PASSWORD_VERIFIED) {
             broadcast_json("{\"type\":\"password_verified\"}");
         } else if (ev.type == ATTACK_EVENT_CLIENT_DISCONNECTED) {
@@ -1337,6 +1348,46 @@ static void on_uart_line(const char *line, void *ctx)
                 finish_sniffer_snapshot();
                 break;
             }
+        }
+        break;
+    }
+
+    case STATE_ATTACK_SNIFFER_DOG: {
+        attack_event_t ev = parse_attack_event(line);
+        if (ev.type == ATTACK_EVENT_STOP_ACK) {
+            xSemaphoreTake(s_mutex, portMAX_DELAY);
+            s_state = STATE_IDLE;
+            xSemaphoreGive(s_mutex);
+            broadcast_json("{\"type\":\"attack_stopped\"}");
+            break;
+        }
+
+        /* "[SnifferDog #2] DEAUTH sent: AP=30:AA:E4:3C:3F:64 -> STA=A6:02:A5:BA:DA:AB (Ch=1, RSSI=-69)" */
+        const char *tag = strstr(line, "[SnifferDog");
+        if (tag && strstr(line, "DEAUTH sent")) {
+            int n = 0, ch = 0, rssi = 0;
+            char ap[24] = {0}, sta[24] = {0};
+            const char *p;
+            if ((p = strchr(tag, '#'))) n = atoi(p + 1);
+            if ((p = strstr(line, "AP=")))   sscanf(p, "AP=%23[^ ]", ap);
+            if ((p = strstr(line, "STA=")))  sscanf(p, "STA=%23[^ )]", sta);
+            if ((p = strstr(line, "Ch=")))   ch = atoi(p + 3);
+            if ((p = strstr(line, "RSSI="))) rssi = atoi(p + 5);
+            broadcast_json(
+                "{\"type\":\"sniffer_dog_deauth\",\"n\":%d,\"ap\":\"%s\","
+                "\"sta\":\"%s\",\"ch\":%d,\"rssi\":%d}",
+                n, ap, sta, ch, rssi);
+        }
+        break;
+    }
+
+    case STATE_ATTACK_BEACON_SPAM: {
+        attack_event_t ev = parse_attack_event(line);
+        if (ev.type == ATTACK_EVENT_STOP_ACK) {
+            xSemaphoreTake(s_mutex, portMAX_DELAY);
+            s_state = STATE_IDLE;
+            xSemaphoreGive(s_mutex);
+            broadcast_json("{\"type\":\"attack_stopped\"}");
         }
         break;
     }
@@ -1871,6 +1922,8 @@ const char *cmd_state_name(cmd_state_t s)
     case STATE_ATTACK_SAE:        return "sae";
     case STATE_ATTACK_HANDSHAKE:  return "handshake";
     case STATE_ATTACK_SNIFFER:    return "sniffer";
+    case STATE_ATTACK_SNIFFER_DOG: return "sniffer_dog";
+    case STATE_ATTACK_BEACON_SPAM: return "beacon_spam";
     case STATE_ATTACK_BLACKOUT:   return "blackout";
     case STATE_ATTACK_MITM:       return "mitm";
     case STATE_ATTACK_NMAP:       return "nmap";
@@ -2103,6 +2156,52 @@ bool cmd_do_sniffer_noscan(void)
     if (s_display_cb) s_display_cb("start_sniffer_noscan", NULL);
     uart_bridge_send("start_sniffer_noscan");
     broadcast_json("{\"type\":\"attack_started\",\"attack\":\"sniffer\"}");
+    return true;
+}
+
+bool cmd_do_sniffer_dog(void)
+{
+    if (!set_state_if_idle(STATE_ATTACK_SNIFFER_DOG)) return false;
+    if (s_display_cb) s_display_cb("start_sniffer_dog", NULL);
+    uart_bridge_send("start_sniffer_dog");
+    broadcast_json("{\"type\":\"attack_started\",\"attack\":\"sniffer_dog\"}");
+    return true;
+}
+
+bool cmd_do_beacon_spam(const char *const *ssids, int count)
+{
+    if (!ssids || count <= 0) return false;
+    if (!set_state_if_idle(STATE_ATTACK_BEACON_SPAM)) return false;
+
+    /* Build: start_beacon_spam "s1" "s2" ...  JanOS caps at 32 SSIDs, each
+     * 1-32 chars, so a 1.5 KB buffer comfortably holds the worst case. */
+    char cmd[1536];
+    int pos = snprintf(cmd, sizeof(cmd), "start_beacon_spam");
+    int used = 0;
+    for (int i = 0; i < count && pos < (int)sizeof(cmd) - 40; i++) {
+        const char *s = ssids[i];
+        if (!s || !s[0]) continue;
+        /* Skip quotes inside the SSID to keep the argument parseable. */
+        pos += snprintf(cmd + pos, sizeof(cmd) - pos, " \"");
+        for (const char *c = s; *c && pos < (int)sizeof(cmd) - 4; c++) {
+            if (*c == '"') continue;
+            cmd[pos++] = *c;
+        }
+        pos += snprintf(cmd + pos, sizeof(cmd) - pos, "\"");
+        used++;
+    }
+    cmd[pos] = '\0';
+
+    if (used == 0) {
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        s_state = STATE_IDLE;
+        xSemaphoreGive(s_mutex);
+        return false;
+    }
+
+    if (s_display_cb) s_display_cb("start_beacon_spam", NULL);
+    uart_bridge_send(cmd);
+    broadcast_json("{\"type\":\"attack_started\",\"attack\":\"beacon_spam\"}");
     return true;
 }
 

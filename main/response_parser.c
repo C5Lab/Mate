@@ -280,6 +280,11 @@ attack_event_t parse_attack_event(const char *line)
         const char *path = strstr(line, "PCAP saved:") + 11;
         while (*path == ' ') path++;
         strncpy(ev.detail, path, sizeof(ev.detail) - 1);
+    } else if (strstr(line, "Received POST data:")) {
+        ev.type = ATTACK_EVENT_PORTAL_DATA;
+        const char *d = strstr(line, "Received POST data:") + strlen("Received POST data:");
+        while (*d == ' ') d++;
+        strncpy(ev.detail, d, sizeof(ev.detail) - 1);
     } else if (strstr(line, "Password received:")) {
         ev.type = ATTACK_EVENT_PASSWORD_RECEIVED;
         const char *pw = strstr(line, "Password received:") + 18;
