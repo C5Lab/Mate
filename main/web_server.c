@@ -868,6 +868,65 @@ static esp_err_t api_arp_hosts_get(httpd_req_t *req)
     return cw_finish(&cw);
 }
 
+static esp_err_t api_portal_captures_get(httpd_req_t *req)
+{
+    int n = cmd_get_portal_captures_count();
+    portal_capture_t *caps = NULL;
+    if (n > 0) {
+        caps = psram_malloc((size_t)n * sizeof(*caps));
+        if (!caps) {
+            send_json(req, "{\"ok\":false,\"error\":\"oom\"}");
+            return ESP_OK;
+        }
+        n = cmd_get_portal_captures(caps, n);
+    }
+
+    chunked_writer_t cw;
+    cw_init(&cw, req);
+    cw_printf(&cw, "{\"ok\":true,\"count\":%d,\"captures\":[", n);
+    for (int i = 0; i < n; i++) {
+        char esc[386];
+        int j = 0;
+        for (int k = 0; caps[i].data[k] && j < (int)sizeof(esc) - 2; k++) {
+            char c = caps[i].data[k];
+            if (c == '"' || c == '\\') esc[j++] = '\\';
+            esc[j++] = c;
+        }
+        esc[j] = '\0';
+        cw_printf(&cw, "%s{\"data\":\"%s\",\"at\":%u}",
+                  i > 0 ? "," : "", esc, (unsigned)caps[i].at_ms);
+    }
+    cw_printf(&cw, "]}");
+    free(caps);
+    return cw_finish(&cw);
+}
+
+static esp_err_t api_sniffer_dog_results_get(httpd_req_t *req)
+{
+    int count = cmd_get_sniffer_dog_count();
+    int n = 256;
+    sniffer_dog_event_t *ev = psram_malloc((size_t)n * sizeof(*ev));
+    if (!ev) {
+        send_json(req, "{\"ok\":false,\"error\":\"oom\"}");
+        return ESP_OK;
+    }
+    n = cmd_get_sniffer_dog_events(ev, n);
+
+    chunked_writer_t cw;
+    cw_init(&cw, req);
+    cw_printf(&cw, "{\"ok\":true,\"count\":%d,\"events\":[", count);
+    for (int i = 0; i < n; i++) {
+        cw_printf(&cw,
+            "%s{\"n\":%d,\"ap\":\"%s\",\"sta\":\"%s\",\"ch\":%d,\"rssi\":%d,\"at\":%u}",
+            i > 0 ? "," : "",
+            ev[i].n, ev[i].ap, ev[i].sta, ev[i].ch, ev[i].rssi,
+            (unsigned)ev[i].at_ms);
+    }
+    cw_printf(&cw, "]}");
+    free(ev);
+    return cw_finish(&cw);
+}
+
 static esp_err_t api_nmap_results_get(httpd_req_t *req)
 {
     nmap_state_t st;
@@ -968,14 +1027,12 @@ static esp_err_t api_dashboard_get(httpd_req_t *req)
         state = cmd_get_state();
     }
 
-    /* SD presence probe: cheap `sd_status` query, refreshed at most every
-     * 30s and only while idle so it never collides with an active command. */
-    static int64_t s_dashboard_sd_at = 0;
-    int64_t now_ms = esp_timer_get_time() / 1000;
+    /* SD presence probe: one-shot `sd_status` query fired only while the SD
+     * state is still unknown (< 0). Once JanOS answers SD_OK/SD_NONE it is
+     * cached for the session and never re-sent, keeping the UART quiet. */
     if (state == STATE_IDLE &&
         cmd_is_c5_connected() &&
-        (s_dashboard_sd_at == 0 || now_ms - s_dashboard_sd_at > 30000)) {
-        s_dashboard_sd_at = now_ms;
+        cmd_sd_present() < 0) {
         cmd_do_sd_status();
     }
 
@@ -1421,6 +1478,8 @@ esp_err_t web_server_start(void)
     REGISTER_URI("/api/probes",          HTTP_GET,  api_probes_get);
     REGISTER_URI("/api/probes",          HTTP_POST, api_probes_refresh_post);
     REGISTER_URI("/api/arp/hosts",       HTTP_GET,  api_arp_hosts_get);
+    REGISTER_URI("/api/portal/captures", HTTP_GET,  api_portal_captures_get);
+    REGISTER_URI("/api/sniffer_dog/results", HTTP_GET, api_sniffer_dog_results_get);
     REGISTER_URI("/api/nmap/results",    HTTP_GET,  api_nmap_results_get);
     REGISTER_URI("/api/status",        HTTP_GET,  api_status_get);
     REGISTER_URI("/api/dashboard",     HTTP_GET,  api_dashboard_get);

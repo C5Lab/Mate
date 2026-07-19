@@ -90,11 +90,21 @@ static int                  s_sd_present = -1;
 static esp_timer_handle_t   s_keepalive_timer = NULL;
 static dynvec_t             s_probes;         /* parsed_probe_t */
 static dynvec_t             s_probes_build;   /* parsed_probe_t */
+/* Live portal/karma/rogueap/eviltwin form submissions, and Sniffer Dog deauth
+ * events. Cached on-device (like nmap/arp) so the web UI can poll them over
+ * HTTP and not lose single-shot data when the send-only WS is LRU-purged. */
+static dynvec_t             s_portal_captures;    /* portal_capture_t */
+static dynvec_t             s_snifferdog_events;  /* sniffer_dog_event_t */
+static int                  s_snifferdog_count = 0;
 static cmd_state_t          s_probe_resume_state = STATE_IDLE;
 static bool                 s_has_last_gps_fix = false;
 static float                s_last_gps_lat = 0.0f;
 static float                s_last_gps_lon = 0.0f;
 static int64_t              s_last_uart_ms = 0;
+/* Set true on the first line ever received from the C5. Once established the
+ * connection is treated as sticky (no more keepalive pings), trading a slow
+ * idle-disconnect indication for a quiet UART. */
+static bool                 s_c5_established = false;
 static bool                 s_sta_connected = false;
 static char                 s_sta_ssid[33] = {0};
 static char                 s_wifi_connect_target[33] = {0};
@@ -150,6 +160,86 @@ static void mark_sta_disconnected(void)
     if (was_connected) {
         broadcast_json("{\"type\":\"wifi_disconnected\"}");
     }
+}
+
+/* Sniffer Dog lines are parsed regardless of FSM state. JanOS streams the
+ * `[SnifferDog #N] DEAUTH sent: ...` events (and can flip Mate back to IDLE via
+ * a stray `Stop command received` echo from the stop we send just before
+ * start_sniffer_dog), so - like nmap/ARP - we cache them state-independently
+ * and let /api/sniffer_dog/results poll the result. Returns true if the line
+ * was a Sniffer Dog line. */
+static bool handle_sniffer_dog_line(const char *line)
+{
+    /* Start banner: (re)establish the state and zero the counters so a fresh
+     * run always begins clean, even if the earlier reset raced a stop echo. */
+    if (strstr(line, "Sniffer Dog started") ||
+        strstr(line, "Starting Sniffer Dog mode")) {
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        s_state = STATE_ATTACK_SNIFFER_DOG;
+        dynvec_clear(&s_snifferdog_events);
+        s_snifferdog_count = 0;
+        xSemaphoreGive(s_mutex);
+        /* Re-announce in case a stop echo raced us to IDLE + attack_stopped. */
+        broadcast_json("{\"type\":\"attack_started\",\"attack\":\"sniffer_dog\"}");
+        return true;
+    }
+
+    const char *tag = strstr(line, "[SnifferDog");
+    if (!tag || !strstr(line, "DEAUTH sent")) return false;
+
+    int n = 0, ch = 0, rssi = 0;
+    char ap[24] = {0}, sta[24] = {0};
+    const char *p;
+    if ((p = strchr(tag, '#'))) n = atoi(p + 1);
+    if ((p = strstr(line, "AP=")))   sscanf(p, "AP=%23[^ ]", ap);
+    if ((p = strstr(line, "STA=")))  sscanf(p, "STA=%23[^ )]", sta);
+    if ((p = strstr(line, "Ch=")))   ch = atoi(p + 3);
+    if ((p = strstr(line, "RSSI="))) rssi = atoi(p + 5);
+
+    sniffer_dog_event_t sde = {0};
+    sde.n = n;
+    sde.ch = ch;
+    sde.rssi = rssi;
+    strncpy(sde.ap, ap, sizeof(sde.ap) - 1);
+    strncpy(sde.sta, sta, sizeof(sde.sta) - 1);
+    sde.at_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    s_snifferdog_count++;
+    if (s_snifferdog_events.count >= 256) {
+        dynvec_clear(&s_snifferdog_events);
+    }
+    dynvec_push(&s_snifferdog_events, &sde);
+    xSemaphoreGive(s_mutex);
+
+    broadcast_json(
+        "{\"type\":\"sniffer_dog_deauth\",\"n\":%d,\"ap\":\"%s\","
+        "\"sta\":\"%s\",\"ch\":%d,\"rssi\":%d}",
+        n, ap, sta, ch, rssi);
+    return true;
+}
+
+/* Reset the poll-able portal-capture cache at the start of a new attack. */
+static void portal_captures_reset(void)
+{
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    dynvec_clear(&s_portal_captures);
+    xSemaphoreGive(s_mutex);
+}
+
+/* Append one live portal form submission to the poll-able cache. */
+static void portal_capture_push(const char *data)
+{
+    if (!data || !data[0]) return;
+    portal_capture_t cap = {0};
+    strncpy(cap.data, data, sizeof(cap.data) - 1);
+    cap.at_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    /* Bound the cache so a marathon session can't grow it without limit. */
+    if (s_portal_captures.count >= 128) {
+        dynvec_clear(&s_portal_captures);
+    }
+    dynvec_push(&s_portal_captures, &cap);
+    xSemaphoreGive(s_mutex);
 }
 
 /* ---------- Scan / sniffer / arp dynvec helpers ---------- */
@@ -1097,6 +1187,7 @@ static void on_uart_line(const char *line, void *ctx)
 {
     (void)ctx;
     s_last_uart_ms = esp_timer_get_time() / 1000;
+    s_c5_established = true;
 
     /* Sub-GHz event lines are state-independent; they can arrive at any time
      * while listening (RSSI/RX/RAW) or at any moment a TX completes. RSSI
@@ -1115,6 +1206,12 @@ static void on_uart_line(const char *line, void *ctx)
      * echo (long before the actual scan results arrive), so we accumulate
      * `Host:`/`port/tcp open` rows in a state-independent helper. */
     handle_nmap_line(line);
+
+    /* Sniffer Dog deauth events likewise stream in regardless of FSM state
+     * (a stop echo can flip us to IDLE), so cache them state-independently. */
+    if (handle_sniffer_dog_line(line)) {
+        return;
+    }
 
     /* Update display if available */
     if (s_display_cb) {
@@ -1237,8 +1334,12 @@ static void on_uart_line(const char *line, void *ctx)
         if (ev.type == ATTACK_EVENT_CLIENT_CONNECTED) {
             broadcast_json("{\"type\":\"client_connected\",\"mac\":\"%s\"}", ev.detail);
         } else if (ev.type == ATTACK_EVENT_PASSWORD_RECEIVED) {
+            char pw[192];
+            snprintf(pw, sizeof(pw), "password=%s", ev.detail);
+            portal_capture_push(pw);
             broadcast_json("{\"type\":\"password_received\",\"password\":\"%s\"}", ev.detail);
         } else if (ev.type == ATTACK_EVENT_PORTAL_DATA) {
+            portal_capture_push(ev.detail);
             char escaped[260];
             int j = 0;
             for (int i = 0; ev.detail[i] && j < (int)sizeof(escaped) - 2; i++) {
@@ -1353,30 +1454,15 @@ static void on_uart_line(const char *line, void *ctx)
     }
 
     case STATE_ATTACK_SNIFFER_DOG: {
+        /* Deauth events and the start banner are handled state-independently in
+         * handle_sniffer_dog_line() above; here we only react to an explicit
+         * stop acknowledgement. */
         attack_event_t ev = parse_attack_event(line);
         if (ev.type == ATTACK_EVENT_STOP_ACK) {
             xSemaphoreTake(s_mutex, portMAX_DELAY);
             s_state = STATE_IDLE;
             xSemaphoreGive(s_mutex);
             broadcast_json("{\"type\":\"attack_stopped\"}");
-            break;
-        }
-
-        /* "[SnifferDog #2] DEAUTH sent: AP=30:AA:E4:3C:3F:64 -> STA=A6:02:A5:BA:DA:AB (Ch=1, RSSI=-69)" */
-        const char *tag = strstr(line, "[SnifferDog");
-        if (tag && strstr(line, "DEAUTH sent")) {
-            int n = 0, ch = 0, rssi = 0;
-            char ap[24] = {0}, sta[24] = {0};
-            const char *p;
-            if ((p = strchr(tag, '#'))) n = atoi(p + 1);
-            if ((p = strstr(line, "AP=")))   sscanf(p, "AP=%23[^ ]", ap);
-            if ((p = strstr(line, "STA=")))  sscanf(p, "STA=%23[^ )]", sta);
-            if ((p = strstr(line, "Ch=")))   ch = atoi(p + 3);
-            if ((p = strstr(line, "RSSI="))) rssi = atoi(p + 5);
-            broadcast_json(
-                "{\"type\":\"sniffer_dog_deauth\",\"n\":%d,\"ap\":\"%s\","
-                "\"sta\":\"%s\",\"ch\":%d,\"rssi\":%d}",
-                n, ap, sta, ch, rssi);
         }
         break;
     }
@@ -1842,7 +1928,9 @@ static void on_uart_line(const char *line, void *ctx)
 static void keepalive_timer_cb(void *arg)
 {
     (void)arg;
-    if (cmd_get_state() == STATE_IDLE) {
+    /* Only ping until the C5 has spoken to us once. After first contact the
+     * connection is sticky, so there's no need to keep the UART chattering. */
+    if (!s_c5_established && cmd_get_state() == STATE_IDLE) {
         uart_bridge_send("ping");
     }
 }
@@ -1867,6 +1955,8 @@ void cmd_handler_init(void)
     dynvec_init(&s_wardrive_logs,    sizeof(parsed_portal_file_t), 8);
     dynvec_init(&s_probes,         sizeof(parsed_probe_t),       8);
     dynvec_init(&s_probes_build,   sizeof(parsed_probe_t),       8);
+    dynvec_init(&s_portal_captures,   sizeof(portal_capture_t),    8);
+    dynvec_init(&s_snifferdog_events, sizeof(sniffer_dog_event_t), 16);
     dynvec_init(&s_subghz_signals, sizeof(subghz_signal_t),      8);
     dynvec_init(&s_subghz_build,   sizeof(subghz_signal_t),      8);
     dynvec_init(&s_arp_hosts,      sizeof(arp_host_t),           8);
@@ -2088,6 +2178,7 @@ bool cmd_do_deauth(void)
 bool cmd_do_evil_twin(void)
 {
     if (!set_state_if_idle(STATE_ATTACK_EVILTWIN)) return false;
+    portal_captures_reset();
     if (s_display_cb) s_display_cb("start_evil_twin", NULL);
     uart_bridge_send("start_evil_twin");
     broadcast_json("{\"type\":\"attack_started\",\"attack\":\"eviltwin\"}");
@@ -2097,6 +2188,7 @@ bool cmd_do_evil_twin(void)
 bool cmd_do_rogueap(const char *ssid, const char *password)
 {
     if (!set_state_if_idle(STATE_ATTACK_ROGUEAP)) return false;
+    portal_captures_reset();
     char cmd[160];
     snprintf(cmd, sizeof(cmd), "start_rogueap \"%s\" %s", ssid, password);
     if (s_display_cb) s_display_cb(cmd, NULL);
@@ -2109,6 +2201,7 @@ bool cmd_do_portal(const char *ssid)
 {
     if (!ssid || !ssid[0]) return false;
     if (!set_state_if_idle(STATE_ATTACK_PORTAL)) return false;
+    portal_captures_reset();
     char cmd[128];
     snprintf(cmd, sizeof(cmd), "start_portal \"%s\"", ssid);
     if (s_display_cb) s_display_cb(cmd, NULL);
@@ -2162,6 +2255,10 @@ bool cmd_do_sniffer_noscan(void)
 bool cmd_do_sniffer_dog(void)
 {
     if (!set_state_if_idle(STATE_ATTACK_SNIFFER_DOG)) return false;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    dynvec_clear(&s_snifferdog_events);
+    s_snifferdog_count = 0;
+    xSemaphoreGive(s_mutex);
     if (s_display_cb) s_display_cb("start_sniffer_dog", NULL);
     uart_bridge_send("start_sniffer_dog");
     broadcast_json("{\"type\":\"attack_started\",\"attack\":\"sniffer_dog\"}");
@@ -2241,6 +2338,7 @@ bool cmd_do_karma(int probe_index)
 {
     if (probe_index <= 0) return false;
     if (!set_state_if_idle(STATE_ATTACK_KARMA)) return false;
+    portal_captures_reset();
 
     char cmd[48];
     snprintf(cmd, sizeof(cmd), "start_karma %d", probe_index);
@@ -2540,9 +2638,10 @@ bool cmd_handshake_initial_done(void)
 
 bool cmd_is_c5_connected(void)
 {
-    int64_t now_ms = esp_timer_get_time() / 1000;
-    if (s_last_uart_ms <= 0) return false;
-    return (now_ms - s_last_uart_ms) <= 15000;
+    /* Sticky: once the C5 has ever replied we consider it connected. This
+     * avoids periodic pings just to keep the indicator green while idle.
+     * Tradeoff: an idle unplug isn't reflected until a real command times out. */
+    return s_c5_established;
 }
 
 bool cmd_get_last_gps_fix(float *lat, float *lon)
@@ -2585,6 +2684,36 @@ int cmd_get_probes(parsed_probe_t *out, int max)
 int cmd_get_probes_count(void)
 {
     return (int)s_probes.count;
+}
+
+int cmd_get_portal_captures(portal_capture_t *out, int max)
+{
+    if (!out || max <= 0) return 0;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    int n = (int)s_portal_captures.count < max ? (int)s_portal_captures.count : max;
+    if (n > 0) memcpy(out, s_portal_captures.data, n * sizeof(portal_capture_t));
+    xSemaphoreGive(s_mutex);
+    return n;
+}
+
+int cmd_get_portal_captures_count(void)
+{
+    return (int)s_portal_captures.count;
+}
+
+int cmd_get_sniffer_dog_count(void)
+{
+    return s_snifferdog_count;
+}
+
+int cmd_get_sniffer_dog_events(sniffer_dog_event_t *out, int max)
+{
+    if (!out || max <= 0) return 0;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    int n = (int)s_snifferdog_events.count < max ? (int)s_snifferdog_events.count : max;
+    if (n > 0) memcpy(out, s_snifferdog_events.data, n * sizeof(sniffer_dog_event_t));
+    xSemaphoreGive(s_mutex);
+    return n;
 }
 
 int cmd_get_arp_hosts(arp_host_t *out, int max)

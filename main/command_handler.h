@@ -76,6 +76,23 @@ typedef enum {
     PW_KIND_PORTAL,
 } pw_kind_t;
 
+/** A single live portal/karma/rogueap/eviltwin form submission captured during
+ *  an active attack (survives WS drops via /api/portal/captures). */
+typedef struct {
+    char     data[192];
+    uint32_t at_ms;
+} portal_capture_t;
+
+/** A single Sniffer Dog targeted-deauth event. */
+typedef struct {
+    int      n;
+    char     ap[24];
+    char     sta[24];
+    int      ch;
+    int      rssi;
+    uint32_t at_ms;
+} sniffer_dog_event_t;
+
 typedef struct {
     int   idx;
     char  type[16];
@@ -156,6 +173,14 @@ bool cmd_do_sniffer_dog(void);
 
 /** Start beacon spam broadcasting the given SSIDs. */
 bool cmd_do_beacon_spam(const char *const *ssids, int count);
+
+/** Copy up to `max` live portal captures into `out`; returns count copied. */
+int cmd_get_portal_captures(portal_capture_t *out, int max);
+int cmd_get_portal_captures_count(void);
+
+/** Sniffer Dog live results: total deauths sent + recent events. */
+int cmd_get_sniffer_dog_count(void);
+int cmd_get_sniffer_dog_events(sniffer_dog_event_t *out, int max);
 
 /** Request indexed probe list (start_karma uses these indices). */
 bool cmd_do_list_probes(void);

@@ -15,22 +15,27 @@ export function SnifferDog() {
     const removeWs = wsAddListener((msg) => {
       if (msg.type === 'attack_started' && msg.attack === 'sniffer_dog') setRunning(true);
       if (msg.type === 'attack_stopped') setRunning(false);
-      if (msg.type === 'sniffer_dog_deauth') {
-        setCount((prev) => prev + 1);
-        setEvents((prev) => [
-          {
-            id: `${Date.now()}-${Math.random().toString(16).slice(2, 6)}`,
-            n: msg.n,
-            ap: msg.ap,
-            sta: msg.sta,
-            ch: msg.ch,
-            rssi: msg.rssi,
-            time: new Date().toLocaleTimeString(),
-          },
-          ...prev,
-        ].slice(0, 200));
-      }
+      // The counter/events are refreshed from the device-cached REST poll
+      // below (source of truth) so they keep updating even if the send-only
+      // WS is dropped.
     });
+
+    // Poll device-side sniffer-dog results every 2s.
+    let alive = true;
+    async function pollResults() {
+      try {
+        const res = await api.snifferDogResults();
+        if (!alive || !res || !res.ok) return;
+        setCount(res.count || 0);
+        const list = (res.events || []).map((e, i) => ({
+          id: `${e.at}-${e.n}-${i}`,
+          n: e.n, ap: e.ap, sta: e.sta, ch: e.ch, rssi: e.rssi,
+        })).reverse().slice(0, 200);
+        setEvents(list);
+      } catch (_) { /* ignore */ }
+    }
+    pollResults();
+    const resTimer = setInterval(pollResults, 2000);
 
     (async () => {
       if (startedRef.current) return;
@@ -52,7 +57,7 @@ export function SnifferDog() {
       }
     })();
 
-    return removeWs;
+    return () => { alive = false; clearInterval(resTimer); removeWs(); };
   }, []);
 
   async function start() {
@@ -119,12 +124,11 @@ export function SnifferDog() {
           <div class="table-wrap">
             <table class="table">
               <thead>
-                <tr><th>Time</th><th>#</th><th>AP</th><th>STA</th><th>CH</th><th>RSSI</th></tr>
+                <tr><th>#</th><th>AP</th><th>STA</th><th>CH</th><th>RSSI</th></tr>
               </thead>
               <tbody>
                 {events.map((e) => (
                   <tr key={e.id}>
-                    <td>{e.time}</td>
                     <td>{e.n}</td>
                     <td>{e.ap}</td>
                     <td>{e.sta}</td>

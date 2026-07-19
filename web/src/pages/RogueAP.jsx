@@ -33,26 +33,41 @@ export function RogueAP() {
     loadPasswords();
     const selected = st.networks.find((n) => st.selected.has(n.index));
     if (selected?.ssid) setSsid(selected.ssid);
-    return wsAddListener((msg) => {
+    const removeWs = wsAddListener((msg) => {
       if (msg.type === 'attack_started' && msg.attack === 'rogueap') setRunning(true);
       if (msg.type === 'attack_stopped') setRunning(false);
+      // Credential list comes from the device-cached REST poll (source of
+      // truth); the WS handlers below only fire an instant toast.
       if (msg.type === 'portal_data') {
         const fields = parseFormFields(msg.data);
         const summary = fields.map((f) => `${f.key}=${f.value}`).join('  ');
-        setCaptured((prev) => [
-          { id: `${Date.now()}-${Math.random().toString(16).slice(2, 6)}`, fields, summary, time: new Date().toLocaleTimeString() },
-          ...prev,
-        ]);
         showToast(`Credentials captured: ${summary}`, 'success');
       }
       if (msg.type === 'password_received') {
-        setCaptured((prev) => [
-          { id: `${Date.now()}-${Math.random().toString(16).slice(2, 6)}`, fields: [{ key: 'password', value: msg.password }], summary: msg.password, time: new Date().toLocaleTimeString() },
-          ...prev,
-        ]);
         showToast(`Password captured: ${msg.password}`, 'success');
       }
     });
+
+    let alive = true;
+    async function pollCaptures() {
+      try {
+        const res = await api.portalCaptures();
+        if (!alive || !res || !res.ok) return;
+        const list = (res.captures || []).map((c, i) => {
+          const fields = parseFormFields(c.data);
+          return {
+            id: `${c.at}-${i}`,
+            fields,
+            summary: fields.map((f) => `${f.key}=${f.value}`).join('  ') || c.data,
+          };
+        }).reverse();
+        setCaptured(list);
+      } catch (_) { /* ignore */ }
+    }
+    pollCaptures();
+    const capTimer = setInterval(pollCaptures, 2000);
+
+    return () => { alive = false; clearInterval(capTimer); removeWs(); };
   }, []);
 
   async function loadPasswords() {
@@ -170,11 +185,11 @@ export function RogueAP() {
           </div>
           <div class="table-wrap">
             <table class="table">
-              <thead><tr><th>Time</th><th>Submitted data</th></tr></thead>
+              <thead><tr><th>#</th><th>Submitted data</th></tr></thead>
               <tbody>
-                {captured.map((c) => (
+                {captured.map((c, i) => (
                   <tr key={c.id}>
-                    <td>{c.time}</td>
+                    <td>{captured.length - i}</td>
                     <td>
                       {(c.fields && c.fields.length) ? c.fields.map((f) => (
                         <div key={f.key}><span class="kv-key">{f.key}:</span> {f.value}</div>

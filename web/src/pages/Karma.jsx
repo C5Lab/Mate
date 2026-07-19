@@ -88,31 +88,15 @@ export function Karma() {
         setClients((prev) => prev.filter((m) => m !== msg.mac));
       }
 
+      // The credential list is rebuilt from the device-cached REST endpoint
+      // (source of truth); these WS events are only for the instant toast.
       if (msg.type === 'portal_data') {
         const fields = parseFormFields(msg.data);
         const summary = fields.map((f) => `${f.key}=${f.value}`).join('  ');
-        setPasswords((prev) => [
-          {
-            id: `${Date.now()}-${Math.random().toString(16).slice(2, 6)}`,
-            password: summary,
-            fields,
-            time: new Date().toLocaleTimeString(),
-          },
-          ...prev,
-        ]);
         showToast(`Credentials captured: ${summary}`, 'success');
       }
 
       if (msg.type === 'password_received') {
-        setPasswords((prev) => [
-          {
-            id: `${Date.now()}-${Math.random().toString(16).slice(2, 6)}`,
-            password: msg.password,
-            fields: [{ key: 'password', value: msg.password }],
-            time: new Date().toLocaleTimeString(),
-          },
-          ...prev,
-        ]);
         showToast(`Password captured: ${msg.password}`, 'success');
       }
 
@@ -122,7 +106,24 @@ export function Karma() {
       }
     });
 
-    return removeWs;
+    // Poll device-cached captures every 2s so credentials survive WS drops.
+    let alive = true;
+    async function pollCaptures() {
+      try {
+        const res = await api.portalCaptures();
+        if (!alive || !res || !res.ok) return;
+        const list = (res.captures || []).map((c, i) => {
+          const fields = parseFormFields(c.data);
+          const summary = fields.map((f) => `${f.key}=${f.value}`).join('  ') || c.data;
+          return { id: `${c.at}-${i}`, password: summary, fields };
+        }).reverse();
+        setPasswords(list);
+      } catch (_) { /* ignore */ }
+    }
+    pollCaptures();
+    const capTimer = setInterval(pollCaptures, 2000);
+
+    return () => { alive = false; clearInterval(capTimer); removeWs(); };
   }, []);
 
   async function start() {
@@ -241,7 +242,6 @@ export function Karma() {
             </span>
           </div>
           <div class="credential-value">{lastPassword.password}</div>
-          <div class="section-note">Captured at {lastPassword.time}</div>
         </section>
       ) : running ? (
         <section class="glass-card card-body reveal">
@@ -265,14 +265,14 @@ export function Karma() {
             <table class="table">
               <thead>
                 <tr>
-                  <th>Time</th>
+                  <th>#</th>
                   <th>Password</th>
                 </tr>
               </thead>
               <tbody>
-                {passwords.map((pw) => (
+                {passwords.map((pw, i) => (
                   <tr key={pw.id}>
-                    <td>{pw.time}</td>
+                    <td>{passwords.length - i}</td>
                     <td>
                       {(pw.fields && pw.fields.length) ? pw.fields.map((f) => (
                         <div key={f.key}><span class="kv-key">{f.key}:</span> {f.value}</div>
