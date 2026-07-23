@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'preact/hooks';
+import { route } from 'preact-router';
 import { Layout } from '../components/Layout';
 import { api } from '../api';
 import { getState, wardriveReset, wardrivePatch, antisurvReset, antisurvPatch } from '../store';
@@ -300,6 +301,9 @@ export function Wardrive() {
               <option value="external">External feed</option>
               <option value="cap">Cap module</option>
             </select>
+            <button class="btn btn-secondary" style="margin-top:8px" onClick={() => route('/gps/diag')}>
+              GPS Diagnostics
+            </button>
           </div>
         </div>
 
