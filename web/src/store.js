@@ -35,6 +35,20 @@ let state = {
   gpsFix: false,
   gpsLat: 0,
   gpsLon: 0,
+  /* Live wardrive session state (driven by WS attack_started/stopped +
+   * wardrive_status events). */
+  wardriveRunning: false,
+  wardriveSats: 0,
+  wardriveDistance: 0,
+  /* WiGLE/WDGWars upload session state. */
+  wardriveUploadRunning: false,
+  wardriveUploadProvider: '',
+  wardriveUploadLast: '',
+  wardriveUploadResult: null,
+  wardriveUploadError: null,
+  /* GPS raw NMEA diagnostics. */
+  gpsRawRunning: false,
+  gpsRawLines: [],
   /* SD presence from JanOS `sd_status`: 1 present, 0 absent, -1 unknown. */
   sdPresent: -1,
   /* Discovered hosts from `list_hosts` (ARP attack). Populated globally so

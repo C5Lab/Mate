@@ -26,6 +26,8 @@ import { GlobalAttacks } from './pages/GlobalAttacks';
 import { SDData } from './pages/SDData';
 import { Bluetooth } from './pages/Bluetooth';
 import { Wardrive } from './pages/Wardrive';
+import { WardriveUpload } from './pages/WardriveUpload';
+import { GpsDiag } from './pages/GpsDiag';
 import { Karma } from './pages/Karma';
 import { DeauthDetector } from './pages/DeauthDetector';
 import { Portal } from './pages/Portal';
@@ -146,11 +148,74 @@ export function App() {
       }
 
       if (msg.type === 'attack_started') {
-        setState({ status: normalizeStatus(msg.attack) });
+        const patch = { status: normalizeStatus(msg.attack) };
+        if (msg.attack === 'wardrive') {
+          patch.wardriveRunning = true;
+          patch.wardriveSats = 0;
+          patch.wardriveDistance = 0;
+        }
+        if (msg.attack === 'wardrive_upload') {
+          patch.wardriveUploadRunning = true;
+          patch.wardriveUploadProvider = msg.provider || '';
+          patch.wardriveUploadResult = null;
+          patch.wardriveUploadError = null;
+          patch.wardriveUploadLast = '';
+        }
+        if (msg.attack === 'gps_raw') {
+          patch.gpsRawRunning = true;
+          patch.gpsRawLines = [];
+        }
+        setState(patch);
       }
 
       if (msg.type === 'attack_stopped') {
-        setState({ status: 'idle' });
+        setState({
+          status: 'idle',
+          wardriveRunning: false,
+          wardriveUploadRunning: false,
+          gpsRawRunning: false,
+        });
+      }
+
+      if (msg.type === 'gps_nmea' && typeof msg.line === 'string') {
+        const next = [...st.gpsRawLines, msg.line];
+        if (next.length > 60) next.splice(0, next.length - 60);
+        setState({ gpsRawRunning: true, gpsRawLines: next });
+      }
+
+      if (msg.type === 'wardrive_status') {
+        setState({
+          wardriveRunning: true,
+          wardriveSats: typeof msg.sats === 'number' && msg.sats >= 0 ? msg.sats : st.wardriveSats,
+          wardriveDistance: typeof msg.dist === 'number' ? msg.dist : st.wardriveDistance,
+        });
+      }
+
+      if (msg.type === 'wardrive_upload_done') {
+        setState({
+          status: 'idle',
+          wardriveUploadRunning: false,
+          wardriveUploadResult: {
+            provider: msg.provider || '',
+            uploaded: msg.uploaded || 0,
+            skipped: msg.skipped || 0,
+            failed: msg.failed || 0,
+            rateLimited: msg.rate_limited || 0,
+          },
+          wardriveUploadError: null,
+        });
+      }
+
+      if (msg.type === 'wardrive_upload_error') {
+        setState({
+          status: 'idle',
+          wardriveUploadRunning: false,
+          wardriveUploadError: msg.reason || 'error',
+        });
+      }
+
+      if (msg.type === 'uart_line' && typeof msg.data === 'string' && st.wardriveUploadRunning) {
+        setState({ wardriveUploadLast: msg.data });
       }
 
       if (msg.type === 'sniffer_count') {
@@ -261,6 +326,8 @@ export function App() {
           <SDData path="/sddata" />
           <Bluetooth path="/bluetooth" />
           <Wardrive path="/wardrive" />
+          <WardriveUpload path="/wardrive/upload" />
+          <GpsDiag path="/gps/diag" />
           <Karma path="/karma" />
           <Portal path="/portal" />
           <SnifferDog path="/snifferdog" />

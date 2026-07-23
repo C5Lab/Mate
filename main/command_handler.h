@@ -34,6 +34,73 @@ typedef struct {
     int  rssi;
 } bt_device_t;
 
+/* ---- Wardrive configuration (mirrors JanOS get_wardrive_config / set_* commands) ---- */
+#define WARDRIVE_BAND_WIFI24   0x01
+#define WARDRIVE_BAND_WIFI5    0x02
+#define WARDRIVE_BAND_BLE      0x04
+#define WARDRIVE_CUSTOM_CH_MAX 96
+#define WARDRIVE_GPS_MODULE_MAX 16
+
+typedef enum {
+    WARDRIVE_CH_POPULAR = 0,
+    WARDRIVE_CH_ALL = 1,
+    WARDRIVE_CH_CUSTOM = 2,
+} wardrive_channel_mode_t;
+
+typedef enum {
+    WARDRIVE_ANTISURV_LOW = 0,
+    WARDRIVE_ANTISURV_MED = 1,
+    WARDRIVE_ANTISURV_HIGH = 2,
+} wardrive_antisurv_sens_t;
+
+typedef struct {
+    uint8_t bands;                       /* bitmask of WARDRIVE_BAND_* */
+    wardrive_channel_mode_t channel_mode;
+    char custom_channels[WARDRIVE_CUSTOM_CH_MAX]; /* colon-separated, e.g. "1:6:11:36" */
+    int wifi_rssi_delta;                 /* 0-50, 0 = log once */
+    int ble_rssi_delta;                  /* 0-50 */
+    int startup_cooldown;                /* 0-600 s */
+    int mem_cap;                         /* 1000-200000 */
+    wardrive_antisurv_sens_t antisurv_sensitivity;
+    char gps_module[WARDRIVE_GPS_MODULE_MAX]; /* e.g. "m5", "atgm", "external", "cap" */
+    bool loaded;                         /* true once populated from get_wardrive_config */
+} wardrive_config_t;
+
+/* A single wardrive log file with its per-provider upload status, parsed from
+ * the JanOS `wardrive_files` command ([WARD_FILE] filename=... lines). */
+#define WARDRIVE_FILE_NAME_MAX     96
+#define WARDRIVE_UPLOAD_STATUS_MAX 16
+typedef struct {
+    char name[WARDRIVE_FILE_NAME_MAX];
+    char wigle[WARDRIVE_UPLOAD_STATUS_MAX];   /* done/pending/failed/rate_limited/ok/unknown */
+    char wdgwars[WARDRIVE_UPLOAD_STATUS_MAX];
+    long size;
+    int  wifi;
+    int  ble;
+    int  bt;
+} wardrive_file_t;
+
+/* ---- GPS raw NMEA diagnostics (HTTP-poll fallback for the WS `gps_nmea`
+ *      flood, which the phone loses to LRU socket purges). ---- */
+#define GPS_RAW_LINE_MAX   100  /* max chars kept per NMEA sentence */
+#define GPS_RAW_RING_MAX   40   /* recent sentences retained for polling */
+
+/* ---- Wardrive live status + recently-seen networks (HTTP-poll fallback for
+ *      the WS `wardrive_status` + raw CSV lines). ---- */
+#define WARDRIVE_NET_SSID_MAX 33
+#define WARDRIVE_NET_SEC_MAX  24
+#define WARDRIVE_NET_RING_MAX 40
+
+typedef struct {
+    char  mac[18];
+    char  ssid[WARDRIVE_NET_SSID_MAX];
+    char  sec[WARDRIVE_NET_SEC_MAX];
+    int   ch;
+    int   rssi;
+    float lat;
+    float lon;
+} wardrive_net_t;
+
 typedef struct {
     char     level[16];
     int      total_hosts;     /* from "Total: N hosts discovered" or "Scanning N host(s)" */
@@ -72,6 +139,11 @@ typedef enum {
     STATE_LISTING_SNIFFER,
     STATE_LISTING_HANDSHAKES,
     STATE_LISTING_WARDRIVE,
+    STATE_WARDRIVE,
+    STATE_WARDRIVE_CONFIG,
+    STATE_LISTING_WARDRIVE_FILES,
+    STATE_WARDRIVE_UPLOAD,
+    STATE_GPS_RAW,
     STATE_LISTING_PROBES,
     STATE_ATTACK_KARMA,
     STATE_SUBGHZ_LISTEN,
@@ -257,6 +329,37 @@ bool cmd_do_sd_status(void);
 /** Request wardrive log files from SD card. */
 bool cmd_do_list_wardrive_logs(void);
 
+/** Start a wardrive session. trace=true enables the KML track
+ *  (`start_wardrive_promisc_trace`) vs. plain `start_wardrive_promisc`. */
+bool cmd_do_start_wardrive(bool trace);
+
+/** Query current wardrive config from JanOS (`get_wardrive_config`).
+ *  Parsed `[WDCFG]` lines populate the cached config. Returns false if busy. */
+bool cmd_do_get_wardrive_config(void);
+
+/** Push wardrive settings to JanOS via the `set_wardrive_*` command family.
+ *  When apply_gps is true, also sends `gps_set <module>`. Returns false if
+ *  busy or if no band is selected. */
+bool cmd_do_set_wardrive_config(const wardrive_config_t *cfg, bool apply_gps);
+
+/** Set the GPS module profile on the device (`gps_set <module>`). Fire-and-forget
+ *  (does not hold the command FSM). module e.g. "m5", "atgm", "external", "cap". */
+bool cmd_do_gps_set(const char *module);
+
+/** Stream raw NMEA from the GPS for diagnostics (`start_gps_raw [baud]`).
+ *  baud <= 0 uses the module's configured baud. Stop with `cmd_do_stop`. */
+bool cmd_do_gps_raw(int baud);
+
+/** List wardrive log files with their per-provider upload status
+ *  (`wardrive_files`). Populates the cached file list. Returns false if busy. */
+bool cmd_do_list_wardrive_files(void);
+
+/** Start a WiGLE/WDGWars upload. provider is "wigle" or "wdgwars"; mode is
+ *  "selected" (needs filename), "pending" (sync not-yet-done), or "all"
+ *  (force re-upload everything). Requires an active STA WiFi connection on the
+ *  device. Returns false if busy or on bad arguments. */
+bool cmd_do_wardrive_upload(const char *provider, const char *mode, const char *filename);
+
 /* ---------- State queries ---------- */
 
 cmd_state_t cmd_get_state(void);
@@ -309,6 +412,44 @@ const char *cmd_get_sta_ssid(void);
 /** Copy up to `max` cached wardrive log entries into `out`. */
 int cmd_get_wardrive_logs(parsed_portal_file_t *out, int max);
 int cmd_get_wardrive_logs_count(void);
+
+/** Copy the cached wardrive config into `out`. Returns true if the config has
+ *  been loaded at least once from JanOS (`get_wardrive_config`). */
+bool cmd_get_wardrive_config(wardrive_config_t *out);
+
+/** Whether the wardrive config was already loaded from JanOS this boot. */
+bool cmd_wardrive_config_loaded(void);
+
+/** Copy up to `max` cached wardrive files (from `wardrive_files`) into `out`. */
+int cmd_get_wardrive_files(wardrive_file_t *out, int max);
+int cmd_get_wardrive_files_count(void);
+
+/** Whether the wardrive file list finished loading at least once. Lets the
+ *  web layer distinguish "empty directory" from "still loading". */
+bool cmd_wardrive_files_loaded(void);
+
+/** Copy up to `max` recent GPS raw NMEA sentences into `out_lines`, a flat
+ *  buffer of `max` slots each `GPS_RAW_LINE_MAX` bytes (stride
+ *  `GPS_RAW_LINE_MAX`). Oldest-first. Returns the number of lines copied. */
+int cmd_get_gps_raw_lines(char *out_lines, int max);
+
+/** Latest GPS raw fix quality (from `$..GGA` field 6) and satellite count
+ *  (field 7). Either arg may be NULL. Quality 0 means no fix. */
+void cmd_get_gps_raw_fix(int *quality_out, int *sats_out);
+
+/** Latest live wardrive counters parsed from the `Wardrive promisc:` status
+ *  line. Any arg may be NULL. */
+void cmd_get_wardrive_live(int *sats_out, float *dist_out, int *unique_out,
+                           int *relogs_out);
+
+/** True while a wardrive session is active - either tracked by the command FSM
+ *  or detected from JanOS's stream (session started outside the web / after an
+ *  FSM reset). */
+bool cmd_wardrive_running(void);
+
+/** Copy up to `max` recently-seen wardrive networks (most-recent-first) into
+ *  `out`. Returns the number copied. */
+int cmd_get_wardrive_nets(wardrive_net_t *out, int max);
 
 /** Copy up to `max` cached probe entries into `out`. */
 int cmd_get_probes(parsed_probe_t *out, int max);
