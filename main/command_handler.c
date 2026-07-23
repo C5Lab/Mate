@@ -89,7 +89,6 @@ static int                  s_sniffer_ap_index = -1;
  * as the end of a `show_sniffer_results` / `list_probes` reply, prematurely
  * finishing the snapshot with an empty buffer. Only honor a terminating prompt
  * once we've seen the command echo. Reset when the command is (re)issued. */
-static bool                 s_sniffer_echo_seen = false;
 static bool                 s_probes_echo_seen = false;
 static int                  s_handshake_count = -1;
 static bool                 s_handshake_initial_done = false;
@@ -2062,73 +2061,6 @@ static void on_uart_line(const char *line, void *ctx)
             s_observer_pending = false;
             ESP_LOGI(TAG, "Observer: scan done, auto-starting sniffer");
             cmd_do_sniffer_noscan();
-        }
-        break;
-    }
-
-    case STATE_WARDRIVE_CONFIG: {
-        /* Swallow the `> get_wardrive_config` command echo so it isn't treated
-         * as the terminating prompt before any [WDCFG] line has arrived. */
-        if (!s_wardrive_config_echo_seen && strstr(line, "get_wardrive_config")) {
-            s_wardrive_config_echo_seen = true;
-            break;
-        }
-        /* Parse `[WDCFG] key=value` lines emitted by get_wardrive_config. */
-        const char *p = strstr(line, "[WDCFG]");
-        if (p) {
-            p += strlen("[WDCFG]");
-            while (*p == ' ') p++;
-            if (strncmp(p, "END", 3) == 0) {
-                s_wardrive_config.loaded = true;
-                s_wardrive_config_loaded = true;
-                xSemaphoreTake(s_mutex, portMAX_DELAY);
-                s_state = STATE_IDLE;
-                xSemaphoreGive(s_mutex);
-                broadcast_json("{\"type\":\"wardrive_config\",\"status\":\"loaded\"}");
-                break;
-            }
-            if (strncmp(p, "bands=", 6) == 0) {
-                s_wardrive_config.bands = 0;
-                if (strstr(p, "wifi24")) s_wardrive_config.bands |= WARDRIVE_BAND_WIFI24;
-                if (strstr(p, "wifi5"))  s_wardrive_config.bands |= WARDRIVE_BAND_WIFI5;
-                if (strstr(p, "ble"))    s_wardrive_config.bands |= WARDRIVE_BAND_BLE;
-            } else if (strncmp(p, "channels=", 9) == 0) {
-                const char *v = p + 9;
-                if (strncmp(v, "popular", 7) == 0) s_wardrive_config.channel_mode = WARDRIVE_CH_POPULAR;
-                else if (strncmp(v, "custom", 6) == 0) s_wardrive_config.channel_mode = WARDRIVE_CH_CUSTOM;
-                else s_wardrive_config.channel_mode = WARDRIVE_CH_ALL;
-            } else if (strncmp(p, "custom=", 7) == 0) {
-                snprintf(s_wardrive_config.custom_channels,
-                         sizeof(s_wardrive_config.custom_channels), "%s", p + 7);
-            } else if (strncmp(p, "wifi_rssi_delta=", 16) == 0) {
-                s_wardrive_config.wifi_rssi_delta = atoi(p + 16);
-            } else if (strncmp(p, "ble_rssi_delta=", 15) == 0) {
-                s_wardrive_config.ble_rssi_delta = atoi(p + 15);
-            } else if (strncmp(p, "startup_cooldown=", 17) == 0) {
-                s_wardrive_config.startup_cooldown = atoi(p + 17);
-            } else if (strncmp(p, "mem_cap=", 8) == 0) {
-                s_wardrive_config.mem_cap = atoi(p + 8);
-            } else if (strncmp(p, "antisurv_sensitivity=", 21) == 0) {
-                const char *v = p + 21;
-                if (strncmp(v, "low", 3) == 0) s_wardrive_config.antisurv_sensitivity = WARDRIVE_ANTISURV_LOW;
-                else if (strncmp(v, "high", 4) == 0) s_wardrive_config.antisurv_sensitivity = WARDRIVE_ANTISURV_HIGH;
-                else s_wardrive_config.antisurv_sensitivity = WARDRIVE_ANTISURV_MED;
-            } else if (strncmp(p, "gps=", 4) == 0) {
-                snprintf(s_wardrive_config.gps_module,
-                         sizeof(s_wardrive_config.gps_module), "%s", p + 4);
-            }
-            break;
-        }
-        /* Fallback: if the prompt arrives without an explicit [WDCFG] END, still
-         * finish so we never wedge in the config-read state. Only honor it after
-         * the command echo so the echo itself doesn't finalize the read early. */
-        if (is_prompt_line(line) && s_wardrive_config_echo_seen) {
-            s_wardrive_config.loaded = true;
-            s_wardrive_config_loaded = true;
-            xSemaphoreTake(s_mutex, portMAX_DELAY);
-            s_state = STATE_IDLE;
-            xSemaphoreGive(s_mutex);
-            broadcast_json("{\"type\":\"wardrive_config\",\"status\":\"loaded\"}");
         }
         break;
     }

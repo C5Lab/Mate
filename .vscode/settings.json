@@ -1,9 +1,19 @@
 {
-  "idf.currentSetup": "C:\\Users\\mati\\esp\\v6.0-beta1\\esp-idf",
-  "clangd.path": "C:\\Espressif\\tools\\esp-clang\\esp-20.1.1_20250829\\esp-clang\\bin\\clangd.exe",
+  "idf.currentSetup": "/Users/jan/.espressif/v6.0/esp-idf",
+  "clangd.path": "/Users/jan/.espressif/tools/esp-clang/esp-20.1.1_20250829/esp-clang/bin/clangd",
   "clangd.arguments": [
     "--background-index",
     "--query-driver=**",
-    "--compile-commands-dir=c:\\Users\\mati\\Documents\\GitHub\\Mate\\build"
+    "--compile-commands-dir=/Users/jan/kod/Mate/build"
+  ],
+  "idf.customExtraVars": {
+    "IDF_TARGET": "esp32"
+  },
+  "idf.port": "/dev/tty.usbserial-5A490765391",
+  "idf.monitorPort": "/dev/tty.usbserial-5A490765391",
+  "idf.flashType": "UART",
+  "idf.openOcdConfigs": [
+    "interface/ftdi/esp32_devkitj_v1.cfg",
+    "target/esp32.cfg"
   ]
 }
