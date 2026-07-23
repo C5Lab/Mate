@@ -1,10 +1,10 @@
 {
   "idf.currentSetup": "/Users/jan/.espressif/v6.0/esp-idf",
-  "clangd.path": "/Users/jan/.espressif/tools/esp-clang/esp-20.1.1_20250829/esp-clang/bin/clangd",
+  "clangd.path": "C:\\Users\\mati\\.espressif\\tools\\esp-clang\\esp-20.1.1_20250829\\esp-clang\\bin\\clangd.exe",
   "clangd.arguments": [
     "--background-index",
     "--query-driver=**",
-    "--compile-commands-dir=/Users/jan/kod/Mate/build"
+    "--compile-commands-dir=c:\\Users\\mati\\Documents\\GitHub\\Mate\\build"
   ],
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32"
