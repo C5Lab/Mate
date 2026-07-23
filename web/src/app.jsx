@@ -33,9 +33,13 @@ import { SDData } from './pages/SDData';
 import { Bluetooth } from './pages/Bluetooth';
 import { Wardrive } from './pages/Wardrive';
 import { MeshRecon } from './pages/MeshRecon';
+import { WardriveUpload } from './pages/WardriveUpload';
+import { GpsDiag } from './pages/GpsDiag';
 import { Karma } from './pages/Karma';
 import { DeauthDetector } from './pages/DeauthDetector';
 import { Portal } from './pages/Portal';
+import { SnifferDog } from './pages/SnifferDog';
+import { BeaconSpam } from './pages/BeaconSpam';
 import { SubGhz } from './pages/SubGhz';
 import { SubGhzListen } from './pages/subghz/Listen';
 import { SubGhzTransmit } from './pages/subghz/Transmit';
@@ -162,8 +166,7 @@ export function App() {
           gpsFix: !!data.gps_fix,
           gpsLat: data.gps_lat || 0,
           gpsLon: data.gps_lon || 0,
-          sdFreeGb: data.sd_free_gb ?? -1,
-          sdTotalGb: data.sd_total_gb ?? -1,
+          sdPresent: data.sd_present ?? -1,
           staConnected: !!data.sta_connected,
           staSsid: data.sta_ssid || '',
         });
@@ -180,6 +183,9 @@ export function App() {
      * ends. 12s felt like a ~20s lag; 3s keeps it snappy. */
     syncStatusRef.current = syncStatus;
     const pollStatusId = setInterval(syncStatus, 3000);
+    /* Refresh dashboard-only fields (handshake count, SD status, GPS) so they
+     * appear once the C5 link comes up, not just on the very first mount. */
+    const pollDashboardId = setInterval(syncDashboard, 15000);
 
     const removeWs = wsAddListener((msg) => {
       const st = getState();
@@ -222,12 +228,61 @@ export function App() {
         } else if (msg.attack === 'antisurv' && !st.antisurv.running) {
           antisurvReset({ running: true });
         }
+        if (msg.attack === 'wardrive_upload') {
+          setState({
+            wardriveUploadRunning: true,
+            wardriveUploadProvider: msg.provider || '',
+            wardriveUploadResult: null,
+            wardriveUploadError: null,
+            wardriveUploadLast: '',
+          });
+        }
+        if (msg.attack === 'gps_raw') {
+          setState({ gpsRawRunning: true, gpsRawLines: [] });
+        }
       }
 
       if (msg.type === 'attack_stopped') {
-        setState({ status: 'idle' });
+        setState({
+          status: 'idle',
+          wardriveUploadRunning: false,
+          gpsRawRunning: false,
+        });
         if (st.wardrive.running) wardrivePatch({ running: false, gps: 'idle' });
         if (st.antisurv.running) antisurvPatch({ running: false });
+      }
+
+      if (msg.type === 'gps_nmea' && typeof msg.line === 'string') {
+        const next = [...st.gpsRawLines, msg.line];
+        if (next.length > 60) next.splice(0, next.length - 60);
+        setState({ gpsRawRunning: true, gpsRawLines: next });
+      }
+
+      if (msg.type === 'wardrive_upload_done') {
+        setState({
+          status: 'idle',
+          wardriveUploadRunning: false,
+          wardriveUploadResult: {
+            provider: msg.provider || '',
+            uploaded: msg.uploaded || 0,
+            skipped: msg.skipped || 0,
+            failed: msg.failed || 0,
+            rateLimited: msg.rate_limited || 0,
+          },
+          wardriveUploadError: null,
+        });
+      }
+
+      if (msg.type === 'wardrive_upload_error') {
+        setState({
+          status: 'idle',
+          wardriveUploadRunning: false,
+          wardriveUploadError: msg.reason || 'error',
+        });
+      }
+
+      if (msg.type === 'uart_line' && typeof msg.data === 'string' && st.wardriveUploadRunning) {
+        setState({ wardriveUploadLast: msg.data });
       }
 
       if (msg.type === 'sniffer_count') {
@@ -276,6 +331,7 @@ export function App() {
 
     return () => {
       clearInterval(pollStatusId);
+      clearInterval(pollDashboardId);
       removeWs();
       removeSub();
     };
@@ -340,8 +396,12 @@ export function App() {
           <Bluetooth path="/bluetooth" />
           <Wardrive path="/wardrive" />
           <MeshRecon path="/mesh" />
+          <WardriveUpload path="/wardrive/upload" />
+          <GpsDiag path="/gps/diag" />
           <Karma path="/karma" />
           <Portal path="/portal" />
+          <SnifferDog path="/snifferdog" />
+          <BeaconSpam path="/beaconspam" />
           <DeauthDetector path="/detector" />
           <SubGhz path="/subghz" />
           <SubGhzListen path="/subghz/listen" />

@@ -26,6 +26,81 @@ typedef struct {
     nmap_port_t ports[NMAP_MAX_PORTS_PER_HOST];
 } nmap_host_t;
 
+/** A single Bluetooth LE device discovered by `scan_bt`. */
+typedef struct {
+    int  index;
+    char mac[18];
+    char name[40];
+    int  rssi;
+} bt_device_t;
+
+/* ---- Wardrive configuration (mirrors JanOS get_wardrive_config / set_* commands) ---- */
+#define WARDRIVE_BAND_WIFI24   0x01
+#define WARDRIVE_BAND_WIFI5    0x02
+#define WARDRIVE_BAND_BLE      0x04
+#define WARDRIVE_CUSTOM_CH_MAX 96
+#define WARDRIVE_GPS_MODULE_MAX 16
+
+typedef enum {
+    WARDRIVE_CH_POPULAR = 0,
+    WARDRIVE_CH_ALL = 1,
+    WARDRIVE_CH_CUSTOM = 2,
+} wardrive_channel_mode_t;
+
+typedef enum {
+    WARDRIVE_ANTISURV_LOW = 0,
+    WARDRIVE_ANTISURV_MED = 1,
+    WARDRIVE_ANTISURV_HIGH = 2,
+} wardrive_antisurv_sens_t;
+
+typedef struct {
+    uint8_t bands;                       /* bitmask of WARDRIVE_BAND_* */
+    wardrive_channel_mode_t channel_mode;
+    char custom_channels[WARDRIVE_CUSTOM_CH_MAX]; /* colon-separated, e.g. "1:6:11:36" */
+    int wifi_rssi_delta;                 /* 0-50, 0 = log once */
+    int ble_rssi_delta;                  /* 0-50 */
+    int startup_cooldown;                /* 0-600 s */
+    int mem_cap;                         /* 1000-200000 */
+    wardrive_antisurv_sens_t antisurv_sensitivity;
+    char gps_module[WARDRIVE_GPS_MODULE_MAX]; /* e.g. "m5", "atgm", "external", "cap" */
+    bool loaded;                         /* true once populated from get_wardrive_config */
+} wardrive_config_t;
+
+/* A single wardrive log file with its per-provider upload status, parsed from
+ * the JanOS `wardrive_files` command ([WARD_FILE] filename=... lines). */
+#define WARDRIVE_FILE_NAME_MAX     96
+#define WARDRIVE_UPLOAD_STATUS_MAX 16
+typedef struct {
+    char name[WARDRIVE_FILE_NAME_MAX];
+    char wigle[WARDRIVE_UPLOAD_STATUS_MAX];   /* done/pending/failed/rate_limited/ok/unknown */
+    char wdgwars[WARDRIVE_UPLOAD_STATUS_MAX];
+    long size;
+    int  wifi;
+    int  ble;
+    int  bt;
+} wardrive_file_t;
+
+/* ---- GPS raw NMEA diagnostics (HTTP-poll fallback for the WS `gps_nmea`
+ *      flood, which the phone loses to LRU socket purges). ---- */
+#define GPS_RAW_LINE_MAX   100  /* max chars kept per NMEA sentence */
+#define GPS_RAW_RING_MAX   40   /* recent sentences retained for polling */
+
+/* ---- Wardrive live status + recently-seen networks (HTTP-poll fallback for
+ *      the WS `wardrive_status` + raw CSV lines). ---- */
+#define WARDRIVE_NET_SSID_MAX 33
+#define WARDRIVE_NET_SEC_MAX  24
+#define WARDRIVE_NET_RING_MAX 40
+
+typedef struct {
+    char  mac[18];
+    char  ssid[WARDRIVE_NET_SSID_MAX];
+    char  sec[WARDRIVE_NET_SEC_MAX];
+    int   ch;
+    int   rssi;
+    float lat;
+    float lon;
+} wardrive_net_t;
+
 typedef struct {
     char     level[16];
     int      total_hosts;     /* from "Total: N hosts discovered" or "Scanning N host(s)" */
@@ -96,11 +171,16 @@ typedef enum {
     STATE_ATTACK_SAE,
     STATE_ATTACK_HANDSHAKE,
     STATE_ATTACK_SNIFFER,
+    STATE_ATTACK_SNIFFER_DOG,
+    STATE_ATTACK_BEACON_SPAM,
     STATE_ATTACK_BLACKOUT,
     STATE_ATTACK_MITM,
     STATE_ATTACK_NMAP,
     STATE_ATTACK_ARP,
     STATE_ATTACK_ARP_BAN,
+    STATE_ATTACK_BT_SCAN,
+    STATE_ATTACK_BT_TRACK,
+    STATE_ATTACK_AIRTAG,
     STATE_WIFI_CONNECTING,
     STATE_LISTING_PORTALS,
     STATE_LISTING_PASSWORDS,
@@ -112,6 +192,10 @@ typedef enum {
     STATE_WARDRIVE_RUN,         /* start_wardrive_promisc[_trace] streaming */
     STATE_ANTISURV_RUN,         /* start_antisurveillance streaming */
     STATE_DEAUTH_DETECT,        /* deauth_detector streaming */
+    STATE_WARDRIVE,
+    STATE_LISTING_WARDRIVE_FILES,
+    STATE_WARDRIVE_UPLOAD,
+    STATE_GPS_RAW,
     STATE_LISTING_PROBES,
     STATE_ATTACK_KARMA,
     STATE_SUBGHZ_LISTEN,
@@ -121,6 +205,29 @@ typedef enum {
     STATE_SUBGHZ_EXPORT,
     STATE_ZIG_RECON,            /* start_zig_recon streaming (Mesh Recon) */
 } cmd_state_t;
+
+/** Captured-password category (matches JanOS `show_pass [evil|portal]`). */
+typedef enum {
+    PW_KIND_EVIL = 0,
+    PW_KIND_PORTAL,
+} pw_kind_t;
+
+/** A single live portal/karma/rogueap/eviltwin form submission captured during
+ *  an active attack (survives WS drops via /api/portal/captures). */
+typedef struct {
+    char     data[192];
+    uint32_t at_ms;
+} portal_capture_t;
+
+/** A single Sniffer Dog targeted-deauth event. */
+typedef struct {
+    int      n;
+    char     ap[24];
+    char     sta[24];
+    int      ch;
+    int      rssi;
+    uint32_t at_ms;
+} sniffer_dog_event_t;
 
 typedef struct {
     int   idx;
@@ -202,6 +309,20 @@ bool cmd_do_sniffer_noscan(void);
  *  happens in firmware so it survives the web client disconnecting mid-scan. */
 bool cmd_do_observer_start(void);
 
+/** Start Sniffer Dog (capture AP-STA pairs + targeted deauth). */
+bool cmd_do_sniffer_dog(void);
+
+/** Start beacon spam broadcasting the given SSIDs. */
+bool cmd_do_beacon_spam(const char *const *ssids, int count);
+
+/** Copy up to `max` live portal captures into `out`; returns count copied. */
+int cmd_get_portal_captures(portal_capture_t *out, int max);
+int cmd_get_portal_captures_count(void);
+
+/** Sniffer Dog live results: total deauths sent + recent events. */
+int cmd_get_sniffer_dog_count(void);
+int cmd_get_sniffer_dog_events(sniffer_dog_event_t *out, int max);
+
 /** Request indexed probe list (start_karma uses these indices). */
 bool cmd_do_list_probes(void);
 
@@ -234,6 +355,19 @@ bool cmd_do_zig_recon_refresh(void);
 /** Mesh Recon: clear on-device + local caches (zig_recon_clear). */
 bool cmd_do_zig_recon_clear(void);
 
+/** Start a one-time Bluetooth LE device scan (`scan_bt`). Clears cache. */
+bool cmd_do_bt_scan(void);
+
+/** Track RSSI of a single BLE device by MAC (`scan_bt <MAC>`). */
+bool cmd_do_bt_track(const char *mac);
+
+/** Start continuous AirTag/SmartTag count scan (`scan_airtag`). */
+bool cmd_do_airtag(void);
+
+/** Copy up to `max` cached BLE devices (from `scan_bt`) into `out`. */
+int cmd_get_bt_devices(bt_device_t *out, int max);
+int cmd_get_bt_devices_count(void);
+
 /** Connect STA to selected AP SSID. */
 bool cmd_do_wifi_connect(const char *ssid, const char *password);
 
@@ -249,14 +383,17 @@ bool cmd_do_list_portals(void);
 /** Select an HTML portal file by index. */
 bool cmd_do_select_portal(int index);
 
-/** Request evil twin passwords. */
-bool cmd_do_list_passwords(void);
+/** Request captured passwords for the given category (evil twin / portal). */
+bool cmd_do_list_passwords(pw_kind_t kind);
 
 /** Request sniffer results. */
 bool cmd_do_sniffer_results(void);
 
-/** Request handshake file count from SD card. */
+/** Request handshake file listing (count + filenames) from SD card. */
 bool cmd_do_list_handshake_count(void);
+
+/** Probe SD card presence (`sd_status` -> SD_OK/SD_NONE). */
+bool cmd_do_sd_status(void);
 
 /** Request wardrive log files from SD card. */
 bool cmd_do_list_wardrive_logs(void);
@@ -275,6 +412,37 @@ typedef struct {
  *  Returns the current sequence number; writes the count copied to *n_out. */
 uint32_t cmd_serial_snapshot(uint32_t since, serial_line_t *out, int max, int *n_out);
 
+/** Start a wardrive session. trace=true enables the KML track
+ *  (`start_wardrive_promisc_trace`) vs. plain `start_wardrive_promisc`. */
+bool cmd_do_start_wardrive(bool trace);
+
+/** Query current wardrive config from JanOS (`get_wardrive_config`).
+ *  Parsed `[WDCFG]` lines populate the cached config. Returns false if busy. */
+bool cmd_do_get_wardrive_config(void);
+
+/** Push wardrive settings to JanOS via the `set_wardrive_*` command family.
+ *  When apply_gps is true, also sends `gps_set <module>`. Returns false if
+ *  busy or if no band is selected. */
+bool cmd_do_set_wardrive_config(const wardrive_config_t *cfg, bool apply_gps);
+
+/** Set the GPS module profile on the device (`gps_set <module>`). Fire-and-forget
+ *  (does not hold the command FSM). module e.g. "m5", "atgm", "external", "cap". */
+bool cmd_do_gps_set(const char *module);
+
+/** Stream raw NMEA from the GPS for diagnostics (`start_gps_raw [baud]`).
+ *  baud <= 0 uses the module's configured baud. Stop with `cmd_do_stop`. */
+bool cmd_do_gps_raw(int baud);
+
+/** List wardrive log files with their per-provider upload status
+ *  (`wardrive_files`). Populates the cached file list. Returns false if busy. */
+bool cmd_do_list_wardrive_files(void);
+
+/** Start a WiGLE/WDGWars upload. provider is "wigle" or "wdgwars"; mode is
+ *  "selected" (needs filename), "pending" (sync not-yet-done), or "all"
+ *  (force re-upload everything). Requires an active STA WiFi connection on the
+ *  device. Returns false if busy or on bad arguments. */
+bool cmd_do_wardrive_upload(const char *provider, const char *mode, const char *filename);
+
 /* ---------- State queries ---------- */
 
 cmd_state_t cmd_get_state(void);
@@ -288,9 +456,10 @@ const scan_results_t *cmd_get_scan_results(void);
 int cmd_get_portal_files(parsed_portal_file_t *out, int max);
 int cmd_get_portal_files_count(void);
 
-/** Copy up to `max` cached passwords into `out`; returns count copied. */
-int cmd_get_passwords(parsed_password_t *out, int max);
-int cmd_get_passwords_count(void);
+/** Copy up to `max` cached passwords of the given category into `out`;
+ *  returns count copied. */
+int cmd_get_passwords(pw_kind_t kind, parsed_password_t *out, int max);
+int cmd_get_passwords_count(pw_kind_t kind);
 
 /** Get cached network observer results. The returned pointer's `aps` array
  *  is heap-backed; per-AP client MACs live in `aps[i].clients` (flat,
@@ -299,6 +468,13 @@ const sniffer_results_t *cmd_get_sniffer_results(void);
 
 /** Get cached handshake .pcap count from SD card listing. */
 int cmd_get_handshake_count(void);
+
+/** Copy up to `max` cached handshake files into `out`; returns count copied. */
+int cmd_get_handshakes(parsed_portal_file_t *out, int max);
+int cmd_get_handshakes_count(void);
+
+/** SD card presence: 1 = present, 0 = absent, -1 = unknown (not probed yet). */
+int cmd_sd_present(void);
 
 /** Whether the initial handshake count fetch already completed at least once
  *  for this boot. Used to gate the dashboard auto-trigger to a one-shot. */
@@ -413,6 +589,44 @@ bool cmd_do_deauth_detect_start(void);
 int cmd_get_deauth_events(deauth_event_t *out, int max);
 int cmd_get_deauth_events_count(void);
 
+/** Copy the cached wardrive config into `out`. Returns true if the config has
+ *  been loaded at least once from JanOS (`get_wardrive_config`). */
+bool cmd_get_wardrive_config(wardrive_config_t *out);
+
+/** Whether the wardrive config was already loaded from JanOS this boot. */
+bool cmd_wardrive_config_loaded(void);
+
+/** Copy up to `max` cached wardrive files (from `wardrive_files`) into `out`. */
+int cmd_get_wardrive_files(wardrive_file_t *out, int max);
+int cmd_get_wardrive_files_count(void);
+
+/** Whether the wardrive file list finished loading at least once. Lets the
+ *  web layer distinguish "empty directory" from "still loading". */
+bool cmd_wardrive_files_loaded(void);
+
+/** Copy up to `max` recent GPS raw NMEA sentences into `out_lines`, a flat
+ *  buffer of `max` slots each `GPS_RAW_LINE_MAX` bytes (stride
+ *  `GPS_RAW_LINE_MAX`). Oldest-first. Returns the number of lines copied. */
+int cmd_get_gps_raw_lines(char *out_lines, int max);
+
+/** Latest GPS raw fix quality (from `$..GGA` field 6) and satellite count
+ *  (field 7). Either arg may be NULL. Quality 0 means no fix. */
+void cmd_get_gps_raw_fix(int *quality_out, int *sats_out);
+
+/** Latest live wardrive counters parsed from the `Wardrive promisc:` status
+ *  line. Any arg may be NULL. */
+void cmd_get_wardrive_live(int *sats_out, float *dist_out, int *unique_out,
+                           int *relogs_out);
+
+/** True while a wardrive session is active - either tracked by the command FSM
+ *  or detected from JanOS's stream (session started outside the web / after an
+ *  FSM reset). */
+bool cmd_wardrive_running(void);
+
+/** Copy up to `max` recently-seen wardrive networks (most-recent-first) into
+ *  `out`. Returns the number copied. */
+int cmd_get_wardrive_nets(wardrive_net_t *out, int max);
+
 /** Copy up to `max` cached probe entries into `out`. */
 int cmd_get_probes(parsed_probe_t *out, int max);
 int cmd_get_probes_count(void);
@@ -449,29 +663,41 @@ bool cmd_do_subghz_listen(float freq_mhz, bool raw);
 /** Start jammer on the given frequency (MHz). */
 bool cmd_do_subghz_jam(float freq_mhz);
 
-/** Transmit a stored signal by 1-based index. */
-bool cmd_do_subghz_tx(int index);
+/** Transmit a stored signal by 1-based index from the given source
+ *  ("mem" volatile cache or "sd" persistent library). NULL/invalid → "sd". */
+bool cmd_do_subghz_tx(int index, const char *source);
 
 /** Transmit a named preset (e.g. "tesla"). Sets the preset's freq first if known. */
 bool cmd_do_subghz_tx_preset(const char *preset);
 
-/** Delete a stored signal by 1-based index. */
+/** Delete a stored signal by 1-based index (SD library only). */
 bool cmd_do_subghz_delete(int index);
 
-/** Clear all stored signals. */
+/** Clear the volatile (mem) capture cache. The SD library is untouched. */
 bool cmd_do_subghz_clear(void);
 
-/** Export all stored signals to SD card. */
+/** Promote all volatile (mem) captures into the persistent SD library
+ *  (`subghz_save all`). */
 bool cmd_do_subghz_export(void);
 
-/** Import all signals from SD card. */
+/** Promote a single volatile (mem) capture to the SD library by 1-based
+ *  mem index (`subghz_save <index>`). Works during an active listen. */
+bool cmd_do_subghz_save(int index);
+
+/** Reload the SD library view (kept for the legacy "Import from SD" button). */
 bool cmd_do_subghz_import(void);
 
-/** Refresh the cached signals list from the device. */
-bool cmd_do_subghz_list_refresh(void);
+/** Refresh the cached signals list from the device for the given source
+ *  ("mem" or "sd"). NULL/invalid → "sd". */
+bool cmd_do_subghz_list_refresh(const char *source);
 
 /** Get cached SubGHZ signals. */
 int cmd_get_subghz_signals(subghz_signal_t *out, int max);
 
 /** Number of cached SubGHZ signals (cheap getter for sizing buffers). */
 int cmd_get_subghz_count(void);
+
+/** Latest RSSI sample + a monotonic sequence number from an active
+ *  `subghz_rx`. Lets the Listen waterfall poll RSSI over HTTP as a
+ *  fallback when the WebSocket is unavailable. Either arg may be NULL. */
+void cmd_get_subghz_rssi(int *rssi_out, uint32_t *seq_out);

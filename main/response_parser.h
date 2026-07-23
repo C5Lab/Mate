@@ -46,6 +46,14 @@ typedef struct {
  */
 bool parse_password_line(const char *line, parsed_password_t *pw);
 
+/**
+ * Parse a captive-portal password line with a variable number of fields:
+ *   "SSID", "field1=val1", "field2=val2", ...
+ * The SSID goes into `pw->ssid`; the remaining fields are joined with "; "
+ * into `pw->password` (truncated to fit).
+ */
+bool parse_portal_password_line(const char *line, parsed_password_t *pw);
+
 /* ---------- Portal file list ---------- */
 
 typedef struct {
@@ -130,6 +138,7 @@ typedef enum {
     ATTACK_EVENT_CLIENT_CONNECTED,
     ATTACK_EVENT_CLIENT_DISCONNECTED,
     ATTACK_EVENT_SNIFFER_COUNT,
+    ATTACK_EVENT_PORTAL_DATA,
     ATTACK_EVENT_STOP_ACK,
 } attack_event_type_t;
 

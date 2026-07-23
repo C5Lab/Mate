@@ -2,18 +2,14 @@ import { useEffect, useRef, useState } from 'preact/hooks';
 import { Layout } from '../components/Layout';
 import { api } from '../api';
 import { wsAddListener } from '../ws';
-import { showToast } from '../components/Toast';
 
-function DataSection({ title, rows, emptyLabel, onDeleteOne, onDeleteAll }) {
+function DataSection({ title, rows, emptyLabel }) {
   return (
     <section class="glass-card card-body reveal">
       <div class="section-head">
         <h3 class="section-title">{title}</h3>
         <div class="row-actions">
           <span class="badge info">{rows.length}</span>
-          <button class="soft-btn" onClick={onDeleteAll} disabled={!rows.length}>
-            Clear
-          </button>
         </div>
       </div>
 
@@ -26,7 +22,6 @@ function DataSection({ title, rows, emptyLabel, onDeleteOne, onDeleteAll }) {
               <tr>
                 <th>Item</th>
                 <th>Meta</th>
-                <th>Action</th>
               </tr>
             </thead>
             <tbody>
@@ -34,11 +29,6 @@ function DataSection({ title, rows, emptyLabel, onDeleteOne, onDeleteAll }) {
                 <tr key={row.id}>
                   <td>{row.item}</td>
                   <td>{row.meta}</td>
-                  <td>
-                    <button class="soft-btn" onClick={() => onDeleteOne(row.id)}>
-                      Delete
-                    </button>
-                  </td>
                 </tr>
               ))}
             </tbody>
@@ -49,17 +39,29 @@ function DataSection({ title, rows, emptyLabel, onDeleteOne, onDeleteAll }) {
   );
 }
 
+const MAX_RETRIES = 12;
+// Per-loader base delays are staggered so the four loaders don't keep hitting
+// the C5's single-command FSM at the exact same instant and starving each other.
+const RETRY_MS = {
+  evil: 1200,
+  portal: 1500,
+  handshakes: 1800,
+  wardrive: 2100,
+};
+
 export function SDData() {
   const [evilTwinPasswords, setEvilTwinPasswords] = useState([]);
   const [portalPasswords, setPortalPasswords] = useState([]);
   const [handshakes, setHandshakes] = useState([]);
   const [wardriveLogs, setWardriveLogs] = useState([]);
 
-  const wardriveRetryRef = useRef(null);
-  const wardriveRetryCountRef = useRef(0);
+  // name -> { timer, count } for the "still loading, poll again" pattern.
+  const retryRefs = useRef({});
 
   useEffect(() => {
+    loadEvilPasswords();
     loadPortalPasswords();
+    loadHandshakes();
     loadWardriveLogs();
 
     const remove = wsAddListener((msg) => {
@@ -67,8 +69,8 @@ export function SDData() {
         setEvilTwinPasswords((prev) => [
           {
             id: `et-${Date.now()}-${Math.random().toString(16).slice(2, 6)}`,
-            item: msg.password,
-            meta: `Captured ${new Date().toLocaleTimeString()}`,
+            item: msg.ssid || 'Evil Twin',
+            meta: msg.password,
           },
           ...prev,
         ]);
@@ -87,45 +89,96 @@ export function SDData() {
     });
 
     return () => {
-      if (wardriveRetryRef.current) {
-        clearTimeout(wardriveRetryRef.current);
-        wardriveRetryRef.current = null;
-      }
-      wardriveRetryCountRef.current = 0;
+      Object.values(retryRefs.current).forEach((r) => {
+        if (r && r.timer) clearTimeout(r.timer);
+      });
+      retryRefs.current = {};
       remove();
     };
   }, []);
 
-  function scheduleWardriveRetry() {
-    if (wardriveRetryRef.current) return;
-    wardriveRetryRef.current = setTimeout(() => {
-      wardriveRetryRef.current = null;
-      loadWardriveLogs();
-    }, 1400);
+  function retryLater(name, fn) {
+    const r = retryRefs.current[name] || (retryRefs.current[name] = { timer: null, count: 0 });
+    if (r.timer) return;
+    r.count += 1;
+    if (r.count > MAX_RETRIES) return;
+    r.timer = setTimeout(() => {
+      r.timer = null;
+      fn();
+    }, RETRY_MS[name] || 1500);
+  }
+
+  function resetRetry(name) {
+    const r = retryRefs.current[name];
+    if (r) {
+      if (r.timer) clearTimeout(r.timer);
+      retryRefs.current[name] = { timer: null, count: 0 };
+    }
+  }
+
+  function mapPasswords(list, prefix) {
+    return list.map((entry, idx) => ({
+      id: `${prefix}-${idx}-${entry.ssid}`,
+      item: `${entry.ssid}`,
+      meta: entry.password,
+    }));
+  }
+
+  // A password reply is "ready" only when it carries a list AND is not still
+  // loading (the loading response ships an empty passwords array too).
+  async function loadEvilPasswords() {
+    try {
+      const data = await api.passwords('evil');
+      if (data.passwords && data.status !== 'loading') {
+        resetRetry('evil');
+        setEvilTwinPasswords(mapPasswords(data.passwords, 'evil'));
+        return;
+      }
+    } catch (e) {
+      /* fall through to retry */
+    }
+    retryLater('evil', loadEvilPasswords);
   }
 
   async function loadPortalPasswords() {
     try {
-      const data = await api.passwords();
-      if (data.passwords) {
-        setPortalPasswords(
-          data.passwords.map((entry, idx) => ({
-            id: `portal-${idx}-${entry.ssid}`,
-            item: `${entry.ssid}`,
-            meta: entry.password,
-          })),
-        );
+      const data = await api.passwords('portal');
+      if (data.passwords && data.status !== 'loading') {
+        resetRetry('portal');
+        setPortalPasswords(mapPasswords(data.passwords, 'portal'));
+        return;
       }
     } catch (e) {
-      showToast('Unable to load SD password data', 'warning');
+      /* fall through to retry */
     }
+    retryLater('portal', loadPortalPasswords);
+  }
+
+  async function loadHandshakes() {
+    try {
+      const data = await api.handshakes();
+      if (data.files) {
+        resetRetry('handshakes');
+        setHandshakes(
+          data.files.map((f) => ({
+            id: `hs-file-${f.index}-${f.name}`,
+            item: f.name,
+            meta: `#${f.index} /sdcard/lab/handshakes`,
+          })),
+        );
+        return;
+      }
+    } catch (e) {
+      /* fall through to retry */
+    }
+    retryLater('handshakes', loadHandshakes);
   }
 
   async function loadWardriveLogs() {
     try {
       const data = await api.wardriveLogs();
       if (data.files) {
-        wardriveRetryCountRef.current = 0;
+        resetRetry('wardrive');
         setWardriveLogs(
           data.files.map((f) => ({
             id: `wardrive-${f.index}-${f.name}`,
@@ -135,29 +188,18 @@ export function SDData() {
         );
         return;
       }
-      if (data.status === 'loading') {
-        wardriveRetryCountRef.current += 1;
-        if (wardriveRetryCountRef.current <= 6) {
-          scheduleWardriveRetry();
-        } else {
-          setWardriveLogs([]);
-        }
-      }
     } catch (e) {
-      showToast('Unable to load wardrive logs', 'warning');
-      wardriveRetryCountRef.current += 1;
-      if (wardriveRetryCountRef.current <= 6) {
-        scheduleWardriveRetry();
-      }
+      /* fall through to retry */
     }
+    retryLater('wardrive', loadWardriveLogs);
   }
 
-  function deleteOne(setter, id) {
-    setter((prev) => prev.filter((row) => row.id !== id));
-  }
-
-  function deleteAll(setter) {
-    setter([]);
+  function reloadAll() {
+    ['evil', 'portal', 'handshakes', 'wardrive'].forEach(resetRetry);
+    loadEvilPasswords();
+    loadPortalPasswords();
+    loadHandshakes();
+    loadWardriveLogs();
   }
 
   return (
@@ -165,7 +207,7 @@ export function SDData() {
       title="Data"
       back="/"
       actions={
-        <button class="btn btn-secondary" onClick={() => { loadPortalPasswords(); loadWardriveLogs(); }}>
+        <button class="btn btn-secondary" onClick={reloadAll}>
           Refresh
         </button>
       }
@@ -173,33 +215,25 @@ export function SDData() {
       <DataSection
         title="Evil Twin Passwords"
         rows={evilTwinPasswords}
-        emptyLabel="No Evil Twin credentials in this session."
-        onDeleteOne={(id) => deleteOne(setEvilTwinPasswords, id)}
-        onDeleteAll={() => deleteAll(setEvilTwinPasswords)}
+        emptyLabel="No Evil Twin credentials found."
       />
 
       <DataSection
         title="Portal Passwords"
         rows={portalPasswords}
-        emptyLabel="No portal passwords loaded."
-        onDeleteOne={(id) => deleteOne(setPortalPasswords, id)}
-        onDeleteAll={() => deleteAll(setPortalPasswords)}
+        emptyLabel="No portal passwords found."
       />
 
       <DataSection
         title="Handshakes"
         rows={handshakes}
-        emptyLabel="No handshake captures yet."
-        onDeleteOne={(id) => deleteOne(setHandshakes, id)}
-        onDeleteAll={() => deleteAll(setHandshakes)}
+        emptyLabel="No handshake captures found."
       />
 
       <DataSection
         title="Wardrive Logs"
         rows={wardriveLogs}
         emptyLabel="No wardrive log files found."
-        onDeleteOne={(id) => deleteOne(setWardriveLogs, id)}
-        onDeleteAll={() => deleteAll(setWardriveLogs)}
       />
     </Layout>
   );

@@ -259,6 +259,49 @@ button:not(:disabled) {
   color: var(--text-soft);
 }
 
+/* Compact inline action chips (e.g. per-row "Save to SD" in tables). */
+.chip-action,
+.chip-success,
+.chip-danger {
+  min-height: 0;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: border-color 0.15s ease, color 0.15s ease, background 0.15s ease;
+}
+
+.chip-action {
+  border: 1px solid var(--line-strong);
+  background: var(--surface-2);
+  color: var(--blue);
+}
+
+.chip-action:hover:not(:disabled) {
+  border-color: var(--blue);
+}
+
+.chip-action:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.chip-success {
+  border: 1px solid rgba(53, 214, 111, 0.5);
+  background: rgba(53, 214, 111, 0.12);
+  color: var(--green);
+}
+
+.chip-danger {
+  border: 1px solid rgba(255, 75, 75, 0.5);
+  background: rgba(255, 75, 75, 0.12);
+  color: var(--red);
+  cursor: pointer;
+}
+
 .chip-dot,
 .dot {
   width: 8px;

@@ -118,12 +118,6 @@ function formatGps(st) {
   return `${st.gpsLat.toFixed(5)}, ${st.gpsLon.toFixed(5)}`;
 }
 
-function formatLastNet(st) {
-  if (!st.networks.length) return '-';
-  const strongest = st.networks.reduce((best, n) => (n.rssi > best.rssi ? n : best), st.networks[0]);
-  return `${strongest.ssid || '[Hidden]'} ${strongest.rssi} dBm`;
-}
-
 function operationLabel(status) {
   const labels = {
     idle: 'Chillin',
@@ -166,9 +160,10 @@ function operationMeta(st) {
   return 'Operation running';
 }
 
-function freeRatio(st) {
-  if (st.sdTotalGb <= 0 || st.sdFreeGb < 0) return 0;
-  return Math.max(0, Math.min(1, st.sdFreeGb / st.sdTotalGb));
+function sdLabelFor(st) {
+  if (st.sdPresent === 1) return 'SD OK';
+  if (st.sdPresent === 0) return 'No SD';
+  return '...';
 }
 
 export function Home() {
@@ -179,9 +174,8 @@ export function Home() {
     showToast('Stop signal sent', 'warning');
   }
 
-  const ratio = freeRatio(st);
-  const ringDeg = Math.round(ratio * 360);
-  const sdLabel = st.sdTotalGb > 0 ? `${st.sdFreeGb}/${st.sdTotalGb} GB free` : 'n/a';
+  const ringDeg = st.sdPresent === 1 ? 360 : 0;
+  const sdLabel = sdLabelFor(st);
   const isBusy = st.status && st.status !== 'idle';
 
   return (
@@ -218,17 +212,12 @@ export function Home() {
             <div class="stat-value stat-value-mini">{formatGps(st)}</div>
             <div class="stat-label">GPS</div>
           </article>
-          <article class="stat-card accent-green">
-            <Glyph name="wifi" />
-            <div class="stat-value stat-value-mini">{formatLastNet(st)}</div>
-            <div class="stat-label">Last Net</div>
-          </article>
           <article class="stat-card stat-card-ring accent-violet">
             <div class="ring-wrap" style={`--ring-deg:${ringDeg}deg`}>
               <div class="ring-core" />
             </div>
             <div class="stat-value stat-value-mini">{sdLabel}</div>
-            <div class="stat-label">SD Space</div>
+            <div class="stat-label">SD Card</div>
           </article>
         </div>
       </section>

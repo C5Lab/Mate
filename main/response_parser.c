@@ -75,6 +75,44 @@ bool parse_password_line(const char *line, parsed_password_t *pw)
     return true;
 }
 
+bool parse_portal_password_line(const char *line, parsed_password_t *pw)
+{
+    if (!line || line[0] != '"') return false;
+
+    const char *ssid_start = line + 1;
+    const char *ssid_end   = strchr(ssid_start, '"');
+    if (!ssid_end) return false;
+
+    memset(pw, 0, sizeof(*pw));
+    int ssid_len = ssid_end - ssid_start;
+    if (ssid_len > (int)sizeof(pw->ssid) - 1) ssid_len = sizeof(pw->ssid) - 1;
+    memcpy(pw->ssid, ssid_start, ssid_len);
+
+    /* Join every remaining quoted field into the password/detail buffer. */
+    const char *p = ssid_end + 1;
+    int  out   = 0;
+    bool first = true;
+    while (*p) {
+        const char *q1 = strchr(p, '"');
+        if (!q1) break;
+        const char *q2 = strchr(q1 + 1, '"');
+        if (!q2) break;
+
+        if (!first && out < (int)sizeof(pw->password) - 3) {
+            pw->password[out++] = ';';
+            pw->password[out++] = ' ';
+        }
+        for (const char *c = q1 + 1; c < q2 && out < (int)sizeof(pw->password) - 1; c++) {
+            pw->password[out++] = *c;
+        }
+        first = false;
+        p = q2 + 1;
+    }
+    pw->password[out] = '\0';
+
+    return pw->ssid[0] != '\0';
+}
+
 /* ---------- Portal file parsing ---------- */
 
 bool parse_portal_file_line(const char *line, parsed_portal_file_t *f)
@@ -242,6 +280,11 @@ attack_event_t parse_attack_event(const char *line)
         const char *path = strstr(line, "PCAP saved:") + 11;
         while (*path == ' ') path++;
         strncpy(ev.detail, path, sizeof(ev.detail) - 1);
+    } else if (strstr(line, "Received POST data:")) {
+        ev.type = ATTACK_EVENT_PORTAL_DATA;
+        const char *d = strstr(line, "Received POST data:") + strlen("Received POST data:");
+        while (*d == ' ') d++;
+        strncpy(ev.detail, d, sizeof(ev.detail) - 1);
     } else if (strstr(line, "Password received:")) {
         ev.type = ATTACK_EVENT_PASSWORD_RECEIVED;
         const char *pw = strstr(line, "Password received:") + 18;

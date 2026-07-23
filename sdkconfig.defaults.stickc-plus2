@@ -1,0 +1,13 @@
+# M5StickC PLUS2 specific (ESP32-PICO-V3-02: 8MB flash, no PSRAM, ST7789V2 display)
+# https://docs.m5stack.com/en/core/M5StickC%20PLUS2
+CONFIG_IDF_TARGET="esp32"
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_8mb.csv"
+CONFIG_JANOS_BOARD_STICKC_PLUS2=y
+
+# Allow revision v1.0+ bootloader range; do not hard-require the v3.x range.
+CONFIG_ESP32_REV_MIN_1=y
+
+# ESP32-PICO-V3-02 has no embedded PSRAM. Keep PSRAM off;
+# heap_caps_malloc(MALLOC_CAP_SPIRAM) callers already fall back gracefully.
+# CONFIG_SPIRAM is not set

@@ -6,9 +6,12 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 #include <stdarg.h>
 #include <stdlib.h>
+#include <ctype.h>
 #include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -57,8 +60,12 @@ static int                  s_scan_expected = -1;
  * observer_start_task (which runs the same scan->sniffer sequence device-side). */
 static volatile bool        s_observer_pending = false;
 static dynvec_t             s_portals;        /* parsed_portal_file_t */
-static dynvec_t             s_passwords;      /* parsed_password_t */
-/* True once we've seen JanOS echo back our `show_pass evil` command. Until
+static dynvec_t             s_passwords_evil;   /* parsed_password_t (show_pass evil) */
+static dynvec_t             s_passwords_portal; /* parsed_password_t (show_pass portal) */
+/* Which category the in-flight STATE_LISTING_PASSWORDS reply belongs to, so
+ * the line parser routes rows to the right cache. Set in cmd_do_list_passwords. */
+static pw_kind_t            s_passwords_kind = PW_KIND_EVIL;
+/* True once we've seen JanOS echo back our `show_pass ...` command. Until
  * then, any incoming "> " prompt belongs to a *previous* command (commonly
  * select_networks fired right before us by the MITM flow) and must NOT be
  * treated as the end of our listing — otherwise STATE_LISTING_PASSWORDS
@@ -77,8 +84,23 @@ static bool                 s_sniffer_collecting = false;
  * own command echo. Reset in begin_sniffer_snapshot(). */
 static bool                 s_sniffer_echo_seen = false;
 static int                  s_sniffer_ap_index = -1;
+/* Echo guards: while the sniffer attack runs, JanOS keeps emitting background
+ * "> Sniffer packet count: N" lines that is_prompt_line() would otherwise treat
+ * as the end of a `show_sniffer_results` / `list_probes` reply, prematurely
+ * finishing the snapshot with an empty buffer. Only honor a terminating prompt
+ * once we've seen the command echo. Reset when the command is (re)issued. */
+static bool                 s_sniffer_echo_seen = false;
+static bool                 s_probes_echo_seen = false;
 static int                  s_handshake_count = -1;
 static bool                 s_handshake_initial_done = false;
+/* Header guard for `list_dir` replies. JanOS echoes the command back as a
+ * "> list_dir ..." line, which is_prompt_line() treats as a CLI prompt; if we
+ * ended the listing there we'd flip to IDLE before any file rows arrive. Only
+ * start parsing (and only honor a terminating prompt) after the "Files in ..."
+ * header. */
+static bool                 s_handshake_header_seen = false;
+static bool                 s_wardrive_header_seen = false;
+static dynvec_t             s_handshakes;     /* parsed_portal_file_t */
 static dynvec_t             s_wardrive_logs;  /* parsed_portal_file_t */
 static wardrive_cfg_t       s_wd_cfg;         /* last parsed [WDCFG] snapshot */
 static wardrive_cfg_t       s_wd_cfg_build;   /* accumulator during config load */
@@ -119,13 +141,58 @@ uint32_t cmd_serial_snapshot(uint32_t since, serial_line_t *out, int max, int *n
     if (n_out) *n_out = n;
     return cur;
 }
+
+/* Cached wardrive config, populated from `get_wardrive_config` [WDCFG] lines. */
+static wardrive_config_t    s_wardrive_config = {0};
+static bool                 s_wardrive_config_loaded = false;
+/* Guard so the `> get_wardrive_config` command echo isn't mistaken for the
+ * terminating CLI prompt before any [WDCFG] line has been parsed. */
+static bool                 s_wardrive_config_echo_seen = false;
+/* Cached wardrive files with per-provider upload status (`wardrive_files`). */
+static dynvec_t             s_wardrive_files;   /* wardrive_file_t */
+static bool                 s_wardrive_files_loaded = false;
+/* Provider ("wigle"/"wdgwars") of the in-flight upload, for status reporting. */
+static char                 s_wardrive_upload_provider[12] = {0};
+/* GPS raw NMEA ring buffer + latest parsed fix (HTTP-poll fallback: the WS
+ * gps_nmea flood is lost to LRU socket purges on the phone). */
+static char                 s_gps_raw_ring[GPS_RAW_RING_MAX][GPS_RAW_LINE_MAX];
+static int                  s_gps_raw_head = 0;   /* next write slot */
+static int                  s_gps_raw_count = 0;  /* valid entries (<= RING_MAX) */
+static int                  s_gps_raw_quality = 0;
+static int                  s_gps_raw_sats = 0;
+/* Wardrive live counters + recently-seen networks (HTTP-poll fallback). */
+static int                  s_wardrive_live_sats = 0;
+static float                s_wardrive_live_dist = 0.0f;
+static int                  s_wardrive_live_unique = 0;
+static int                  s_wardrive_live_relogs = 0;
+/* Tracks an active wardrive session independent of the command FSM, so the
+ * web UI reflects live stats even when the session wasn't started via the FSM
+ * (e.g. started outside the web, or the FSM was reset while the C5 kept
+ * running). Driven by JanOS's deterministic start/stop banners. */
+static bool                 s_wardrive_active = false;
+static wardrive_net_t       s_wardrive_net_ring[WARDRIVE_NET_RING_MAX];
+static int                  s_wardrive_net_head = 0;
+static int                  s_wardrive_net_count = 0;
+/* SD presence from `sd_status`: 1 present, 0 absent, -1 unknown. */
+static int                  s_sd_present = -1;
+static esp_timer_handle_t   s_keepalive_timer = NULL;
 static dynvec_t             s_probes;         /* parsed_probe_t */
 static dynvec_t             s_probes_build;   /* parsed_probe_t */
+/* Live portal/karma/rogueap/eviltwin form submissions, and Sniffer Dog deauth
+ * events. Cached on-device (like nmap/arp) so the web UI can poll them over
+ * HTTP and not lose single-shot data when the send-only WS is LRU-purged. */
+static dynvec_t             s_portal_captures;    /* portal_capture_t */
+static dynvec_t             s_snifferdog_events;  /* sniffer_dog_event_t */
+static int                  s_snifferdog_count = 0;
 static cmd_state_t          s_probe_resume_state = STATE_IDLE;
 static bool                 s_has_last_gps_fix = false;
 static float                s_last_gps_lat = 0.0f;
 static float                s_last_gps_lon = 0.0f;
 static int64_t              s_last_uart_ms = 0;
+/* Set true on the first line ever received from the C5. Once established the
+ * connection is treated as sticky (no more keepalive pings), trading a slow
+ * idle-disconnect indication for a quiet UART. */
+static bool                 s_c5_established = false;
 static bool                 s_sta_connected = false;
 static char                 s_sta_ssid[33] = {0};
 static char                 s_wifi_connect_target[33] = {0};
@@ -135,6 +202,12 @@ static bool                 s_wifi_connect_saw_failure = false;
 static dynvec_t             s_subghz_signals; /* subghz_signal_t */
 static dynvec_t             s_subghz_build;   /* subghz_signal_t */
 static int                  s_subghz_import_count = 0;
+/* Latest RSSI sample from an active `subghz_rx`, cached so the Listen
+ * waterfall can poll it over HTTP as a fallback when the WS is flapping.
+ * `s_subghz_rssi_seq` increments on every new sample so the UI only draws
+ * a column when the value actually changed. */
+static int                  s_subghz_last_rssi = 0;
+static uint32_t             s_subghz_rssi_seq = 0;
 /* Discovered hosts from `list_hosts` (ARP attack). Cached on the device so
  * the web UI can poll for them even if the WS dropped during the discovery
  * burst (e.g. after the softAP channel hops to follow the STA). */
@@ -165,6 +238,14 @@ static dynvec_t             s_zig_pans;       /* zig_pan_t */
 static dynvec_t             s_zig_nodes;      /* zig_node_t */
 static dynvec_t             s_zig_edges;      /* zig_edge_t */
 static zig_status_t         s_zig_status = {0};
+/* Bluetooth caches. Like nmap/ARP, BLE results stream in state-independently:
+ * JanOS flips the FSM back to IDLE on the `> scan_bt` prompt echo before the
+ * 10s scan actually finishes, so the device list is parsed in a
+ * state-independent helper and cached so /api/bt/devices survives WS drops. */
+static dynvec_t             s_bt_devices;     /* bt_device_t */
+static bool                 s_bt_scan_active = false;  /* armed by cmd_do_bt_scan */
+static bool                 s_bt_track_active = false; /* armed by cmd_do_bt_track */
+static bool                 s_airtag_active = false;   /* armed by cmd_do_airtag */
 
 static bool is_prompt_line(const char *line)
 {
@@ -197,6 +278,86 @@ static void mark_sta_disconnected(void)
     if (was_connected) {
         broadcast_json("{\"type\":\"wifi_disconnected\"}");
     }
+}
+
+/* Sniffer Dog lines are parsed regardless of FSM state. JanOS streams the
+ * `[SnifferDog #N] DEAUTH sent: ...` events (and can flip Mate back to IDLE via
+ * a stray `Stop command received` echo from the stop we send just before
+ * start_sniffer_dog), so - like nmap/ARP - we cache them state-independently
+ * and let /api/sniffer_dog/results poll the result. Returns true if the line
+ * was a Sniffer Dog line. */
+static bool handle_sniffer_dog_line(const char *line)
+{
+    /* Start banner: (re)establish the state and zero the counters so a fresh
+     * run always begins clean, even if the earlier reset raced a stop echo. */
+    if (strstr(line, "Sniffer Dog started") ||
+        strstr(line, "Starting Sniffer Dog mode")) {
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        s_state = STATE_ATTACK_SNIFFER_DOG;
+        dynvec_clear(&s_snifferdog_events);
+        s_snifferdog_count = 0;
+        xSemaphoreGive(s_mutex);
+        /* Re-announce in case a stop echo raced us to IDLE + attack_stopped. */
+        broadcast_json("{\"type\":\"attack_started\",\"attack\":\"sniffer_dog\"}");
+        return true;
+    }
+
+    const char *tag = strstr(line, "[SnifferDog");
+    if (!tag || !strstr(line, "DEAUTH sent")) return false;
+
+    int n = 0, ch = 0, rssi = 0;
+    char ap[24] = {0}, sta[24] = {0};
+    const char *p;
+    if ((p = strchr(tag, '#'))) n = atoi(p + 1);
+    if ((p = strstr(line, "AP=")))   sscanf(p, "AP=%23[^ ]", ap);
+    if ((p = strstr(line, "STA=")))  sscanf(p, "STA=%23[^ )]", sta);
+    if ((p = strstr(line, "Ch=")))   ch = atoi(p + 3);
+    if ((p = strstr(line, "RSSI="))) rssi = atoi(p + 5);
+
+    sniffer_dog_event_t sde = {0};
+    sde.n = n;
+    sde.ch = ch;
+    sde.rssi = rssi;
+    strncpy(sde.ap, ap, sizeof(sde.ap) - 1);
+    strncpy(sde.sta, sta, sizeof(sde.sta) - 1);
+    sde.at_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    s_snifferdog_count++;
+    if (s_snifferdog_events.count >= 256) {
+        dynvec_clear(&s_snifferdog_events);
+    }
+    dynvec_push(&s_snifferdog_events, &sde);
+    xSemaphoreGive(s_mutex);
+
+    broadcast_json(
+        "{\"type\":\"sniffer_dog_deauth\",\"n\":%d,\"ap\":\"%s\","
+        "\"sta\":\"%s\",\"ch\":%d,\"rssi\":%d}",
+        n, ap, sta, ch, rssi);
+    return true;
+}
+
+/* Reset the poll-able portal-capture cache at the start of a new attack. */
+static void portal_captures_reset(void)
+{
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    dynvec_clear(&s_portal_captures);
+    xSemaphoreGive(s_mutex);
+}
+
+/* Append one live portal form submission to the poll-able cache. */
+static void portal_capture_push(const char *data)
+{
+    if (!data || !data[0]) return;
+    portal_capture_t cap = {0};
+    strncpy(cap.data, data, sizeof(cap.data) - 1);
+    cap.at_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    /* Bound the cache so a marathon session can't grow it without limit. */
+    if (s_portal_captures.count >= 128) {
+        dynvec_clear(&s_portal_captures);
+    }
+    dynvec_push(&s_portal_captures, &cap);
+    xSemaphoreGive(s_mutex);
 }
 
 /* ---------- Scan / sniffer / arp dynvec helpers ---------- */
@@ -1012,6 +1173,196 @@ static void handle_nmap_line(const char *line)
     }
 }
 
+/* ---------- Bluetooth (scan_bt / scan_airtag) ---------- */
+
+/* Skip leading whitespace and an optional JanOS prompt ("> ") so lines like
+ * "> 1,0" (airtag counts) or "> AA:BB:.. RSSI:" (tracking) parse the same as
+ * their bare forms. */
+static const char *bt_skip_prompt(const char *line)
+{
+    const char *p = line;
+    while (*p == ' ') p++;
+    if (p[0] == '>' && p[1] == ' ') {
+        p += 2;
+        while (*p == ' ') p++;
+    }
+    return p;
+}
+
+/* True if `p` starts with an "AA:BB:CC:DD:EE:FF" MAC. */
+static bool bt_is_mac_at(const char *p)
+{
+    if (!p) return false;
+    for (int i = 0; i < 17; i++) {
+        char c = p[i];
+        if (i % 3 == 2) {
+            if (c != ':') return false;
+        } else if (!isxdigit((unsigned char)c)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Append `name` into `dst` as a JSON-escaped string (no surrounding quotes),
+ * trimming trailing whitespace/CR/LF. `dst` must hold at least `2*len+1`. */
+static void bt_escape_name(char *dst, size_t dst_sz, const char *name)
+{
+    size_t j = 0;
+    for (size_t i = 0; name[i] && j < dst_sz - 2; i++) {
+        char c = name[i];
+        if (c == '"' || c == '\\') dst[j++] = '\\';
+        dst[j++] = c;
+    }
+    while (j > 0 && (dst[j - 1] == ' ' || dst[j - 1] == '\r' || dst[j - 1] == '\n')) {
+        j--;
+    }
+    dst[j] = '\0';
+}
+
+/* Find the entry matching `mac` (or append a fresh one). Caller holds mutex.
+ * Returns the index in s_bt_devices or -1 on OOM. */
+static int bt_upsert_device_locked(int index, const char *mac,
+                                   int rssi, const char *name)
+{
+    for (size_t i = 0; i < s_bt_devices.count; i++) {
+        bt_device_t *d = (bt_device_t *)dynvec_at(&s_bt_devices, i);
+        if (d && strcasecmp(d->mac, mac) == 0) {
+            d->rssi = rssi;
+            if (index > 0) d->index = index;
+            if (name && name[0]) {
+                strncpy(d->name, name, sizeof(d->name) - 1);
+                d->name[sizeof(d->name) - 1] = '\0';
+            }
+            return (int)i;
+        }
+    }
+
+    bt_device_t fresh = {0};
+    fresh.index = index > 0 ? index : (int)s_bt_devices.count + 1;
+    fresh.rssi  = rssi;
+    strncpy(fresh.mac, mac, sizeof(fresh.mac) - 1);
+    if (name && name[0]) strncpy(fresh.name, name, sizeof(fresh.name) - 1);
+    if (!dynvec_push(&s_bt_devices, &fresh)) {
+        log_drop("bt_devices");
+        return -1;
+    }
+    return (int)s_bt_devices.count - 1;
+}
+
+/* Parse the trailing "  Name: <rest>" off a scan_bt line into `out`. */
+static void bt_parse_name(const char *line, char *out, size_t out_sz)
+{
+    out[0] = '\0';
+    const char *n = strstr(line, "Name:");
+    if (!n) return;
+    n += 5;
+    while (*n == ' ') n++;
+    size_t j = 0;
+    while (*n && j < out_sz - 1) out[j++] = *n++;
+    out[j] = '\0';
+    while (j > 0 && (out[j - 1] == ' ' || out[j - 1] == '\r' || out[j - 1] == '\n')) {
+        out[--j] = '\0';
+    }
+}
+
+/* State-independent Bluetooth line parser. JanOS flips the FSM back to IDLE on
+ * the `> scan_bt` prompt echo before the 10s scan finishes, so (like nmap/ARP)
+ * we parse regardless of state, gated on the arm flags set by cmd_do_bt_*. */
+/* Returns true if the line was a Bluetooth result so the outer dispatcher can
+ * suppress the redundant raw uart_line broadcast (keeps the 16-deep WS queue
+ * from saturating during the burst of device rows, which was dropping the
+ * bt_scan_complete frame and wedging the web UI's "Scanning" spinner). */
+static bool handle_bt_line(const char *line)
+{
+    if (!line) return false;
+
+    /* Device list row: "  1. 09:2B:56:0E:1C:E0  RSSI: -82 dBm  [Name: X]" */
+    if (s_bt_scan_active && strstr(line, "RSSI:")) {
+        const char *p = bt_skip_prompt(line);
+        int index = 0;
+        char mac[18] = {0};
+        if (isdigit((unsigned char)*p) &&
+            sscanf(p, "%d. %17s", &index, mac) == 2 && bt_is_mac_at(mac)) {
+            const char *r = strstr(line, "RSSI:");
+            int rssi = r ? atoi(r + 5) : 0;
+            char name[40];
+            bt_parse_name(line, name, sizeof(name));
+
+            xSemaphoreTake(s_mutex, portMAX_DELAY);
+            bt_upsert_device_locked(index, mac, rssi, name);
+            xSemaphoreGive(s_mutex);
+
+            char esc[80];
+            bt_escape_name(esc, sizeof(esc), name);
+            broadcast_json(
+                "{\"type\":\"bt_device\",\"index\":%d,\"mac\":\"%s\","
+                "\"rssi\":%d,\"name\":\"%s\"}",
+                index, mac, rssi, esc);
+            return true;
+        }
+    }
+
+    /* "Summary: 0 AirTags, 0 SmartTags, 27 total devices" */
+    {
+        const char *p = strstr(line, "Summary:");
+        if (p && strstr(p, "AirTags")) {
+            int airtags = 0, smarttags = 0, total = 0;
+            sscanf(p, "Summary: %d AirTags, %d SmartTags, %d total devices",
+                   &airtags, &smarttags, &total);
+            s_bt_scan_active = false;
+            broadcast_json(
+                "{\"type\":\"bt_scan_complete\",\"airtags\":%d,"
+                "\"smarttags\":%d,\"total\":%d}",
+                airtags, smarttags, total);
+            return true;
+        }
+    }
+
+    /* Tracking row: "F1:2E:71:9F:C8:68  RSSI: -93 dBm  Name: X" (MAC first). */
+    if (s_bt_track_active && strstr(line, "RSSI:")) {
+        const char *p = bt_skip_prompt(line);
+        if (bt_is_mac_at(p)) {
+            char mac[18] = {0};
+            memcpy(mac, p, 17);
+            const char *r = strstr(line, "RSSI:");
+            int rssi = r ? atoi(r + 5) : 0;
+            char name[40];
+            bt_parse_name(line, name, sizeof(name));
+            char esc[80];
+            bt_escape_name(esc, sizeof(esc), name);
+            broadcast_json(
+                "{\"type\":\"bt_track\",\"mac\":\"%s\",\"rssi\":%d,\"name\":\"%s\"}",
+                mac, rssi, esc);
+            return true;
+        }
+    }
+
+    /* AirTag count stream: "<airtags>,<smarttags>" (may be prompt-prefixed as
+     * "> 1,0", so strip the prompt first). */
+    if (s_airtag_active) {
+        const char *p = bt_skip_prompt(line);
+        int airtags = 0, smarttags = 0;
+        char extra = 0;
+        if (isdigit((unsigned char)*p) &&
+            sscanf(p, "%d,%d%c", &airtags, &smarttags, &extra) == 2) {
+            broadcast_json(
+                "{\"type\":\"airtag_count\",\"airtags\":%d,\"smarttags\":%d}",
+                airtags, smarttags);
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void bt_devices_reset(void)
+{
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    dynvec_clear(&s_bt_devices);
+    xSemaphoreGive(s_mutex);
+}
+
 /* ---------- UART line callback ---------- */
 
 static void broadcast_uart_line(const char *line)
@@ -1088,12 +1439,23 @@ static void parse_subghz_rx_fields(const char *data, subghz_signal_t *out)
             snprintf(out->type, sizeof(out->type), "RAW");
         }
     }
-    /* mf=... runs to end-of-line (or up to " te=") so spaced manufacturer
-     * names like "BENINCA TO.GO" survive intact. */
+    /* mf=... may contain spaces (e.g. "BENINCA TO.GO"), so it can't be read
+     * with %s. It runs until the next " <key>=" token or end-of-line. JanOS
+     * emits mf in varying positions and now appends ` cnt=`/`name=` after it,
+     * so bound against every field that can legitimately follow mf rather
+     * than only " te=" (otherwise mf captures "- cnt=0 name=..."). */
     if ((p = strstr(data, "mf="))) {
         p += 3;
-        const char *te = strstr(p, " te=");
-        size_t n = te ? (size_t)(te - p) : strlen(p);
+        static const char *const mf_delims[] = {
+            " te=", " cnt=", " name=", " learn=", " proto=",
+            " id=", " serial=", " btn=", " bits=", " freq=", " edges=",
+        };
+        const char *end = p + strlen(p);
+        for (size_t d = 0; d < sizeof(mf_delims) / sizeof(mf_delims[0]); d++) {
+            const char *hit = strstr(p, mf_delims[d]);
+            if (hit && hit < end) end = hit;
+        }
+        size_t n = (size_t)(end - p);
         /* Trim trailing CR/LF/space */
         while (n > 0 && (p[n - 1] == '\r' || p[n - 1] == '\n' || p[n - 1] == ' ')) n--;
         if (n >= sizeof(out->mf)) n = sizeof(out->mf) - 1;
@@ -1145,7 +1507,32 @@ static bool handle_subghz_event_line(const char *line)
         }
         s_last_rssi_ms = now_ms;
         int rssi = atoi(m + 13);
-        broadcast_json("{\"type\":\"subghz_rssi\",\"rssi\":%d}", rssi);
+        s_subghz_last_rssi = rssi;
+        s_subghz_rssi_seq++;
+        broadcast_json("{\"type\":\"subghz_rssi\",\"rssi\":%d,\"seq\":%u}",
+                       rssi, (unsigned)s_subghz_rssi_seq);
+        return true;
+    }
+
+    /* [SUBGHZ_RX_DROP] fires for every burst the noise gate rejects — on a
+     * noisy band or a clone CC1101 that is many times per second. It carries
+     * no GUI value, so consume it here. Crucially this stops it from reaching
+     * broadcast_uart_line(): otherwise the flood saturates the 16-deep WS
+     * queue and the throttled [SUBGHZ_RSSI] / [SUBGHZ_RX] frames get dropped,
+     * which is exactly why the Listen waterfall stays blank and the captured
+     * count never moves even though the RX events show up on the UART log. */
+    if (strstr(line, "[SUBGHZ_RX_DROP]") != NULL) {
+        return true;
+    }
+
+    /* Decode-sideband lines that precede [SUBGHZ_RX] — verbose only, not
+     * meant for GUI parsing. Dropping them here keeps the WS queue headroom
+     * for subghz_rssi / subghz_rx during an active listen. */
+    if (strstr(line, "[KL_DEC]") != NULL ||
+        strstr(line, "[KAT_RX]") != NULL ||
+        strstr(line, "[REPLAY_SEG]") != NULL ||
+        strstr(line, "[REPLAY]") != NULL ||
+        strstr(line, "SubGHz: key saved") != NULL) {
         return true;
     }
 
@@ -1205,6 +1592,44 @@ static bool handle_subghz_event_line(const char *line)
         const char *p = strstr(m, "idx=");
         if (p) idx = atoi(p + 4);
         broadcast_json("{\"type\":\"subghz_tx_done\",\"idx\":%d}", idx);
+        return true;
+    }
+
+    /* Per-entry save result. Emitted by both `subghz_save <idx>` (inline
+     * Save-to-SD on the Listen page) and `subghz_save all` (Manage export).
+     * Handled state-independently so the Listen page gets feedback while RX
+     * is still running. NOTE: only the per-entry `[SUBGHZ_SAVE]` line is
+     * consumed here — `[SUBGHZ_SAVE_END]` is intentionally left to fall
+     * through to the STATE_SUBGHZ_EXPORT FSM handler which needs it to
+     * finish the "save all" flow. */
+    if ((m = strstr(line, "[SUBGHZ_SAVE] ")) != NULL) {
+        int idx = 0;
+        const char *p = strstr(m, "idx=");
+        if (p) idx = atoi(p + 4);
+        char name[64] = {0};
+        const char *np = strstr(m, "name=");
+        if (np) {
+            np += 5;
+            size_t n = strlen(np);
+            while (n > 0 && (np[n - 1] == '\r' || np[n - 1] == '\n' || np[n - 1] == ' ')) n--;
+            if (n >= sizeof(name)) n = sizeof(name) - 1;
+            memcpy(name, np, n);
+            name[n] = '\0';
+        }
+        broadcast_json("{\"type\":\"subghz_save_done\",\"idx\":%d,\"name\":\"%s\"}",
+                       idx, name);
+        return true;
+    }
+
+    if ((m = strstr(line, "[SUBGHZ_SAVE_ERR]")) != NULL) {
+        int idx = 0;
+        const char *p = strstr(m, "idx=");
+        if (p) idx = atoi(p + 4);
+        char reason[32] = {0};
+        const char *rp = strstr(m, "reason=");
+        if (rp) sscanf(rp, "reason=%31s", reason);
+        broadcast_json("{\"type\":\"subghz_save_err\",\"idx\":%d,\"reason\":\"%s\"}",
+                       idx, reason);
         return true;
     }
 
@@ -1268,10 +1693,210 @@ static bool handle_subghz_event_line(const char *line)
     return false;
 }
 
+/* Extract a whitespace-delimited value for `key` (passed WITHOUT '=') out of a
+ * JanOS marker line such as `[WARD_FILE] filename=w1.csv wigle=done size=1234`.
+ * Copies into `out` (NUL-terminated). Returns true if the key was found. */
+static bool ward_marker_str(const char *line, const char *key, char *out, int out_len)
+{
+    if (out_len > 0) out[0] = '\0';
+    char needle[24];
+    snprintf(needle, sizeof(needle), "%s=", key);
+    const char *p = strstr(line, needle);
+    if (!p) return false;
+    p += strlen(needle);
+    int i = 0;
+    while (*p && *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n' && i < out_len - 1) {
+        out[i++] = *p++;
+    }
+    if (out_len > 0) out[i] = '\0';
+    return true;
+}
+
+static long ward_marker_long(const char *line, const char *key, long def)
+{
+    char buf[24];
+    if (ward_marker_str(line, key, buf, sizeof(buf)) && buf[0]) return atol(buf);
+    return def;
+}
+
+static int ward_marker_int(const char *line, const char *key, int def)
+{
+    char buf[24];
+    if (ward_marker_str(line, key, buf, sizeof(buf)) && buf[0]) return atoi(buf);
+    return def;
+}
+
+/* ---------- GPS raw / wardrive live-status ring buffers ---------- */
+
+static void gps_raw_reset(void)
+{
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    s_gps_raw_head = 0;
+    s_gps_raw_count = 0;
+    s_gps_raw_quality = 0;
+    s_gps_raw_sats = 0;
+    xSemaphoreGive(s_mutex);
+}
+
+static void gps_raw_push(const char *sentence)
+{
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    snprintf(s_gps_raw_ring[s_gps_raw_head], GPS_RAW_LINE_MAX, "%s", sentence);
+    s_gps_raw_head = (s_gps_raw_head + 1) % GPS_RAW_RING_MAX;
+    if (s_gps_raw_count < GPS_RAW_RING_MAX) s_gps_raw_count++;
+
+    /* GGA: $..GGA,time,lat,N,lon,E,quality,sats,... -> fields 6=quality, 7=sats */
+    if (strstr(sentence, "GGA")) {
+        int field = 0;
+        const char *p = sentence;
+        int quality = 0, sats = 0;
+        for (; *p; p++) {
+            if (*p == ',') {
+                field++;
+                if (field == 6) quality = atoi(p + 1);
+                else if (field == 7) { sats = atoi(p + 1); break; }
+            }
+        }
+        s_gps_raw_quality = quality;
+        s_gps_raw_sats = sats;
+    }
+    xSemaphoreGive(s_mutex);
+}
+
+static void wardrive_live_reset(void)
+{
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    s_wardrive_live_sats = 0;
+    s_wardrive_live_dist = 0.0f;
+    s_wardrive_live_unique = 0;
+    s_wardrive_live_relogs = 0;
+    s_wardrive_net_head = 0;
+    s_wardrive_net_count = 0;
+    xSemaphoreGive(s_mutex);
+}
+
+/* Parse a wardrive CSV row emitted during a live session, e.g.
+ *   "C4:2B:44:12:29:20,AX4,[WPA2_PSK],2025-09-26 00:00:08,48,-62,53.26,-6.22,100.09,12.40,WIFI"
+ * Fields: 0=MAC 1=SSID 2=[sec] 3=timestamp 4=channel 5=rssi 6=lat 7=lon ...
+ * Returns true and fills `out` when the row looks like a WIFI record. */
+static bool parse_wardrive_csv(const char *line, wardrive_net_t *out)
+{
+    /* Must end in the WIFI/BLE tag and start with a MAC (hex + colons). */
+    if (!strstr(line, ",WIFI") && !strstr(line, ",BLE")) return false;
+    if (line[0] == '>' || line[0] == ' ') return false;
+    /* Cheap MAC sanity: "XX:XX:XX:XX:XX:XX," */
+    if (strlen(line) < 18 || line[2] != ':' || line[5] != ':' || line[17] != ',') return false;
+
+    memset(out, 0, sizeof(*out));
+
+    /* Tokenize a mutable copy so empty SSIDs (",,") are handled. */
+    char buf[256];
+    snprintf(buf, sizeof(buf), "%s", line);
+
+    char *fields[11] = {0};
+    int n = 0;
+    char *p = buf;
+    char *start = buf;
+    for (; *p && n < 11; p++) {
+        if (*p == ',') {
+            *p = '\0';
+            fields[n++] = start;
+            start = p + 1;
+        }
+    }
+    if (n < 8) return false;
+
+    snprintf(out->mac, sizeof(out->mac), "%s", fields[0]);
+    if (fields[1]) snprintf(out->ssid, sizeof(out->ssid), "%s", fields[1]);
+    if (fields[2]) snprintf(out->sec, sizeof(out->sec), "%s", fields[2]);
+    out->ch   = fields[4] ? atoi(fields[4]) : 0;
+    out->rssi = fields[5] ? atoi(fields[5]) : 0;
+    out->lat  = fields[6] ? strtof(fields[6], NULL) : 0.0f;
+    out->lon  = fields[7] ? strtof(fields[7], NULL) : 0.0f;
+    return true;
+}
+
+static void wardrive_net_push(const wardrive_net_t *net)
+{
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    s_wardrive_net_ring[s_wardrive_net_head] = *net;
+    s_wardrive_net_head = (s_wardrive_net_head + 1) % WARDRIVE_NET_RING_MAX;
+    if (s_wardrive_net_count < WARDRIVE_NET_RING_MAX) s_wardrive_net_count++;
+    xSemaphoreGive(s_mutex);
+}
+
+/* Wardrive live stats stream in regardless of the command FSM state: the
+ * session may have been started outside the web (or the FSM reset while the C5
+ * kept running), so - like the ARP/nmap/BT/Sniffer-Dog handlers - we parse the
+ * `Wardrive promisc:` status line and the CSV network rows state-independently.
+ * This mirrors how the Tab5 parses these lines in its monitor loop. Returns
+ * true when the line was consumed as a wardrive stream line. */
+static bool handle_wardrive_stream_line(const char *line)
+{
+    /* Start/stop banners drive the active flag so `running` is correct even for
+     * externally-started sessions. */
+    if (strstr(line, "Promiscuous wardrive started")) {
+        wardrive_live_reset();
+        s_wardrive_active = true;
+        return false;   /* let downstream parsing/logging see it too */
+    }
+    if (strstr(line, "Wardrive promisc stopped")) {
+        s_wardrive_active = false;
+        return false;   /* STATE_WARDRIVE case still handles the FSM transition */
+    }
+
+    /* Periodic status line:
+     *   "Wardrive promisc: N unique networks, ... K relogs, ...
+     *    GPS: valid, sats: 8, dist: 20.8m" */
+    const char *wp = strstr(line, "Wardrive promisc:");
+    if (wp) {
+        int sats = -1, unique = -1, relogs = -1;
+        float dist = -1.0f;
+        const char *sp = strstr(wp, "sats:");
+        if (sp) { sp += 5; while (*sp == ' ') sp++; sats = atoi(sp); }
+        const char *dp = strstr(wp, "dist:");
+        if (dp) { dp += 5; while (*dp == ' ') dp++; dist = atof(dp); }
+        const char *up = strstr(wp, "unique");
+        if (up) { const char *q = wp + 17; while (*q == ' ') q++; unique = atoi(q); }
+        const char *rp = strstr(wp, "relogs");
+        if (rp) {
+            /* Number sits just before " relogs": back over spaces then digits. */
+            const char *q = rp;
+            while (q > wp && *(q - 1) == ' ') q--;
+            while (q > wp && ((*(q - 1) >= '0' && *(q - 1) <= '9') || *(q - 1) == '-')) q--;
+            relogs = atoi(q);
+        }
+
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        if (sats >= 0)   s_wardrive_live_sats = sats;
+        if (dist >= 0)   s_wardrive_live_dist = dist;
+        if (unique >= 0) s_wardrive_live_unique = unique;
+        if (relogs >= 0) s_wardrive_live_relogs = relogs;
+        s_wardrive_active = true;
+        xSemaphoreGive(s_mutex);
+
+        broadcast_json(
+            "{\"type\":\"wardrive_status\",\"sats\":%d,\"dist\":%.2f,"
+            "\"unique\":%d,\"relogs\":%d}",
+            sats, dist < 0 ? 0.0f : dist, unique, relogs);
+        return true;
+    }
+
+    /* Live CSV network rows stream in during the session; retain the most
+     * recent ones so the UI can show SSIDs over the HTTP poll. */
+    wardrive_net_t net;
+    if (parse_wardrive_csv(line, &net)) {
+        wardrive_net_push(&net);
+        return true;
+    }
+    return false;
+}
+
 static void on_uart_line(const char *line, void *ctx)
 {
     (void)ctx;
     s_last_uart_ms = esp_timer_get_time() / 1000;
+    s_c5_established = true;
 
     /* Capture every raw line into the serial ring so the web can poll it
      * (reliable even when the WebSocket drops frames). */
@@ -1299,6 +1924,25 @@ static void on_uart_line(const char *line, void *ctx)
      * zig_recon_* polls; parse them regardless of FSM state. */
     handle_zig_line(line);
 
+    /* Bluetooth (scan_bt / scan_airtag) results also arrive after the FSM has
+     * already flipped back to IDLE on the command echo, so parse them
+     * state-independently too (gated on the arm flags). When a BT line is
+     * consumed we skip the redundant raw uart_line below to spare WS queue
+     * space (see broadcast_uart_line gate at the end). */
+    bool bt_consumed = handle_bt_line(line);
+
+    /* Sniffer Dog deauth events likewise stream in regardless of FSM state
+     * (a stop echo can flip us to IDLE), so cache them state-independently. */
+    if (handle_sniffer_dog_line(line)) {
+        return;
+    }
+
+    /* Wardrive live stats + CSV rows stream in regardless of FSM state (the
+     * session may have been started outside the web, or the FSM reset while the
+     * C5 kept running). Parse them state-independently; don't early-return so
+     * the raw uart_line broadcast below is unchanged. */
+    handle_wardrive_stream_line(line);
+
     /* Update display if available */
     if (s_display_cb) {
         s_display_cb(NULL, line);
@@ -1315,6 +1959,13 @@ static void on_uart_line(const char *line, void *ctx)
         s_state = STATE_IDLE;
         xSemaphoreGive(s_mutex);
         broadcast_json("{\"type\":\"attack_stopped\"}");
+    }
+
+    /* `sd_status` reply is state-independent (SD_OK / SD_NONE on its own line). */
+    if (strstr(line, "SD_OK")) {
+        s_sd_present = 1;
+    } else if (strstr(line, "SD_NONE")) {
+        s_sd_present = 0;
     }
 
     const char *gps = strstr(line, "GPS fix obtained:");
@@ -1415,6 +2066,228 @@ static void on_uart_line(const char *line, void *ctx)
         break;
     }
 
+    case STATE_WARDRIVE_CONFIG: {
+        /* Swallow the `> get_wardrive_config` command echo so it isn't treated
+         * as the terminating prompt before any [WDCFG] line has arrived. */
+        if (!s_wardrive_config_echo_seen && strstr(line, "get_wardrive_config")) {
+            s_wardrive_config_echo_seen = true;
+            break;
+        }
+        /* Parse `[WDCFG] key=value` lines emitted by get_wardrive_config. */
+        const char *p = strstr(line, "[WDCFG]");
+        if (p) {
+            p += strlen("[WDCFG]");
+            while (*p == ' ') p++;
+            if (strncmp(p, "END", 3) == 0) {
+                s_wardrive_config.loaded = true;
+                s_wardrive_config_loaded = true;
+                xSemaphoreTake(s_mutex, portMAX_DELAY);
+                s_state = STATE_IDLE;
+                xSemaphoreGive(s_mutex);
+                broadcast_json("{\"type\":\"wardrive_config\",\"status\":\"loaded\"}");
+                break;
+            }
+            if (strncmp(p, "bands=", 6) == 0) {
+                s_wardrive_config.bands = 0;
+                if (strstr(p, "wifi24")) s_wardrive_config.bands |= WARDRIVE_BAND_WIFI24;
+                if (strstr(p, "wifi5"))  s_wardrive_config.bands |= WARDRIVE_BAND_WIFI5;
+                if (strstr(p, "ble"))    s_wardrive_config.bands |= WARDRIVE_BAND_BLE;
+            } else if (strncmp(p, "channels=", 9) == 0) {
+                const char *v = p + 9;
+                if (strncmp(v, "popular", 7) == 0) s_wardrive_config.channel_mode = WARDRIVE_CH_POPULAR;
+                else if (strncmp(v, "custom", 6) == 0) s_wardrive_config.channel_mode = WARDRIVE_CH_CUSTOM;
+                else s_wardrive_config.channel_mode = WARDRIVE_CH_ALL;
+            } else if (strncmp(p, "custom=", 7) == 0) {
+                snprintf(s_wardrive_config.custom_channels,
+                         sizeof(s_wardrive_config.custom_channels), "%s", p + 7);
+            } else if (strncmp(p, "wifi_rssi_delta=", 16) == 0) {
+                s_wardrive_config.wifi_rssi_delta = atoi(p + 16);
+            } else if (strncmp(p, "ble_rssi_delta=", 15) == 0) {
+                s_wardrive_config.ble_rssi_delta = atoi(p + 15);
+            } else if (strncmp(p, "startup_cooldown=", 17) == 0) {
+                s_wardrive_config.startup_cooldown = atoi(p + 17);
+            } else if (strncmp(p, "mem_cap=", 8) == 0) {
+                s_wardrive_config.mem_cap = atoi(p + 8);
+            } else if (strncmp(p, "antisurv_sensitivity=", 21) == 0) {
+                const char *v = p + 21;
+                if (strncmp(v, "low", 3) == 0) s_wardrive_config.antisurv_sensitivity = WARDRIVE_ANTISURV_LOW;
+                else if (strncmp(v, "high", 4) == 0) s_wardrive_config.antisurv_sensitivity = WARDRIVE_ANTISURV_HIGH;
+                else s_wardrive_config.antisurv_sensitivity = WARDRIVE_ANTISURV_MED;
+            } else if (strncmp(p, "gps=", 4) == 0) {
+                snprintf(s_wardrive_config.gps_module,
+                         sizeof(s_wardrive_config.gps_module), "%s", p + 4);
+            }
+            break;
+        }
+        /* Fallback: if the prompt arrives without an explicit [WDCFG] END, still
+         * finish so we never wedge in the config-read state. Only honor it after
+         * the command echo so the echo itself doesn't finalize the read early. */
+        if (is_prompt_line(line) && s_wardrive_config_echo_seen) {
+            s_wardrive_config.loaded = true;
+            s_wardrive_config_loaded = true;
+            xSemaphoreTake(s_mutex, portMAX_DELAY);
+            s_state = STATE_IDLE;
+            xSemaphoreGive(s_mutex);
+            broadcast_json("{\"type\":\"wardrive_config\",\"status\":\"loaded\"}");
+        }
+        break;
+    }
+
+    case STATE_WARDRIVE: {
+        /* Live stats + CSV rows are parsed state-independently in
+         * handle_wardrive_stream_line(); here we only handle the FSM stop
+         * transition. */
+
+        /* Graceful stop reported by JanOS. */
+        if (strstr(line, "Wardrive promisc stopped")) {
+            s_wardrive_active = false;
+            xSemaphoreTake(s_mutex, portMAX_DELAY);
+            s_state = STATE_IDLE;
+            xSemaphoreGive(s_mutex);
+            broadcast_json("{\"type\":\"attack_stopped\"}");
+            break;
+        }
+
+        attack_event_t ev = parse_attack_event(line);
+        if (ev.type == ATTACK_EVENT_STOP_ACK) {
+            s_wardrive_active = false;
+            xSemaphoreTake(s_mutex, portMAX_DELAY);
+            s_state = STATE_IDLE;
+            xSemaphoreGive(s_mutex);
+            broadcast_json("{\"type\":\"attack_stopped\"}");
+            break;
+        }
+        break;
+    }
+
+    case STATE_LISTING_WARDRIVE_FILES: {
+        /* JanOS `wardrive_files`:
+         *   [WARD_FILE] BEGIN
+         *   [WARD_FILE] filename=w1.csv hash=.. wigle=done wdgwars=pending
+         *               size=1234 wifi=10 ble=3 bt=0 bad=0
+         *   [WARD_FILE] SUMMARY ...
+         *   [WARD_FILE] END
+         */
+        if (strstr(line, "[WARD_FILE] BEGIN")) {
+            dynvec_clear(&s_wardrive_files);
+            break;
+        }
+        if (strstr(line, "[WARD_FILE] filename=")) {
+            wardrive_file_t f;
+            memset(&f, 0, sizeof(f));
+            ward_marker_str(line, "filename", f.name, sizeof(f.name));
+            ward_marker_str(line, "wigle", f.wigle, sizeof(f.wigle));
+            ward_marker_str(line, "wdgwars", f.wdgwars, sizeof(f.wdgwars));
+            f.size = ward_marker_long(line, "size", 0);
+            f.wifi = ward_marker_int(line, "wifi", 0);
+            f.ble  = ward_marker_int(line, "ble", 0);
+            f.bt   = ward_marker_int(line, "bt", 0);
+            if (f.name[0] && !dynvec_push(&s_wardrive_files, &f)) log_drop("wardrive_files");
+            break;
+        }
+        if (strstr(line, "[WARD_FILE] SUMMARY")) {
+            break;  /* aggregate stats -- not needed by the web UI */
+        }
+        if (strstr(line, "[WARD_FILE] END") ||
+            strstr(line, "Unrecognized command") ||
+            is_prompt_line(line)) {
+            s_wardrive_files_loaded = true;
+            xSemaphoreTake(s_mutex, portMAX_DELAY);
+            s_state = STATE_IDLE;
+            xSemaphoreGive(s_mutex);
+            broadcast_json("{\"type\":\"wardrive_files_updated\",\"count\":%d}",
+                           (int)s_wardrive_files.count);
+        }
+        break;
+    }
+
+    case STATE_WARDRIVE_UPLOAD: {
+        /* Fatal aborts reported by JanOS. */
+        const char *err = NULL;
+        if (strstr(line, "NO WIGLE CREDENTIALS") || strstr(line, "NO WDGWARS CREDENTIALS") ||
+            strstr(line, "NOT SET") || strstr(line, "not set")) {
+            err = "no_credentials";
+        } else if (strstr(line, "WDGWARS AUTH FAILED") || strstr(line, "AUTH FAILED")) {
+            err = "auth_failed";
+        } else if (strstr(line, "WIFI NOT CONNECTED")) {
+            err = "wifi";
+        } else if (strstr(line, "Unrecognized command")) {
+            err = "unsupported";
+        }
+        if (err) {
+            xSemaphoreTake(s_mutex, portMAX_DELAY);
+            s_state = STATE_IDLE;
+            xSemaphoreGive(s_mutex);
+            broadcast_json("{\"type\":\"wardrive_upload_error\",\"provider\":\"%s\","
+                           "\"reason\":\"%s\"}", s_wardrive_upload_provider, err);
+            break;
+        }
+
+        /* Completion summary. Several historical formats -- try the richest
+         * first. "duplicate" is treated as "skipped". */
+        const char *done = strstr(line, "Done:");
+        if (done) {
+            int up = 0, skip = 0, fail = 0, rl = 0;
+            if (sscanf(done, "Done: %d uploaded, %d skipped, %d failed, %d rate_limited",
+                       &up, &skip, &fail, &rl) >= 3 ||
+                sscanf(done, "Done: %d uploaded, %d duplicate, %d failed",
+                       &up, &skip, &fail) == 3 ||
+                sscanf(done, "Done: %d uploaded, %d skipped, %d failed",
+                       &up, &skip, &fail) == 3) {
+                /* parsed */
+            }
+            xSemaphoreTake(s_mutex, portMAX_DELAY);
+            s_state = STATE_IDLE;
+            xSemaphoreGive(s_mutex);
+            broadcast_json("{\"type\":\"wardrive_upload_done\",\"provider\":\"%s\","
+                           "\"uploaded\":%d,\"skipped\":%d,\"failed\":%d,\"rate_limited\":%d}",
+                           s_wardrive_upload_provider, up, skip, fail, rl);
+            /* Refresh cached file statuses on the next request. */
+            s_wardrive_files_loaded = false;
+            break;
+        }
+
+        attack_event_t ev = parse_attack_event(line);
+        if (ev.type == ATTACK_EVENT_STOP_ACK) {
+            xSemaphoreTake(s_mutex, portMAX_DELAY);
+            s_state = STATE_IDLE;
+            xSemaphoreGive(s_mutex);
+            broadcast_json("{\"type\":\"attack_stopped\"}");
+        }
+        /* Non-terminal progress lines fall through to broadcast_uart_line so
+         * the web UI can show live upload progress. */
+        break;
+    }
+
+    case STATE_GPS_RAW: {
+        /* Raw NMEA diagnostics: forward sentences ($GxGGA/$GxRMC/...) as a
+         * dedicated event so the panel can render them without the general
+         * uart_line noise. `stop` is handled by cmd_do_stop (forces IDLE). */
+        const char *dollar = strchr(line, '$');
+        if (dollar && (dollar[1] == 'G' || dollar[1] == 'P' || dollar[1] == 'B' ||
+                       dollar[1] == 'L' || dollar[1] == 'Q')) {
+            /* Retain in the ring buffer for the HTTP-poll fallback; the phone
+             * loses the high-rate WS gps_nmea stream to LRU socket purges. */
+            gps_raw_push(dollar);
+
+            /* WS fast path: forward only the fix-bearing sentences (GGA/RMC) so
+             * the ~17 sentences/s burst can't saturate the WS queue and get the
+             * client evicted. Everything is still available via the poll. */
+            if (strstr(dollar, "GGA") || strstr(dollar, "RMC")) {
+                char escaped[260];
+                int j = 0;
+                for (int i = 0; dollar[i] && j < (int)sizeof(escaped) - 2; i++) {
+                    if (dollar[i] == '"' || dollar[i] == '\\') escaped[j++] = '\\';
+                    escaped[j++] = dollar[i];
+                }
+                escaped[j] = '\0';
+                broadcast_json("{\"type\":\"gps_nmea\",\"line\":\"%s\"}", escaped);
+            }
+            return;  /* skip the redundant raw uart_line copy */
+        }
+        break;
+    }
+
     case STATE_ATTACK_DEAUTH:
     case STATE_ATTACK_BLACKOUT:
     case STATE_ATTACK_SAE: {
@@ -1436,7 +2309,22 @@ static void on_uart_line(const char *line, void *ctx)
         if (ev.type == ATTACK_EVENT_CLIENT_CONNECTED) {
             broadcast_json("{\"type\":\"client_connected\",\"mac\":\"%s\"}", ev.detail);
         } else if (ev.type == ATTACK_EVENT_PASSWORD_RECEIVED) {
+            char pw[192];
+            snprintf(pw, sizeof(pw), "password=%s", ev.detail);
+            portal_capture_push(pw);
             broadcast_json("{\"type\":\"password_received\",\"password\":\"%s\"}", ev.detail);
+        } else if (ev.type == ATTACK_EVENT_PORTAL_DATA) {
+            portal_capture_push(ev.detail);
+            char escaped[260];
+            int j = 0;
+            for (int i = 0; ev.detail[i] && j < (int)sizeof(escaped) - 2; i++) {
+                if (ev.detail[i] == '"' || ev.detail[i] == '\\') {
+                    escaped[j++] = '\\';
+                }
+                escaped[j++] = ev.detail[i];
+            }
+            escaped[j] = '\0';
+            broadcast_json("{\"type\":\"portal_data\",\"data\":\"%s\"}", escaped);
         } else if (ev.type == ATTACK_EVENT_PASSWORD_VERIFIED) {
             broadcast_json("{\"type\":\"password_verified\"}");
         } else if (ev.type == ATTACK_EVENT_CLIENT_DISCONNECTED) {
@@ -1478,6 +2366,10 @@ static void on_uart_line(const char *line, void *ctx)
         if (ev.type == ATTACK_EVENT_SNIFFER_COUNT) {
             s_sniffer.packet_count = ev.int_val;
             broadcast_json("{\"type\":\"sniffer_count\",\"count\":%d}", ev.int_val);
+            /* Background count lines arrive prompt-prefixed ("> Sniffer packet
+             * count: N"); stop here so they never reach the is_prompt_line
+             * check below and prematurely finish the snapshot. */
+            break;
         } else if (ev.type == ATTACK_EVENT_STOP_ACK) {
             s_sniffer_collecting = false;
             xSemaphoreTake(s_mutex, portMAX_DELAY);
@@ -1490,8 +2382,9 @@ static void on_uart_line(const char *line, void *ctx)
             parsed_sniffer_ap_t ap;
             char client[SNIFFER_CLIENT_LEN];
 
-            /* Our own command echo -- mark it seen, don't treat as prompt. */
-            if (strstr(line, "show_sniffer_results")) {
+            /* Only trust a terminating prompt once we've seen our command echo;
+             * a stray background "> " before that is not our result's end. */
+            if (!s_sniffer_echo_seen && strstr(line, "show_sniffer_results") != NULL) {
                 s_sniffer_echo_seen = true;
                 break;
             }
@@ -1531,6 +2424,31 @@ static void on_uart_line(const char *line, void *ctx)
                 finish_sniffer_snapshot();
                 break;
             }
+        }
+        break;
+    }
+
+    case STATE_ATTACK_SNIFFER_DOG: {
+        /* Deauth events and the start banner are handled state-independently in
+         * handle_sniffer_dog_line() above; here we only react to an explicit
+         * stop acknowledgement. */
+        attack_event_t ev = parse_attack_event(line);
+        if (ev.type == ATTACK_EVENT_STOP_ACK) {
+            xSemaphoreTake(s_mutex, portMAX_DELAY);
+            s_state = STATE_IDLE;
+            xSemaphoreGive(s_mutex);
+            broadcast_json("{\"type\":\"attack_stopped\"}");
+        }
+        break;
+    }
+
+    case STATE_ATTACK_BEACON_SPAM: {
+        attack_event_t ev = parse_attack_event(line);
+        if (ev.type == ATTACK_EVENT_STOP_ACK) {
+            xSemaphoreTake(s_mutex, portMAX_DELAY);
+            s_state = STATE_IDLE;
+            xSemaphoreGive(s_mutex);
+            broadcast_json("{\"type\":\"attack_stopped\"}");
         }
         break;
     }
@@ -1596,6 +2514,40 @@ static void on_uart_line(const char *line, void *ctx)
         if (stop_like) {
             /* Bug 2: arp_ban stop tears down STA on JanOS. */
             mark_sta_disconnected();
+            xSemaphoreTake(s_mutex, portMAX_DELAY);
+            s_state = STATE_IDLE;
+            xSemaphoreGive(s_mutex);
+            broadcast_json("{\"type\":\"attack_stopped\"}");
+        }
+        break;
+    }
+
+    case STATE_ATTACK_BT_SCAN: {
+        /* One-time BLE scan. Device rows + the "Summary:" end marker are
+         * parsed state-independently in handle_bt_line(); here we only flip
+         * the FSM back to IDLE once the scan finishes (Summary) or is
+         * stopped, so the device isn't left stuck "busy". */
+        attack_event_t ev = parse_attack_event(line);
+        bool done = (ev.type == ATTACK_EVENT_STOP_ACK ||
+                     (strstr(line, "Summary:") && strstr(line, "AirTags")));
+        if (done) {
+            xSemaphoreTake(s_mutex, portMAX_DELAY);
+            s_state = STATE_IDLE;
+            xSemaphoreGive(s_mutex);
+            broadcast_json("{\"type\":\"attack_stopped\"}");
+        }
+        break;
+    }
+
+    case STATE_ATTACK_BT_TRACK:
+    case STATE_ATTACK_AIRTAG: {
+        /* Continuous scans: RSSI / count lines are streamed
+         * state-independently in handle_bt_line(); only an explicit stop
+         * acknowledgement ends them. */
+        attack_event_t ev = parse_attack_event(line);
+        if (ev.type == ATTACK_EVENT_STOP_ACK) {
+            s_bt_track_active = false;
+            s_airtag_active = false;
             xSemaphoreTake(s_mutex, portMAX_DELAY);
             s_state = STATE_IDLE;
             xSemaphoreGive(s_mutex);
@@ -1719,8 +2671,14 @@ static void on_uart_line(const char *line, void *ctx)
         }
 
         parsed_password_t pw;
-        if (parse_password_line(line, &pw)) {
-            if (!dynvec_push(&s_passwords, &pw)) log_drop("passwords");
+        bool parsed = (s_passwords_kind == PW_KIND_PORTAL)
+                          ? parse_portal_password_line(line, &pw)
+                          : parse_password_line(line, &pw);
+        if (parsed) {
+            dynvec_t *dst = (s_passwords_kind == PW_KIND_PORTAL)
+                                ? &s_passwords_portal
+                                : &s_passwords_evil;
+            if (!dynvec_push(dst, &pw)) log_drop("passwords");
             break;
         }
 
@@ -1787,16 +2745,29 @@ static void on_uart_line(const char *line, void *ctx)
     }
 
     case STATE_LISTING_HANDSHAKES: {
-        const char *p = line;
-        while (*p == ' ') p++;
-        if (*p >= '0' && *p <= '9' && strstr(line, ".pcap") && !strstr(line, ".hccapx")) {
-            if (s_handshake_count < 0) s_handshake_count = 0;
-            s_handshake_count++;
+        /* Ignore the "> list_dir ..." echo; only parse after the header. */
+        if (strstr(line, "Files in ")) {
+            s_handshake_header_seen = true;
+            break;
         }
 
-        if ((strstr(line, "Found ") && strstr(line, "file(s) in")) || is_prompt_line(line)) {
+        if (s_handshake_header_seen) {
+            parsed_portal_file_t f;
+            if (parse_portal_file_line(line, &f)) {
+                if (!dynvec_push(&s_handshakes, &f)) log_drop("handshakes");
+                if (strstr(line, ".pcap") && !strstr(line, ".hccapx")) {
+                    if (s_handshake_count < 0) s_handshake_count = 0;
+                    s_handshake_count++;
+                }
+                break;
+            }
+        }
+
+        if ((strstr(line, "Found ") && strstr(line, "file(s) in")) ||
+            (s_handshake_header_seen && is_prompt_line(line))) {
             if (s_handshake_count < 0) s_handshake_count = 0;
             s_handshake_initial_done = true;
+            s_handshake_header_seen = false;
             xSemaphoreTake(s_mutex, portMAX_DELAY);
             s_state = STATE_IDLE;
             xSemaphoreGive(s_mutex);
@@ -1805,13 +2776,23 @@ static void on_uart_line(const char *line, void *ctx)
     }
 
     case STATE_LISTING_WARDRIVE: {
-        parsed_portal_file_t f;
-        if (parse_portal_file_line(line, &f)) {
-            if (!dynvec_push(&s_wardrive_logs, &f)) log_drop("wardrive_logs");
+        /* Ignore the "> list_dir ..." echo; only parse after the header. */
+        if (strstr(line, "Files in ")) {
+            s_wardrive_header_seen = true;
             break;
         }
 
-        if ((strstr(line, "Found ") && strstr(line, "file(s) in")) || is_prompt_line(line)) {
+        if (s_wardrive_header_seen) {
+            parsed_portal_file_t f;
+            if (parse_portal_file_line(line, &f)) {
+                if (!dynvec_push(&s_wardrive_logs, &f)) log_drop("wardrive_logs");
+                break;
+            }
+        }
+
+        if ((strstr(line, "Found ") && strstr(line, "file(s) in")) ||
+            (s_wardrive_header_seen && is_prompt_line(line))) {
+            s_wardrive_header_seen = false;
             xSemaphoreTake(s_mutex, portMAX_DELAY);
             s_state = STATE_IDLE;
             xSemaphoreGive(s_mutex);
@@ -2012,7 +2993,18 @@ static void on_uart_line(const char *line, void *ctx)
     case STATE_SUBGHZ_LIST: {
         /* [SUBGHZ_LIST] / [SUBGHZ_LIST_END] are handled in
          * handle_subghz_event_line so they work regardless of state.
-         * Nothing else interesting can arrive while a list is in flight. */
+         *
+         * If JanOS rejects the list (e.g. a bad/missing `<mem|sd>` source
+         * prints "Usage: subghz_list ..." + a CLI prompt and NO
+         * [SUBGHZ_LIST_END]), fall back to the prompt so we don't wedge the
+         * whole SubGHz subsystem in STATE_SUBGHZ_LIST — that would block the
+         * next listen/tx/list until the 8s silence timeout, which never
+         * fires while an RX flood keeps the UART busy. */
+        if (is_prompt_line(line)) {
+            xSemaphoreTake(s_mutex, portMAX_DELAY);
+            if (s_state == STATE_SUBGHZ_LIST) s_state = STATE_IDLE;
+            xSemaphoreGive(s_mutex);
+        }
         break;
     }
 
@@ -2036,10 +3028,10 @@ static void on_uart_line(const char *line, void *ctx)
                 broadcast_json("{\"type\":\"subghz_import_done\",\"count\":%d}",
                                s_subghz_import_count);
             }
-            /* Auto-refresh the in-memory list from JanOS so the Manage table
-             * shows imported entries without the frontend having to chase
-             * another round-trip. */
-            cmd_do_subghz_list_refresh();
+            /* Auto-refresh the SD library so the Manage table shows the
+             * imported entries without the frontend chasing another
+             * round-trip. */
+            cmd_do_subghz_list_refresh("sd");
             break;
         }
         if (strstr(line, "[SUBGHZ_IMPORT]")) {
@@ -2051,23 +3043,37 @@ static void on_uart_line(const char *line, void *ctx)
     }
 
     case STATE_SUBGHZ_EXPORT: {
-        if (strstr(line, "[SUBGHZ_EXPORT_END]") || is_prompt_line(line)) {
+        /* `subghz_save all` finishes on [SUBGHZ_SAVE_END]; accept the legacy
+         * [SUBGHZ_EXPORT_END] and a bare prompt as fallbacks. */
+        if (strstr(line, "[SUBGHZ_SAVE_END]") ||
+            strstr(line, "[SUBGHZ_EXPORT_END]") ||
+            is_prompt_line(line)) {
             xSemaphoreTake(s_mutex, portMAX_DELAY);
             if (s_state == STATE_SUBGHZ_EXPORT) s_state = STATE_IDLE;
             xSemaphoreGive(s_mutex);
             broadcast_json("{\"type\":\"subghz_export_done\"}");
+            /* Reflect the freshly-saved entries in the SD library view. */
+            cmd_do_subghz_list_refresh("sd");
         }
         break;
     }
 
     case STATE_LISTING_PROBES: {
+        /* Wait for the `list_probes` echo before honoring a prompt as the end
+         * of the reply. While the sniffer runs, background "> " lines would
+         * otherwise cut the listing short and swap in an empty buffer. */
+        if (!s_probes_echo_seen && strstr(line, "list_probes") != NULL) {
+            s_probes_echo_seen = true;
+            break;
+        }
+
         parsed_probe_t pr;
         if (parse_probe_line(line, &pr)) {
             if (!dynvec_push(&s_probes_build, &pr)) log_drop("probes_build");
             break;
         }
 
-        if (is_prompt_line(line)) {
+        if (is_prompt_line(line) && s_probes_echo_seen) {
             /* Swap so we don't leak the previous live cache; clear build. */
             dynvec_t tmp = s_probes;
             s_probes       = s_probes_build;
@@ -2091,11 +3097,35 @@ static void on_uart_line(const char *line, void *ctx)
 
     sync_display_status();
 
+    /* The sniffer emits "Sniffer packet count: N" every ~200ms; it is already
+     * delivered as a structured `sniffer_count` event, so skip the redundant
+     * raw uart_line here. Otherwise the flood doubles WS traffic and saturates
+     * the send queue, dropping rare frames like `sniffer_results_updated`. */
+    if (strstr(line, "Sniffer packet count:")) {
+        return;
+    }
+
+    /* BT device rows / RSSI / airtag counts already went out as structured
+     * events; don't also flood the WS queue with their raw copies. */
+    if (bt_consumed) {
+        return;
+    }
+
     /* Forward raw line for non-structured lines (network CSV lines return early above) */
     broadcast_uart_line(line);
 }
 
 /* ---------- Public API ---------- */
+
+static void keepalive_timer_cb(void *arg)
+{
+    (void)arg;
+    /* Only ping until the C5 has spoken to us once. After first contact the
+     * connection is sticky, so there's no need to keep the UART chattering. */
+    if (!s_c5_established && cmd_get_state() == STATE_IDLE) {
+        uart_bridge_send("ping");
+    }
+}
 
 void cmd_handler_init(void)
 {
@@ -2110,15 +3140,20 @@ void cmd_handler_init(void)
      * Initial capacities are small but enough for the most common cases;
      * dynvec_push doubles on demand. */
     scan_clear();
-    dynvec_init(&s_portals,        sizeof(parsed_portal_file_t), 8);
-    dynvec_init(&s_passwords,      sizeof(parsed_password_t),    8);
-    dynvec_init(&s_wardrive_logs,  sizeof(parsed_portal_file_t), 8);
+    dynvec_init(&s_portals,          sizeof(parsed_portal_file_t), 8);
+    dynvec_init(&s_passwords_evil,   sizeof(parsed_password_t),    8);
+    dynvec_init(&s_passwords_portal, sizeof(parsed_password_t),    8);
+    dynvec_init(&s_handshakes,       sizeof(parsed_portal_file_t), 8);
+    dynvec_init(&s_wardrive_logs,    sizeof(parsed_portal_file_t), 8);
+    dynvec_init(&s_wardrive_files,   sizeof(wardrive_file_t),      8);
     dynvec_init(&s_wd_blacklist,   sizeof(char[18]),             8);
     dynvec_init(&s_deauth_events,  sizeof(deauth_event_t),       8);
     memset(&s_wd_cfg,       0, sizeof(s_wd_cfg));
     memset(&s_wd_cfg_build, 0, sizeof(s_wd_cfg_build));
     dynvec_init(&s_probes,         sizeof(parsed_probe_t),       8);
     dynvec_init(&s_probes_build,   sizeof(parsed_probe_t),       8);
+    dynvec_init(&s_portal_captures,   sizeof(portal_capture_t),    8);
+    dynvec_init(&s_snifferdog_events, sizeof(sniffer_dog_event_t), 16);
     dynvec_init(&s_subghz_signals, sizeof(subghz_signal_t),      8);
     dynvec_init(&s_subghz_build,   sizeof(subghz_signal_t),      8);
     dynvec_init(&s_arp_hosts,      sizeof(arp_host_t),           8);
@@ -2126,9 +3161,24 @@ void cmd_handler_init(void)
     dynvec_init(&s_zig_pans,       sizeof(zig_pan_t),            8);
     dynvec_init(&s_zig_nodes,      sizeof(zig_node_t),           8);
     dynvec_init(&s_zig_edges,      sizeof(zig_edge_t),           8);
+    dynvec_init(&s_bt_devices,     sizeof(bt_device_t),          16);
     reset_sniffer_build();
 
     uart_bridge_register_line_cb(on_uart_line, NULL);
+
+    /* Keepalive: JanOS only chatters on its own during active work, so an
+     * otherwise-idle C5 would drop below the 15s "connected" window even
+     * though it's perfectly healthy. Ping it periodically while idle; the
+     * pong (or any reply) refreshes s_last_uart_ms. Skipped while a command
+     * is running so we never inject a stray "ping" mid-listing/attack. */
+    const esp_timer_create_args_t ka_args = {
+        .callback = keepalive_timer_cb,
+        .name     = "c5_keepalive",
+    };
+    if (esp_timer_create(&ka_args, &s_keepalive_timer) == ESP_OK) {
+        esp_timer_start_periodic(s_keepalive_timer, 5000000 /* 5s */);
+    }
+
     ESP_LOGI(TAG, "Command handler initialized");
 }
 
@@ -2163,11 +3213,16 @@ const char *cmd_state_name(cmd_state_t s)
     case STATE_ATTACK_SAE:        return "sae";
     case STATE_ATTACK_HANDSHAKE:  return "handshake";
     case STATE_ATTACK_SNIFFER:    return "sniffer";
+    case STATE_ATTACK_SNIFFER_DOG: return "sniffer_dog";
+    case STATE_ATTACK_BEACON_SPAM: return "beacon_spam";
     case STATE_ATTACK_BLACKOUT:   return "blackout";
     case STATE_ATTACK_MITM:       return "mitm";
     case STATE_ATTACK_NMAP:       return "nmap";
     case STATE_ATTACK_ARP:        return "arp";
     case STATE_ATTACK_ARP_BAN:    return "arp_ban";
+    case STATE_ATTACK_BT_SCAN:    return "bt_scan";
+    case STATE_ATTACK_BT_TRACK:   return "bt_track";
+    case STATE_ATTACK_AIRTAG:     return "airtag";
     case STATE_WIFI_CONNECTING:   return "wifi_connecting";
     case STATE_LISTING_PORTALS:   return "listing_portals";
     case STATE_LISTING_PASSWORDS: return "listing_passwords";
@@ -2179,6 +3234,10 @@ const char *cmd_state_name(cmd_state_t s)
     case STATE_WARDRIVE_RUN:      return "wardrive_run";
     case STATE_ANTISURV_RUN:      return "antisurv_run";
     case STATE_DEAUTH_DETECT:     return "deauth_detect";
+    case STATE_WARDRIVE:          return "wardrive";
+    case STATE_LISTING_WARDRIVE_FILES: return "listing_wardrive_files";
+    case STATE_WARDRIVE_UPLOAD:   return "wardrive_upload";
+    case STATE_GPS_RAW:           return "gps_raw";
     case STATE_LISTING_PROBES:    return "listing_probes";
     case STATE_ATTACK_KARMA:      return "karma";
     case STATE_SUBGHZ_LISTEN:     return "subghz_listen";
@@ -2208,16 +3267,18 @@ int cmd_get_portal_files_count(void)
     return (int)s_portals.count;
 }
 
-int cmd_get_passwords(parsed_password_t *out, int max)
+int cmd_get_passwords(pw_kind_t kind, parsed_password_t *out, int max)
 {
-    int n = (int)s_passwords.count < max ? (int)s_passwords.count : max;
-    if (n > 0 && out) memcpy(out, s_passwords.data, n * sizeof(parsed_password_t));
+    dynvec_t *src = (kind == PW_KIND_PORTAL) ? &s_passwords_portal : &s_passwords_evil;
+    int n = (int)src->count < max ? (int)src->count : max;
+    if (n > 0 && out) memcpy(out, src->data, n * sizeof(parsed_password_t));
     return n;
 }
 
-int cmd_get_passwords_count(void)
+int cmd_get_passwords_count(pw_kind_t kind)
 {
-    return (int)s_passwords.count;
+    dynvec_t *src = (kind == PW_KIND_PORTAL) ? &s_passwords_portal : &s_passwords_evil;
+    return (int)src->count;
 }
 
 const sniffer_results_t *cmd_get_sniffer_results(void)
@@ -2248,7 +3309,8 @@ static bool is_recoverable_state(cmd_state_t s)
      * has gone silent. STATE_SCANNING is included because the
      * "Scan results printed" marker can be lost in a UART glitch and
      * leave Mate stuck (Bug 1). */
-    return is_listing_state(s) || s == STATE_SCANNING;
+    return is_listing_state(s) || s == STATE_SCANNING ||
+           s == STATE_WARDRIVE_CONFIG || s == STATE_LISTING_WARDRIVE_FILES;
 }
 
 static bool set_state_if_idle(cmd_state_t new_state)
@@ -2334,6 +3396,7 @@ bool cmd_do_deauth(void)
 bool cmd_do_evil_twin(void)
 {
     if (!set_state_if_idle(STATE_ATTACK_EVILTWIN)) return false;
+    portal_captures_reset();
     if (s_display_cb) s_display_cb("start_evil_twin", NULL);
     uart_bridge_send("start_evil_twin");
     broadcast_json("{\"type\":\"attack_started\",\"attack\":\"eviltwin\"}");
@@ -2343,6 +3406,7 @@ bool cmd_do_evil_twin(void)
 bool cmd_do_rogueap(const char *ssid, const char *password)
 {
     if (!set_state_if_idle(STATE_ATTACK_ROGUEAP)) return false;
+    portal_captures_reset();
     char cmd[160];
     snprintf(cmd, sizeof(cmd), "start_rogueap \"%s\" %s", ssid, password);
     if (s_display_cb) s_display_cb(cmd, NULL);
@@ -2355,6 +3419,7 @@ bool cmd_do_portal(const char *ssid)
 {
     if (!ssid || !ssid[0]) return false;
     if (!set_state_if_idle(STATE_ATTACK_PORTAL)) return false;
+    portal_captures_reset();
     char cmd[128];
     snprintf(cmd, sizeof(cmd), "start_portal \"%s\"", ssid);
     if (s_display_cb) s_display_cb(cmd, NULL);
@@ -2463,6 +3528,56 @@ bool cmd_do_zig_recon_clear(void)
     return true;
 }
 
+bool cmd_do_sniffer_dog(void)
+{
+    if (!set_state_if_idle(STATE_ATTACK_SNIFFER_DOG)) return false;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    dynvec_clear(&s_snifferdog_events);
+    s_snifferdog_count = 0;
+    xSemaphoreGive(s_mutex);
+    if (s_display_cb) s_display_cb("start_sniffer_dog", NULL);
+    uart_bridge_send("start_sniffer_dog");
+    broadcast_json("{\"type\":\"attack_started\",\"attack\":\"sniffer_dog\"}");
+    return true;
+}
+
+bool cmd_do_beacon_spam(const char *const *ssids, int count)
+{
+    if (!ssids || count <= 0) return false;
+    if (!set_state_if_idle(STATE_ATTACK_BEACON_SPAM)) return false;
+
+    /* Build: start_beacon_spam "s1" "s2" ...  JanOS caps at 32 SSIDs, each
+     * 1-32 chars, so a 1.5 KB buffer comfortably holds the worst case. */
+    char cmd[1536];
+    int pos = snprintf(cmd, sizeof(cmd), "start_beacon_spam");
+    int used = 0;
+    for (int i = 0; i < count && pos < (int)sizeof(cmd) - 40; i++) {
+        const char *s = ssids[i];
+        if (!s || !s[0]) continue;
+        /* Skip quotes inside the SSID to keep the argument parseable. */
+        pos += snprintf(cmd + pos, sizeof(cmd) - pos, " \"");
+        for (const char *c = s; *c && pos < (int)sizeof(cmd) - 4; c++) {
+            if (*c == '"') continue;
+            cmd[pos++] = *c;
+        }
+        pos += snprintf(cmd + pos, sizeof(cmd) - pos, "\"");
+        used++;
+    }
+    cmd[pos] = '\0';
+
+    if (used == 0) {
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        s_state = STATE_IDLE;
+        xSemaphoreGive(s_mutex);
+        return false;
+    }
+
+    if (s_display_cb) s_display_cb("start_beacon_spam", NULL);
+    uart_bridge_send(cmd);
+    broadcast_json("{\"type\":\"attack_started\",\"attack\":\"beacon_spam\"}");
+    return true;
+}
+
 bool cmd_do_list_probes(void)
 {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
@@ -2488,6 +3603,7 @@ bool cmd_do_list_probes(void)
     s_state = STATE_LISTING_PROBES;
     xSemaphoreGive(s_mutex);
 
+    s_probes_echo_seen = false;
     dynvec_clear(&s_probes_build);
     if (s_display_cb) s_display_cb("list_probes", NULL);
     uart_bridge_send("list_probes");
@@ -2498,6 +3614,7 @@ bool cmd_do_karma(int probe_index)
 {
     if (probe_index <= 0) return false;
     if (!set_state_if_idle(STATE_ATTACK_KARMA)) return false;
+    portal_captures_reset();
 
     char cmd[48];
     snprintf(cmd, sizeof(cmd), "start_karma %d", probe_index);
@@ -2608,6 +3725,69 @@ bool cmd_do_arp_ban(const char *mac, const char *ip)
     return true;
 }
 
+bool cmd_do_bt_scan(void)
+{
+    if (!set_state_if_idle(STATE_ATTACK_BT_SCAN)) return false;
+    bt_devices_reset();
+    s_bt_track_active = false;
+    s_airtag_active = false;
+    s_bt_scan_active = true;
+    if (s_display_cb) s_display_cb("scan_bt", NULL);
+    uart_bridge_send("scan_bt");
+    broadcast_json("{\"type\":\"attack_started\",\"attack\":\"bt_scan\"}");
+    return true;
+}
+
+bool cmd_do_bt_track(const char *mac)
+{
+    if (!mac || !mac[0]) return false;
+    if (!set_state_if_idle(STATE_ATTACK_BT_TRACK)) return false;
+    s_bt_scan_active = false;
+    s_airtag_active = false;
+    s_bt_track_active = true;
+
+    char cmd[48];
+    snprintf(cmd, sizeof(cmd), "scan_bt %s", mac);
+    if (s_display_cb) s_display_cb(cmd, NULL);
+    uart_bridge_send(cmd);
+    broadcast_json("{\"type\":\"attack_started\",\"attack\":\"bt_track\"}");
+    return true;
+}
+
+bool cmd_do_airtag(void)
+{
+    if (!set_state_if_idle(STATE_ATTACK_AIRTAG)) return false;
+    s_bt_scan_active = false;
+    s_bt_track_active = false;
+    s_airtag_active = true;
+    if (s_display_cb) s_display_cb("scan_airtag", NULL);
+    uart_bridge_send("scan_airtag");
+    broadcast_json("{\"type\":\"attack_started\",\"attack\":\"airtag\"}");
+    return true;
+}
+
+int cmd_get_bt_devices(bt_device_t *out, int max)
+{
+    if (!out || max <= 0) return 0;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    int n = (int)s_bt_devices.count;
+    if (n > max) n = max;
+    for (int i = 0; i < n; i++) {
+        const bt_device_t *d = (const bt_device_t *)dynvec_at(&s_bt_devices, (size_t)i);
+        if (d) out[i] = *d;
+    }
+    xSemaphoreGive(s_mutex);
+    return n;
+}
+
+int cmd_get_bt_devices_count(void)
+{
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    int n = (int)s_bt_devices.count;
+    xSemaphoreGive(s_mutex);
+    return n;
+}
+
 bool cmd_do_wifi_connect(const char *ssid, const char *password)
 {
     if (!ssid || !ssid[0]) return false;
@@ -2654,6 +3834,9 @@ bool cmd_do_stop(void)
     s_observer_pending = false;   /* cancel any pending observer scan->sniffer handoff */
     s_probe_resume_state = STATE_IDLE;
     s_subghz_import_count = 0;
+    s_bt_scan_active = false;
+    s_bt_track_active = false;
+    s_airtag_active = false;
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     cmd_state_t prev = s_state;
@@ -2695,13 +3878,15 @@ bool cmd_do_select_portal(int index)
     return true;
 }
 
-bool cmd_do_list_passwords(void)
+bool cmd_do_list_passwords(pw_kind_t kind)
 {
     if (!set_state_if_idle(STATE_LISTING_PASSWORDS)) return false;
-    dynvec_clear(&s_passwords);
+    s_passwords_kind = kind;
+    dynvec_clear(kind == PW_KIND_PORTAL ? &s_passwords_portal : &s_passwords_evil);
     s_passwords_echo_seen = false;
-    if (s_display_cb) s_display_cb("show_pass evil", NULL);
-    uart_bridge_send("show_pass evil");
+    const char *cmd = (kind == PW_KIND_PORTAL) ? "show_pass portal" : "show_pass evil";
+    if (s_display_cb) s_display_cb(cmd, NULL);
+    uart_bridge_send(cmd);
     return true;
 }
 
@@ -2741,8 +3926,20 @@ bool cmd_do_list_handshake_count(void)
 {
     if (!set_state_if_idle(STATE_LISTING_HANDSHAKES)) return false;
     s_handshake_count = 0;
+    s_handshake_header_seen = false;
+    dynvec_clear(&s_handshakes);
     if (s_display_cb) s_display_cb("list_dir /sdcard/lab/handshakes", NULL);
     uart_bridge_send("list_dir /sdcard/lab/handshakes");
+    return true;
+}
+
+bool cmd_do_sd_status(void)
+{
+    /* Does not change FSM state: the SD_OK/SD_NONE reply is parsed
+     * state-independently in on_uart_line(). Callers gate this on IDLE so we
+     * never inject a stray command mid-listing/attack. */
+    if (s_display_cb) s_display_cb("sd_status", NULL);
+    uart_bridge_send("sd_status");
     return true;
 }
 
@@ -2750,6 +3947,7 @@ bool cmd_do_list_wardrive_logs(void)
 {
     if (!set_state_if_idle(STATE_LISTING_WARDRIVE)) return false;
     dynvec_clear(&s_wardrive_logs);
+    s_wardrive_header_seen = false;
     if (s_display_cb) s_display_cb("list_dir /sdcard/lab/wardrives", NULL);
     uart_bridge_send("list_dir /sdcard/lab/wardrives");
     return true;
@@ -2761,6 +3959,34 @@ bool cmd_do_wardrive_config_load(void)
 {
     if (!set_state_if_idle(STATE_WARDRIVE_CONFIG)) return false;
     memset(&s_wd_cfg_build, 0, sizeof(s_wd_cfg_build));
+    if (s_display_cb) s_display_cb("get_wardrive_config", NULL);
+    uart_bridge_send("get_wardrive_config");
+    return true;
+}
+
+bool cmd_do_start_wardrive(bool trace)
+{
+    if (!set_state_if_idle(STATE_WARDRIVE)) return false;
+
+    /* Fresh live counters + network list for this session. */
+    wardrive_live_reset();
+    s_wardrive_active = true;
+
+    /* Clear any leftover selection first, mirroring the Tab5 flow. */
+    uart_bridge_send("unselect_networks");
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    const char *cmd = trace ? "start_wardrive_promisc_trace" : "start_wardrive_promisc";
+    if (s_display_cb) s_display_cb(cmd, NULL);
+    uart_bridge_send(cmd);
+    broadcast_json("{\"type\":\"attack_started\",\"attack\":\"wardrive\"}");
+    return true;
+}
+
+bool cmd_do_get_wardrive_config(void)
+{
+    if (!set_state_if_idle(STATE_WARDRIVE_CONFIG)) return false;
+    s_wardrive_config_echo_seen = false;
     if (s_display_cb) s_display_cb("get_wardrive_config", NULL);
     uart_bridge_send("get_wardrive_config");
     return true;
@@ -2919,9 +4145,175 @@ int cmd_get_wardrive_blacklist_count(void)
     return (int)s_wd_blacklist.count;
 }
 
+bool cmd_do_set_wardrive_config(const wardrive_config_t *cfg, bool apply_gps)
+{
+    if (!cfg) return false;
+    if (cfg->bands == 0) return false;   /* JanOS requires at least one band */
+    if (!set_state_if_idle(STATE_WARDRIVE_CONFIG)) return false;
+
+    char cmd[160];
+
+    /* GPS module (optional) */
+    if (apply_gps && cfg->gps_module[0]) {
+        snprintf(cmd, sizeof(cmd), "gps_set %s", cfg->gps_module);
+        uart_bridge_send(cmd);
+        vTaskDelay(pdMS_TO_TICKS(60));
+    }
+
+    /* Bands */
+    {
+        char list[40] = "";
+        if (cfg->bands & WARDRIVE_BAND_WIFI24) strcat(list, "wifi24,");
+        if (cfg->bands & WARDRIVE_BAND_WIFI5)  strcat(list, "wifi5,");
+        if (cfg->bands & WARDRIVE_BAND_BLE)    strcat(list, "ble,");
+        size_t l = strlen(list);
+        if (l && list[l - 1] == ',') list[l - 1] = '\0';
+        snprintf(cmd, sizeof(cmd), "set_wardrive_bands %s", list);
+        uart_bridge_send(cmd);
+        vTaskDelay(pdMS_TO_TICKS(60));
+    }
+
+    /* Channels */
+    if (cfg->channel_mode == WARDRIVE_CH_CUSTOM && cfg->custom_channels[0]) {
+        snprintf(cmd, sizeof(cmd), "set_wardrive_channels custom %s", cfg->custom_channels);
+    } else {
+        const char *mode = cfg->channel_mode == WARDRIVE_CH_POPULAR ? "popular" : "all";
+        snprintf(cmd, sizeof(cmd), "set_wardrive_channels %s", mode);
+    }
+    uart_bridge_send(cmd);
+    vTaskDelay(pdMS_TO_TICKS(60));
+
+    /* RSSI re-log deltas */
+    snprintf(cmd, sizeof(cmd), "set_wardrive_rssi_delta wifi %d", cfg->wifi_rssi_delta);
+    uart_bridge_send(cmd);
+    vTaskDelay(pdMS_TO_TICKS(60));
+    snprintf(cmd, sizeof(cmd), "set_wardrive_rssi_delta ble %d", cfg->ble_rssi_delta);
+    uart_bridge_send(cmd);
+    vTaskDelay(pdMS_TO_TICKS(60));
+
+    /* Memory cap */
+    snprintf(cmd, sizeof(cmd), "set_wardrive_memcap %d", cfg->mem_cap);
+    uart_bridge_send(cmd);
+    vTaskDelay(pdMS_TO_TICKS(60));
+
+    /* Startup cooldown */
+    snprintf(cmd, sizeof(cmd), "set_wardrive_cooldown %d", cfg->startup_cooldown);
+    uart_bridge_send(cmd);
+    vTaskDelay(pdMS_TO_TICKS(60));
+
+    /* Anti-surveillance sensitivity */
+    {
+        const char *s = cfg->antisurv_sensitivity == WARDRIVE_ANTISURV_LOW ? "low" :
+                        cfg->antisurv_sensitivity == WARDRIVE_ANTISURV_HIGH ? "high" : "med";
+        snprintf(cmd, sizeof(cmd), "set_antisurv_sensitivity %s", s);
+        uart_bridge_send(cmd);
+    }
+
+    /* Cache the applied config so the UI reflects it immediately. */
+    s_wardrive_config = *cfg;
+    s_wardrive_config.loaded = true;
+    s_wardrive_config_loaded = true;
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    s_state = STATE_IDLE;
+    xSemaphoreGive(s_mutex);
+    return true;
+}
+
+bool cmd_do_gps_set(const char *module)
+{
+    if (!module || !module[0]) return false;
+    char cmd[48];
+    snprintf(cmd, sizeof(cmd), "gps_set %s", module);
+    if (s_display_cb) s_display_cb(cmd, NULL);
+    uart_bridge_send(cmd);
+    return true;
+}
+
+bool cmd_do_gps_raw(int baud)
+{
+    /* Tolerate a restart while already streaming: an earlier session that was
+     * never stopped (e.g. the page was left) would otherwise wedge us in
+     * STATE_GPS_RAW and reject the retry with a "busy" toast. */
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (s_state != STATE_IDLE && s_state != STATE_GPS_RAW) {
+        xSemaphoreGive(s_mutex);
+        ESP_LOGW(TAG, "Busy (state=%s), rejecting gps_raw", cmd_state_name(s_state));
+        return false;
+    }
+    s_state = STATE_GPS_RAW;
+    xSemaphoreGive(s_mutex);
+
+    gps_raw_reset();
+    char cmd[32];
+    if (baud > 0) snprintf(cmd, sizeof(cmd), "start_gps_raw %d", baud);
+    else          snprintf(cmd, sizeof(cmd), "start_gps_raw");
+    if (s_display_cb) s_display_cb(cmd, NULL);
+    uart_bridge_send(cmd);
+    broadcast_json("{\"type\":\"attack_started\",\"attack\":\"gps_raw\"}");
+    return true;
+}
+
+bool cmd_do_list_wardrive_files(void)
+{
+    if (!set_state_if_idle(STATE_LISTING_WARDRIVE_FILES)) return false;
+    dynvec_clear(&s_wardrive_files);
+    s_wardrive_files_loaded = false;
+    if (s_display_cb) s_display_cb("wardrive_files", NULL);
+    uart_bridge_send("wardrive_files");
+    return true;
+}
+
+bool cmd_do_wardrive_upload(const char *provider, const char *mode, const char *filename)
+{
+    if (!provider) return false;
+    bool is_wdg = (strcmp(provider, "wdgwars") == 0);
+    if (!is_wdg && strcmp(provider, "wigle") != 0) return false;
+    if (!mode) mode = "pending";
+
+    const char *base = is_wdg ? "wdgwars_upload" : "wigle_upload";
+    char cmd[160];
+    if (strcmp(mode, "all") == 0) {
+        snprintf(cmd, sizeof(cmd), "%s all", base);
+    } else if (strcmp(mode, "selected") == 0) {
+        if (!filename || !filename[0]) return false;
+        snprintf(cmd, sizeof(cmd), "%s %s", base, filename);
+    } else {
+        /* "pending": sync everything not yet done. */
+        snprintf(cmd, sizeof(cmd), "%s", base);
+    }
+
+    if (!set_state_if_idle(STATE_WARDRIVE_UPLOAD)) return false;
+    snprintf(s_wardrive_upload_provider, sizeof(s_wardrive_upload_provider), "%s",
+             is_wdg ? "wdgwars" : "wigle");
+
+    if (s_display_cb) s_display_cb(cmd, NULL);
+    uart_bridge_send(cmd);
+    broadcast_json("{\"type\":\"attack_started\",\"attack\":\"wardrive_upload\","
+                   "\"provider\":\"%s\"}", s_wardrive_upload_provider);
+    return true;
+}
+
 int cmd_get_handshake_count(void)
 {
     return s_handshake_count;
+}
+
+int cmd_get_handshakes(parsed_portal_file_t *out, int max)
+{
+    int n = (int)s_handshakes.count < max ? (int)s_handshakes.count : max;
+    if (n > 0 && out) memcpy(out, s_handshakes.data, n * sizeof(parsed_portal_file_t));
+    return n;
+}
+
+int cmd_get_handshakes_count(void)
+{
+    return (int)s_handshakes.count;
+}
+
+int cmd_sd_present(void)
+{
+    return s_sd_present;
 }
 
 bool cmd_handshake_initial_done(void)
@@ -2931,9 +4323,10 @@ bool cmd_handshake_initial_done(void)
 
 bool cmd_is_c5_connected(void)
 {
-    int64_t now_ms = esp_timer_get_time() / 1000;
-    if (s_last_uart_ms <= 0) return false;
-    return (now_ms - s_last_uart_ms) <= 15000;
+    /* Sticky: once the C5 has ever replied we consider it connected. This
+     * avoids periodic pings just to keep the indicator green while idle.
+     * Tradeoff: an idle unplug isn't reflected until a real command times out. */
+    return s_c5_established;
 }
 
 bool cmd_get_last_gps_fix(float *lat, float *lon)
@@ -2966,6 +4359,91 @@ int cmd_get_wardrive_logs_count(void)
     return (int)s_wardrive_logs.count;
 }
 
+bool cmd_get_wardrive_config(wardrive_config_t *out)
+{
+    if (out) *out = s_wardrive_config;
+    return s_wardrive_config_loaded;
+}
+
+bool cmd_wardrive_config_loaded(void)
+{
+    return s_wardrive_config_loaded;
+}
+
+int cmd_get_wardrive_files(wardrive_file_t *out, int max)
+{
+    int n = (int)s_wardrive_files.count < max ? (int)s_wardrive_files.count : max;
+    if (n > 0 && out) memcpy(out, s_wardrive_files.data, n * sizeof(wardrive_file_t));
+    return n;
+}
+
+int cmd_get_wardrive_files_count(void)
+{
+    return (int)s_wardrive_files.count;
+}
+
+bool cmd_wardrive_files_loaded(void)
+{
+    return s_wardrive_files_loaded;
+}
+
+int cmd_get_gps_raw_lines(char *out_lines, int max)
+{
+    if (!out_lines || max <= 0) return 0;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    int n = s_gps_raw_count < max ? s_gps_raw_count : max;
+    /* Copy oldest-first: the oldest kept entry is `count` slots behind head. */
+    int start = (s_gps_raw_head - s_gps_raw_count + GPS_RAW_RING_MAX * 2) % GPS_RAW_RING_MAX;
+    /* If capped below count, skip the excess oldest entries. */
+    int skip = s_gps_raw_count - n;
+    start = (start + skip) % GPS_RAW_RING_MAX;
+    for (int i = 0; i < n; i++) {
+        int idx = (start + i) % GPS_RAW_RING_MAX;
+        snprintf(out_lines + (size_t)i * GPS_RAW_LINE_MAX, GPS_RAW_LINE_MAX,
+                 "%s", s_gps_raw_ring[idx]);
+    }
+    xSemaphoreGive(s_mutex);
+    return n;
+}
+
+void cmd_get_gps_raw_fix(int *quality_out, int *sats_out)
+{
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (quality_out) *quality_out = s_gps_raw_quality;
+    if (sats_out)    *sats_out = s_gps_raw_sats;
+    xSemaphoreGive(s_mutex);
+}
+
+void cmd_get_wardrive_live(int *sats_out, float *dist_out, int *unique_out,
+                           int *relogs_out)
+{
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (sats_out)   *sats_out = s_wardrive_live_sats;
+    if (dist_out)   *dist_out = s_wardrive_live_dist;
+    if (unique_out) *unique_out = s_wardrive_live_unique;
+    if (relogs_out) *relogs_out = s_wardrive_live_relogs;
+    xSemaphoreGive(s_mutex);
+}
+
+bool cmd_wardrive_running(void)
+{
+    return (cmd_get_state() == STATE_WARDRIVE) || s_wardrive_active;
+}
+
+int cmd_get_wardrive_nets(wardrive_net_t *out, int max)
+{
+    if (!out || max <= 0) return 0;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    int n = s_wardrive_net_count < max ? s_wardrive_net_count : max;
+    /* Most-recent-first: newest entry is one slot behind head. */
+    for (int i = 0; i < n; i++) {
+        int idx = (s_wardrive_net_head - 1 - i + WARDRIVE_NET_RING_MAX * 2) % WARDRIVE_NET_RING_MAX;
+        out[i] = s_wardrive_net_ring[idx];
+    }
+    xSemaphoreGive(s_mutex);
+    return n;
+}
+
 int cmd_get_probes(parsed_probe_t *out, int max)
 {
     int n = (int)s_probes.count < max ? (int)s_probes.count : max;
@@ -2976,6 +4454,36 @@ int cmd_get_probes(parsed_probe_t *out, int max)
 int cmd_get_probes_count(void)
 {
     return (int)s_probes.count;
+}
+
+int cmd_get_portal_captures(portal_capture_t *out, int max)
+{
+    if (!out || max <= 0) return 0;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    int n = (int)s_portal_captures.count < max ? (int)s_portal_captures.count : max;
+    if (n > 0) memcpy(out, s_portal_captures.data, n * sizeof(portal_capture_t));
+    xSemaphoreGive(s_mutex);
+    return n;
+}
+
+int cmd_get_portal_captures_count(void)
+{
+    return (int)s_portal_captures.count;
+}
+
+int cmd_get_sniffer_dog_count(void)
+{
+    return s_snifferdog_count;
+}
+
+int cmd_get_sniffer_dog_events(sniffer_dog_event_t *out, int max)
+{
+    if (!out || max <= 0) return 0;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    int n = (int)s_snifferdog_events.count < max ? (int)s_snifferdog_events.count : max;
+    if (n > 0) memcpy(out, s_snifferdog_events.data, n * sizeof(sniffer_dog_event_t));
+    xSemaphoreGive(s_mutex);
+    return n;
 }
 
 int cmd_get_arp_hosts(arp_host_t *out, int max)
@@ -3096,11 +4604,21 @@ bool cmd_do_subghz_jam(float freq_mhz)
     return true;
 }
 
-bool cmd_do_subghz_tx(int index)
+/* JanOS commands that touch a stored signal (list / tx / info) require an
+ * explicit storage source. Normalize whatever the frontend sent to exactly
+ * "mem" or "sd"; anything unrecognized (or NULL) falls back to "sd", the
+ * persistent library the Transmit/Manage pages are built around. */
+static const char *subghz_norm_source(const char *source)
+{
+    if (source && strcmp(source, "mem") == 0) return "mem";
+    return "sd";
+}
+
+bool cmd_do_subghz_tx(int index, const char *source)
 {
     if (index <= 0) return false;
-    char cmd[32];
-    snprintf(cmd, sizeof(cmd), "subghz_tx %d", index);
+    char cmd[40];
+    snprintf(cmd, sizeof(cmd), "subghz_tx %d %s", index, subghz_norm_source(source));
     if (s_display_cb) s_display_cb(cmd, NULL);
     uart_bridge_send(cmd);
     return true;
@@ -3139,22 +4657,37 @@ bool cmd_do_subghz_clear(void)
 
 bool cmd_do_subghz_export(void)
 {
+    /* New JanOS API: promote every volatile (mem) capture into the
+     * persistent SD library. Replaces the removed `subghz_export all`. */
     if (!set_state_if_idle(STATE_SUBGHZ_EXPORT)) return false;
-    if (s_display_cb) s_display_cb("subghz_export all", NULL);
-    uart_bridge_send("subghz_export all");
+    if (s_display_cb) s_display_cb("subghz_save all", NULL);
+    uart_bridge_send("subghz_save all");
+    return true;
+}
+
+bool cmd_do_subghz_save(int index)
+{
+    /* Promote a single volatile (mem) capture to the SD library. NOT
+     * idle-gated (like subghz_tx) so the Listen page can save a signal
+     * without stopping RX; JanOS replies [SUBGHZ_SAVE]/[SUBGHZ_SAVE_ERR]
+     * which are handled state-independently in handle_subghz_event_line. */
+    if (index <= 0) return false;
+    char cmd[32];
+    snprintf(cmd, sizeof(cmd), "subghz_save %d", index);
+    if (s_display_cb) s_display_cb(cmd, NULL);
+    uart_bridge_send(cmd);
     return true;
 }
 
 bool cmd_do_subghz_import(void)
 {
-    if (!set_state_if_idle(STATE_SUBGHZ_IMPORT)) return false;
-    s_subghz_import_count = 0;
-    if (s_display_cb) s_display_cb("subghz_import all", NULL);
-    uart_bridge_send("subghz_import all");
-    return true;
+    /* There is no longer a distinct "import" step — the SD directory *is*
+     * the library. Treat the legacy button as a plain reload of the SD
+     * library so it stays useful instead of erroring on a dead command. */
+    return cmd_do_subghz_list_refresh("sd");
 }
 
-bool cmd_do_subghz_list_refresh(void)
+bool cmd_do_subghz_list_refresh(const char *source)
 {
     /* `subghz_list` is a cheap query — accept it even if the FSM is
      * still in STATE_SUBGHZ_LIST from a previous in-flight refresh, and
@@ -3181,8 +4714,10 @@ bool cmd_do_subghz_list_refresh(void)
     }
 
     dynvec_clear(&s_subghz_build);
-    if (s_display_cb) s_display_cb("subghz_list", NULL);
-    uart_bridge_send("subghz_list");
+    char cmd[24];
+    snprintf(cmd, sizeof(cmd), "subghz_list %s", subghz_norm_source(source));
+    if (s_display_cb) s_display_cb(cmd, NULL);
+    uart_bridge_send(cmd);
     return true;
 }
 
@@ -3196,4 +4731,10 @@ int cmd_get_subghz_signals(subghz_signal_t *out, int max)
 int cmd_get_subghz_count(void)
 {
     return (int)s_subghz_signals.count;
+}
+
+void cmd_get_subghz_rssi(int *rssi_out, uint32_t *seq_out)
+{
+    if (rssi_out) *rssi_out = s_subghz_last_rssi;
+    if (seq_out)  *seq_out  = s_subghz_rssi_seq;
 }

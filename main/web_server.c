@@ -147,7 +147,7 @@ static esp_err_t cw_finish(chunked_writer_t *cw)
 
 /* ---------- WS send queue (decouples UART task from httpd) ---------- */
 
-#define WS_QUEUE_SIZE  16
+#define WS_QUEUE_SIZE  32
 #define WS_MSG_MAX_LEN 2048
 
 /* Queue stores a heap-allocated pointer — only 8 bytes per slot (16 slots = 128 bytes).
@@ -389,6 +389,31 @@ static esp_err_t api_scan_results_get(httpd_req_t *req)
     return cw_finish(&cw);
 }
 
+static esp_err_t api_bt_devices_get(httpd_req_t *req)
+{
+    int count = cmd_get_bt_devices_count();
+    bt_device_t *devs = NULL;
+    if (count > 0) {
+        devs = calloc((size_t)count, sizeof(bt_device_t));
+        if (devs) count = cmd_get_bt_devices(devs, count);
+        else count = 0;
+    }
+
+    chunked_writer_t cw;
+    cw_init(&cw, req);
+    cw_printf(&cw, "{\"ok\":true,\"count\":%d,\"devices\":[", count);
+    for (int i = 0; i < count; i++) {
+        const bt_device_t *d = &devs[i];
+        cw_printf(&cw,
+            "%s{\"index\":%d,\"mac\":\"%s\",\"name\":\"%s\",\"rssi\":%d}",
+            i > 0 ? "," : "",
+            d->index, d->mac, d->name, d->rssi);
+    }
+    cw_printf(&cw, "]}");
+    free(devs);
+    return cw_finish(&cw);
+}
+
 static esp_err_t api_select_post(httpd_req_t *req)
 {
     char body[256] = {0};
@@ -438,15 +463,65 @@ static esp_err_t api_attack_post(httpd_req_t *req)
     const char *uri = req->uri;
     bool ok = false;
 
-    if (strstr(uri, "/deauth"))         ok = cmd_do_deauth();
+    if (strstr(uri, "/bt_scan"))         ok = cmd_do_bt_scan();
+    else if (strstr(uri, "/bt_track")) {
+        char body[96] = {0};
+        if (req->content_len > 0) {
+            int received = httpd_req_recv(req, body, sizeof(body) - 1);
+            if (received < 0) body[0] = '\0';
+        }
+        char mac[24] = {0};
+        json_get_string(body, "\"mac\"", mac, sizeof(mac));
+        ok = cmd_do_bt_track(mac[0] ? mac : NULL);
+    }
+    else if (strstr(uri, "/airtag"))     ok = cmd_do_airtag();
+    else if (strstr(uri, "/deauth"))     ok = cmd_do_deauth();
     else if (strstr(uri, "/blackout"))   ok = cmd_do_blackout();
     else if (strstr(uri, "/eviltwin"))   ok = cmd_do_evil_twin();
     else if (strstr(uri, "/sae"))        ok = cmd_do_sae();
     else if (strstr(uri, "/handshake"))  ok = cmd_do_handshake();
     else if (strstr(uri, "/observer"))   ok = cmd_do_observer_start();
     else if (strstr(uri, "/sniffer_noscan")) ok = cmd_do_sniffer_noscan();
+    else if (strstr(uri, "/sniffer_dog")) ok = cmd_do_sniffer_dog();
     else if (strstr(uri, "/sniffer"))    ok = cmd_do_sniffer();
     else if (strstr(uri, "/mitm"))       ok = cmd_do_mitm();
+    else if (strstr(uri, "/beacon_spam")) {
+        char body[1024] = {0};
+        if (req->content_len > 0) {
+            int received = httpd_req_recv(req, body, sizeof(body) - 1);
+            if (received < 0) body[0] = '\0';
+        }
+
+        /* Parse {"ssids":["a","b",...]}: walk the quoted strings after the
+         * "ssids" key. No fixed cap here beyond JanOS's own 32-SSID limit. */
+        dynvec_t ptrs;   /* char* into ssid_buf */
+        dynvec_init(&ptrs, sizeof(char *), 8);
+        char *ssid_buf = malloc(sizeof(body));
+        int sb = 0;
+        if (ssid_buf) {
+            const char *p = strstr(body, "\"ssids\"");
+            const char *arr = p ? strchr(p, '[') : NULL;
+            const char *arr_end = arr ? strchr(arr, ']') : NULL;
+            const char *c = arr ? arr + 1 : NULL;
+            while (c && arr_end && c < arr_end) {
+                const char *q1 = strchr(c, '"');
+                if (!q1 || q1 >= arr_end) break;
+                const char *q2 = strchr(q1 + 1, '"');
+                if (!q2 || q2 > arr_end) break;
+                char *start = ssid_buf + sb;
+                for (const char *k = q1 + 1; k < q2 && sb < (int)sizeof(body) - 1; k++) {
+                    ssid_buf[sb++] = *k;
+                }
+                ssid_buf[sb++] = '\0';
+                if (start[0]) dynvec_push(&ptrs, &start);
+                c = q2 + 1;
+            }
+            ok = (ptrs.count > 0) &&
+                 cmd_do_beacon_spam((const char *const *)ptrs.data, (int)ptrs.count);
+        }
+        dynvec_free(&ptrs);
+        free(ssid_buf);
+    }
     else if (strstr(uri, "/karma")) {
         char body[96] = {0};
         if (req->content_len > 0) {
@@ -679,10 +754,24 @@ static esp_err_t api_portal_select_post(httpd_req_t *req)
 
 static esp_err_t api_passwords_get(httpd_req_t *req)
 {
-    int n = cmd_get_passwords_count();
+    /* Category selector: /api/passwords?kind=evil|portal (default evil). */
+    pw_kind_t kind = PW_KIND_EVIL;
+    size_t qlen = httpd_req_get_url_query_len(req) + 1;
+    if (qlen > 1 && qlen < 64) {
+        char q[64];
+        if (httpd_req_get_url_query_str(req, q, qlen) == ESP_OK) {
+            char val[16];
+            if (httpd_query_key_value(q, "kind", val, sizeof(val)) == ESP_OK &&
+                strcmp(val, "portal") == 0) {
+                kind = PW_KIND_PORTAL;
+            }
+        }
+    }
+
+    int n = cmd_get_passwords_count(kind);
 
     if (n == 0) {
-        cmd_do_list_passwords();
+        cmd_do_list_passwords(kind);
         send_json(req, "{\"ok\":true,\"passwords\":[],\"status\":\"loading\"}");
         return ESP_OK;
     }
@@ -692,7 +781,7 @@ static esp_err_t api_passwords_get(httpd_req_t *req)
         send_json(req, "{\"ok\":false,\"error\":\"oom\"}");
         return ESP_OK;
     }
-    n = cmd_get_passwords(pws, n);
+    n = cmd_get_passwords(kind, pws, n);
 
     chunked_writer_t cw;
     cw_init(&cw, req);
@@ -818,6 +907,65 @@ static esp_err_t api_arp_hosts_get(httpd_req_t *req)
     }
     cw_printf(&cw, "]}");
     free(hosts);
+    return cw_finish(&cw);
+}
+
+static esp_err_t api_portal_captures_get(httpd_req_t *req)
+{
+    int n = cmd_get_portal_captures_count();
+    portal_capture_t *caps = NULL;
+    if (n > 0) {
+        caps = psram_malloc((size_t)n * sizeof(*caps));
+        if (!caps) {
+            send_json(req, "{\"ok\":false,\"error\":\"oom\"}");
+            return ESP_OK;
+        }
+        n = cmd_get_portal_captures(caps, n);
+    }
+
+    chunked_writer_t cw;
+    cw_init(&cw, req);
+    cw_printf(&cw, "{\"ok\":true,\"count\":%d,\"captures\":[", n);
+    for (int i = 0; i < n; i++) {
+        char esc[386];
+        int j = 0;
+        for (int k = 0; caps[i].data[k] && j < (int)sizeof(esc) - 2; k++) {
+            char c = caps[i].data[k];
+            if (c == '"' || c == '\\') esc[j++] = '\\';
+            esc[j++] = c;
+        }
+        esc[j] = '\0';
+        cw_printf(&cw, "%s{\"data\":\"%s\",\"at\":%u}",
+                  i > 0 ? "," : "", esc, (unsigned)caps[i].at_ms);
+    }
+    cw_printf(&cw, "]}");
+    free(caps);
+    return cw_finish(&cw);
+}
+
+static esp_err_t api_sniffer_dog_results_get(httpd_req_t *req)
+{
+    int count = cmd_get_sniffer_dog_count();
+    int n = 256;
+    sniffer_dog_event_t *ev = psram_malloc((size_t)n * sizeof(*ev));
+    if (!ev) {
+        send_json(req, "{\"ok\":false,\"error\":\"oom\"}");
+        return ESP_OK;
+    }
+    n = cmd_get_sniffer_dog_events(ev, n);
+
+    chunked_writer_t cw;
+    cw_init(&cw, req);
+    cw_printf(&cw, "{\"ok\":true,\"count\":%d,\"events\":[", count);
+    for (int i = 0; i < n; i++) {
+        cw_printf(&cw,
+            "%s{\"n\":%d,\"ap\":\"%s\",\"sta\":\"%s\",\"ch\":%d,\"rssi\":%d,\"at\":%u}",
+            i > 0 ? "," : "",
+            ev[i].n, ev[i].ap, ev[i].sta, ev[i].ch, ev[i].rssi,
+            (unsigned)ev[i].at_ms);
+    }
+    cw_printf(&cw, "]}");
+    free(ev);
     return cw_finish(&cw);
 }
 
@@ -999,6 +1147,16 @@ static esp_err_t api_dashboard_get(httpd_req_t *req)
         s_dashboard_hs_attempted = true;
         cmd_do_list_handshake_count();
         hs_loading = true;
+        state = cmd_get_state();
+    }
+
+    /* SD presence probe: one-shot `sd_status` query fired only while the SD
+     * state is still unknown (< 0). Once JanOS answers SD_OK/SD_NONE it is
+     * cached for the session and never re-sent, keeping the UART quiet. */
+    if (state == STATE_IDLE &&
+        cmd_is_c5_connected() &&
+        cmd_sd_present() < 0) {
+        cmd_do_sd_status();
     }
 
     float lat = 0.0f, lon = 0.0f;
@@ -1012,7 +1170,7 @@ static esp_err_t api_dashboard_get(httpd_req_t *req)
         "{\"ok\":true,\"c5_connected\":%s,\"ap_clients\":%d,\"heap_free\":%u,"
         "\"heap_internal\":%u,\"handshake_count\":%d,\"handshake_loading\":%s,"
         "\"gps_fix\":%s,\"gps_lat\":%.6f,\"gps_lon\":%.6f,\"last_net_rssi\":%d,"
-        "\"sd_free_gb\":-1,\"sd_total_gb\":-1,\"sta_connected\":%s,\"sta_ssid\":\"%s\"}",
+        "\"sd_present\":%d,\"sta_connected\":%s,\"sta_ssid\":\"%s\"}",
         cmd_is_c5_connected() ? "true" : "false",
         wifi_ap_get_client_count(),
         (unsigned)esp_get_free_heap_size(),
@@ -1023,6 +1181,7 @@ static esp_err_t api_dashboard_get(httpd_req_t *req)
         has_fix ? lat : 0.0f,
         has_fix ? lon : 0.0f,
         strongest_idx >= 0 ? strongest_rssi : -120,
+        cmd_sd_present(),
         cmd_is_sta_connected() ? "true" : "false",
         sta_ssid ? sta_ssid : ""
     );
@@ -1055,23 +1214,52 @@ static esp_err_t api_wardrive_logs_get(httpd_req_t *req)
         return cw_finish(&cw);
     }
 
-    if (state == STATE_LISTING_WARDRIVE) {
-        send_json(req, "{\"ok\":true,\"status\":\"loading\"}");
-        return ESP_OK;
+    /* Either the listing is already running, or we're busy with another
+     * command (e.g. the sibling password/handshake listing fired by the same
+     * Data page). Report "loading" so the client keeps polling until the
+     * single-command FSM frees up, instead of a hard 409 the UI treats as a
+     * dead end. If idle, kick off the listing now. */
+    if (state == STATE_IDLE) {
+        cmd_do_list_wardrive_logs();
+    }
+    send_json(req, "{\"ok\":true,\"status\":\"loading\"}");
+    return ESP_OK;
+}
+
+static esp_err_t api_handshakes_get(httpd_req_t *req)
+{
+    int n = cmd_get_handshakes_count();
+    cmd_state_t state = cmd_get_state();
+
+    if (n > 0) {
+        parsed_portal_file_t *files = psram_malloc((size_t)n * sizeof(*files));
+        if (!files) {
+            send_json(req, "{\"ok\":false,\"error\":\"oom\"}");
+            return ESP_OK;
+        }
+        n = cmd_get_handshakes(files, n);
+
+        chunked_writer_t cw;
+        cw_init(&cw, req);
+        cw_printf(&cw, "{\"ok\":true,\"files\":[");
+        for (int i = 0; i < n; i++) {
+            cw_printf(&cw, "%s{\"index\":%d,\"name\":\"%s\"}",
+                      i > 0 ? "," : "", files[i].index, files[i].filename);
+        }
+        cw_printf(&cw, "]}");
+        free(files);
+        return cw_finish(&cw);
     }
 
-    if (state != STATE_IDLE) {
-        httpd_resp_set_status(req, "409 Conflict");
-        send_json(req, "{\"ok\":false,\"error\":\"busy\"}");
-        return ESP_OK;
+    /* Either the listing is already running, or we're busy with another
+     * command (e.g. the sibling password/wardrive listing fired by the same
+     * Data page). Report "loading" so the client keeps polling until the
+     * single-command FSM frees up, instead of a hard 409 the UI treats as a
+     * dead end. If idle, kick off the listing now. */
+    if (state == STATE_IDLE) {
+        cmd_do_list_handshake_count();
     }
-
-    if (cmd_do_list_wardrive_logs()) {
-        send_json(req, "{\"ok\":true,\"status\":\"loading\"}");
-    } else {
-        httpd_resp_set_status(req, "409 Conflict");
-        send_json(req, "{\"ok\":false,\"error\":\"busy\"}");
-    }
+    send_json(req, "{\"ok\":true,\"status\":\"loading\"}");
     return ESP_OK;
 }
 
@@ -1415,9 +1603,16 @@ static esp_err_t api_subghz_post(httpd_req_t *req)
             ok = cmd_do_subghz_tx_preset(preset);
         } else {
             int idx = 0;
+            char source[8] = {0};
             json_get_int(body, "\"index\"", &idx);
-            ok = cmd_do_subghz_tx(idx);
+            json_get_string(body, "\"source\"", source, sizeof(source));
+            ok = cmd_do_subghz_tx(idx, source[0] ? source : NULL);
         }
+    }
+    else if (strstr(uri, "/save")) {
+        int idx = 0;
+        json_get_int(body, "\"index\"", &idx);
+        ok = cmd_do_subghz_save(idx);
     }
     else if (strstr(uri, "/delete")) {
         int idx = 0;
@@ -1434,7 +1629,9 @@ static esp_err_t api_subghz_post(httpd_req_t *req)
         ok = cmd_do_subghz_import();
     }
     else if (strstr(uri, "/list/refresh")) {
-        ok = cmd_do_subghz_list_refresh();
+        char source[8] = {0};
+        json_get_string(body, "\"source\"", source, sizeof(source));
+        ok = cmd_do_subghz_list_refresh(source[0] ? source : NULL);
     }
 
     if (ok) {
@@ -1444,6 +1641,154 @@ static esp_err_t api_subghz_post(httpd_req_t *req)
         send_json(req, "{\"ok\":false,\"error\":\"busy or bad params\"}");
     }
     return ESP_OK;
+}
+
+static esp_err_t api_wardrive_files_get(httpd_req_t *req)
+{
+    cmd_state_t state = cmd_get_state();
+
+    if (cmd_wardrive_files_loaded()) {
+        int n = cmd_get_wardrive_files_count();
+        wardrive_file_t *files = NULL;
+        if (n > 0) {
+            files = psram_malloc((size_t)n * sizeof(*files));
+            if (!files) {
+                send_json(req, "{\"ok\":false,\"error\":\"oom\"}");
+                return ESP_OK;
+            }
+            n = cmd_get_wardrive_files(files, n);
+        }
+        chunked_writer_t cw;
+        cw_init(&cw, req);
+        cw_printf(&cw, "{\"ok\":true,\"files\":[");
+        for (int i = 0; i < n; i++) {
+            cw_printf(&cw,
+                "%s{\"name\":\"%s\",\"wigle\":\"%s\",\"wdgwars\":\"%s\","
+                "\"size\":%ld,\"wifi\":%d,\"ble\":%d,\"bt\":%d}",
+                i > 0 ? "," : "",
+                files[i].name, files[i].wigle, files[i].wdgwars,
+                files[i].size, files[i].wifi, files[i].ble, files[i].bt);
+        }
+        cw_printf(&cw, "]}");
+        free(files);
+        return cw_finish(&cw);
+    }
+
+    /* Not loaded yet: kick the listing if idle, otherwise keep polling. */
+    if (state == STATE_IDLE) {
+        cmd_do_list_wardrive_files();
+    }
+    send_json(req, "{\"ok\":true,\"status\":\"loading\"}");
+    return ESP_OK;
+}
+
+static esp_err_t api_wardrive_upload_post(httpd_req_t *req)
+{
+    char body[192] = {0};
+    if (req->content_len > 0) {
+        int received = httpd_req_recv(req, body, sizeof(body) - 1);
+        if (received < 0) body[0] = '\0';
+    }
+
+    /* WiFi-first: the device must be joined to a network before uploading. */
+    if (!cmd_is_sta_connected()) {
+        httpd_resp_set_status(req, "409 Conflict");
+        send_json(req, "{\"ok\":false,\"error\":\"wifi_required\"}");
+        return ESP_OK;
+    }
+
+    char provider[12] = {0};
+    char mode[16] = {0};
+    char filename[WARDRIVE_FILE_NAME_MAX] = {0};
+    json_get_string(body, "\"provider\"", provider, sizeof(provider));
+    json_get_string(body, "\"mode\"", mode, sizeof(mode));
+    json_get_string(body, "\"filename\"", filename, sizeof(filename));
+
+    if (cmd_do_wardrive_upload(provider, mode[0] ? mode : "pending",
+                               filename[0] ? filename : NULL)) {
+        send_json(req, "{\"ok\":true,\"status\":\"uploading\"}");
+    } else {
+        httpd_resp_set_status(req, "409 Conflict");
+        send_json(req, "{\"ok\":false,\"error\":\"busy or bad params\"}");
+    }
+    return ESP_OK;
+}
+
+static esp_err_t api_gps_module_post(httpd_req_t *req)
+{
+    char body[64] = {0};
+    if (req->content_len > 0) {
+        int received = httpd_req_recv(req, body, sizeof(body) - 1);
+        if (received < 0) body[0] = '\0';
+    }
+    char module[16] = {0};
+    if (!json_get_string(body, "\"module\"", module, sizeof(module)) || !module[0]) {
+        send_json(req, "{\"ok\":false,\"error\":\"module required\"}");
+        return ESP_OK;
+    }
+    if (cmd_do_gps_set(module)) {
+        send_json(req, "{\"ok\":true}");
+    } else {
+        send_json(req, "{\"ok\":false,\"error\":\"bad module\"}");
+    }
+    return ESP_OK;
+}
+
+static esp_err_t api_gps_raw_post(httpd_req_t *req)
+{
+    char body[48] = {0};
+    if (req->content_len > 0) {
+        int received = httpd_req_recv(req, body, sizeof(body) - 1);
+        if (received < 0) body[0] = '\0';
+    }
+    int baud = 0;
+    json_get_int(body, "\"baud\"", &baud);
+
+    if (cmd_do_gps_raw(baud)) {
+        send_json(req, "{\"ok\":true,\"status\":\"gps_raw\"}");
+    } else {
+        httpd_resp_set_status(req, "409 Conflict");
+        send_json(req, "{\"ok\":false,\"error\":\"busy\"}");
+    }
+    return ESP_OK;
+}
+
+/* Minimal JSON string escaper: doubles quotes/backslashes and drops control
+ * chars so an SSID/NMEA field can't break the surrounding JSON. */
+static void json_escape(char *dst, size_t dstsz, const char *src)
+{
+    size_t j = 0;
+    for (size_t i = 0; src && src[i] && j + 2 < dstsz; i++) {
+        unsigned char c = (unsigned char)src[i];
+        if (c == '"' || c == '\\') { dst[j++] = '\\'; dst[j++] = (char)c; }
+        else if (c >= 0x20)        { dst[j++] = (char)c; }
+    }
+    dst[j] = '\0';
+}
+
+/* Live GPS raw diagnostics for the HTTP-poll fallback (the phone loses the
+ * high-rate WS gps_nmea stream to LRU socket purges). */
+static esp_err_t api_gps_raw_status_get(httpd_req_t *req)
+{
+    bool running = (cmd_get_state() == STATE_GPS_RAW);
+    int quality = 0, sats = 0;
+    cmd_get_gps_raw_fix(&quality, &sats);
+
+    char *lines = psram_malloc((size_t)GPS_RAW_RING_MAX * GPS_RAW_LINE_MAX);
+    int n = lines ? cmd_get_gps_raw_lines(lines, GPS_RAW_RING_MAX) : 0;
+
+    chunked_writer_t cw;
+    cw_init(&cw, req);
+    cw_printf(&cw, "{\"ok\":true,\"running\":%s,\"quality\":%d,\"sats\":%d,\"lines\":[",
+              running ? "true" : "false", quality, sats);
+    char esc[GPS_RAW_LINE_MAX * 2];
+    for (int i = 0; i < n; i++) {
+        json_escape(esc, sizeof(esc), lines + (size_t)i * GPS_RAW_LINE_MAX);
+        cw_printf(&cw, "%s\"%s\"", i > 0 ? "," : "", esc);
+    }
+    cw_printf(&cw, "]}");
+    free(lines);
+    return cw_finish(&cw);
 }
 
 static esp_err_t api_subghz_list_get(httpd_req_t *req)
@@ -1489,6 +1834,22 @@ static esp_err_t api_subghz_list_get(httpd_req_t *req)
     cw_printf(&cw, "]}");
     free(sigs);
     return cw_finish(&cw);
+}
+
+/* Live RSSI fallback for the Listen waterfall: the WS `subghz_rssi` stream
+ * is the primary path, but this lets the UI poll the latest sample so the
+ * waterfall keeps advancing even if the WS is momentarily unavailable. The
+ * `seq` lets the client draw only genuinely new samples. */
+static esp_err_t api_subghz_rssi_get(httpd_req_t *req)
+{
+    int rssi = 0;
+    uint32_t seq = 0;
+    cmd_get_subghz_rssi(&rssi, &seq);
+    char buf[64];
+    snprintf(buf, sizeof(buf),
+             "{\"ok\":true,\"seq\":%u,\"rssi\":%d}", (unsigned)seq, rssi);
+    send_json(req, buf);
+    return ESP_OK;
 }
 
 /* ---------- Root / SPA handler ---------- */
@@ -1570,13 +1931,20 @@ esp_err_t web_server_start(void)
      * (classic stack-smash signature). 8 KB gives the SPI/LCD path
      * comfortable headroom. */
     config.stack_size       = 8192;
-    config.max_uri_handlers = 64;   /* 40 handlers today (incl. the 4 zigbee
-                                     * endpoints); generous headroom so the
-                                     * last-registered wildcard SPA route never
-                                     * gets dropped -> "Nothing matches the
+    config.max_uri_handlers = 64;   /* generous headroom for every REGISTER_URI
+                                     * entry (wifi/bt/wardrive/gps/zigbee/subghz);
+                                     * the last-registered wildcard SPA route must
+                                     * never be dropped -> "Nothing matches the
                                      * given URI" 404 on every page. Bump this
                                      * whenever you add REGISTER_URI entries. */
-    config.max_open_sockets = 7;
+    /* LWIP allows 16 sockets (CONFIG_LWIP_MAX_SOCKETS=16). The send-only
+     * WebSocket registers no recv activity, so with a tight cap + LRU purge
+     * it becomes the eviction victim whenever the browser opens short-lived
+     * HTTP polls (status/dashboard/subghz-list) — killing every broadcast
+     * (stuck Last RSSI, blank waterfall, Transmit needing a manual refresh).
+     * 12 leaves headroom for the WS plus concurrent HTTP without starving
+     * lwip internals. */
+    config.max_open_sockets = 12;
     config.lru_purge_enable = true;
     config.recv_wait_timeout  = 10;
     config.send_wait_timeout  = 10;
@@ -1650,6 +2018,7 @@ esp_err_t web_server_start(void)
     REGISTER_URI("/api/portals",       HTTP_GET,  api_portals_get);
     REGISTER_URI("/api/portal/select", HTTP_POST, api_portal_select_post);
     REGISTER_URI("/api/passwords",     HTTP_GET,  api_passwords_get);
+    REGISTER_URI("/api/handshakes",    HTTP_GET,  api_handshakes_get);
     REGISTER_URI("/api/wardrive/logs", HTTP_GET,  api_wardrive_logs_get);
     REGISTER_URI("/api/wardrive/config",    HTTP_GET,  api_wardrive_config_get);
     REGISTER_URI("/api/wardrive/config",    HTTP_POST, api_wardrive_config_post);
@@ -1661,19 +2030,28 @@ esp_err_t web_server_start(void)
     REGISTER_URI("/api/serial",             HTTP_GET,  api_serial_get);
     REGISTER_URI("/api/deauth/detect",      HTTP_POST, api_deauth_detect_post);
     REGISTER_URI("/api/deauth/detected",    HTTP_GET,  api_deauth_detected_get);
+    REGISTER_URI("/api/wardrive/files",     HTTP_GET,  api_wardrive_files_get);
+    REGISTER_URI("/api/wardrive/upload",    HTTP_POST, api_wardrive_upload_post);
+    REGISTER_URI("/api/gps/module",         HTTP_POST, api_gps_module_post);
+    REGISTER_URI("/api/gps/raw",            HTTP_POST, api_gps_raw_post);
+    REGISTER_URI("/api/gps/raw/status",     HTTP_GET,  api_gps_raw_status_get);
     REGISTER_URI("/api/sniffer/results", HTTP_GET,  api_sniffer_results_get);
     REGISTER_URI("/api/sniffer/results", HTTP_POST, api_sniffer_refresh_post);
     REGISTER_URI("/api/probes",          HTTP_GET,  api_probes_get);
     REGISTER_URI("/api/probes",          HTTP_POST, api_probes_refresh_post);
     REGISTER_URI("/api/arp/hosts",       HTTP_GET,  api_arp_hosts_get);
+    REGISTER_URI("/api/portal/captures", HTTP_GET,  api_portal_captures_get);
+    REGISTER_URI("/api/sniffer_dog/results", HTTP_GET, api_sniffer_dog_results_get);
     REGISTER_URI("/api/nmap/results",    HTTP_GET,  api_nmap_results_get);
     REGISTER_URI("/api/zigbee/start",    HTTP_POST, api_zigbee_start_post);
     REGISTER_URI("/api/zigbee/refresh",  HTTP_POST, api_zigbee_refresh_post);
     REGISTER_URI("/api/zigbee/clear",    HTTP_POST, api_zigbee_clear_post);
     REGISTER_URI("/api/zigbee/results",  HTTP_GET,  api_zigbee_results_get);
+    REGISTER_URI("/api/bt/devices",      HTTP_GET,  api_bt_devices_get);
     REGISTER_URI("/api/status",        HTTP_GET,  api_status_get);
     REGISTER_URI("/api/dashboard",     HTTP_GET,  api_dashboard_get);
     REGISTER_URI("/api/subghz/list",   HTTP_GET,  api_subghz_list_get);
+    REGISTER_URI("/api/subghz/rssi",   HTTP_GET,  api_subghz_rssi_get);
     REGISTER_URI("/api/subghz/*",      HTTP_POST, api_subghz_post);
 
     /* Captive portal detection endpoints */

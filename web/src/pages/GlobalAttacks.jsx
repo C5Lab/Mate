@@ -31,16 +31,16 @@ const ACTIONS = [
   {
     id: 'snifferdog',
     title: 'SnifferDog',
-    note: 'Observer mode with AP/client snapshots',
+    note: 'Capture AP-STA pairs and deauth each client',
     available: true,
-    run: async () => api.sniffer(),
-    routeOnSuccess: '/sniffer',
+    route: '/snifferdog',
   },
   {
     id: 'beaconspam',
     title: 'Beacon Spam',
-    note: 'Unavailable in current firmware API',
-    available: false,
+    note: 'Flood fake SSID beacon frames',
+    available: true,
+    route: '/beaconspam',
   },
   {
     id: 'karma',

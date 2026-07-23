@@ -124,7 +124,7 @@ BOARDS = {
     },
     "stickc-plus2": {
         "idf_target":         "esp32",
-        "sdkconfig_defaults": "sdkconfig.defaults;sdkconfig.defaults.esp32",
+        "sdkconfig_defaults": "sdkconfig.defaults;sdkconfig.defaults.stickc-plus2",
         "chip":               "esp32",
         "flash_size":         "8MB",
         "flash_mode":         "dio",

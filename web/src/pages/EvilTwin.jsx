@@ -6,27 +6,70 @@ import { getState } from '../store';
 import { showToast } from '../components/Toast';
 import { wsAddListener } from '../ws';
 
+function parseFormFields(data) {
+  return String(data || '')
+    .split('&')
+    .map((pair) => {
+      const idx = pair.indexOf('=');
+      if (idx < 0) return { key: pair, value: '' };
+      return {
+        key: decodeURIComponent(pair.slice(0, idx).replace(/\+/g, ' ')),
+        value: decodeURIComponent(pair.slice(idx + 1).replace(/\+/g, ' ')),
+      };
+    })
+    .filter((f) => f.key);
+}
+
 export function EvilTwin() {
   const [running, setRunning] = useState(false);
   const [portalSelected, setPortalSelected] = useState(false);
   const [passwords, setPasswords] = useState([]);
+  const [verified, setVerified] = useState(false);
   const st = getState();
 
-  useEffect(() => wsAddListener((msg) => {
-    if (msg.type === 'attack_started' && msg.attack === 'eviltwin') setRunning(true);
-    if (msg.type === 'attack_stopped') setRunning(false);
-    if (msg.type === 'password_received') {
-      setPasswords((prev) => [
-        {
-          id: `${Date.now()}-${Math.random().toString(16).slice(2, 6)}`,
-          password: msg.password,
-          time: new Date().toLocaleTimeString(),
-        },
-        ...prev,
-      ]);
-      showToast(`Password captured: ${msg.password}`, 'success');
+  useEffect(() => {
+    // The send-only WS can be LRU-purged during the browser's HTTP polls, so the
+    // device-cached REST list is the source of truth; the WS handlers below are
+    // only for instant toasts.
+    const removeWs = wsAddListener((msg) => {
+      if (msg.type === 'attack_started' && msg.attack === 'eviltwin') setRunning(true);
+      if (msg.type === 'attack_stopped') setRunning(false);
+      if (msg.type === 'portal_data') {
+        const fields = parseFormFields(msg.data);
+        const summary = fields.map((f) => `${f.key}=${f.value}`).join('  ');
+        showToast(`Credentials captured: ${summary}`, 'success');
+      }
+      if (msg.type === 'password_received') {
+        showToast(`Password captured: ${msg.password}`, 'success');
+      }
+      if (msg.type === 'password_verified') {
+        setVerified(true);
+        showToast('Password verified by target!', 'success');
+      }
+    });
+
+    // Poll device-cached captures every 2s so credentials survive WS drops.
+    let alive = true;
+    async function pollCaptures() {
+      try {
+        const res = await api.portalCaptures();
+        if (!alive || !res || !res.ok) return;
+        const list = (res.captures || []).map((c, i) => {
+          const fields = parseFormFields(c.data);
+          return {
+            id: `${c.at}-${i}`,
+            fields,
+            summary: fields.map((f) => `${f.key}=${f.value}`).join('  ') || c.data,
+          };
+        }).reverse();
+        setPasswords(list);
+      } catch (_) { /* ignore */ }
     }
-  }), []);
+    pollCaptures();
+    const capTimer = setInterval(pollCaptures, 2000);
+
+    return () => { alive = false; clearInterval(capTimer); removeWs(); };
+  }, []);
 
   const targetNet = st.networks.find((n) => st.selected.has(n.index));
 
@@ -44,6 +87,8 @@ export function EvilTwin() {
     const res = await api.evilTwin();
     if (res.ok) {
       setRunning(true);
+      setVerified(false);
+      setPasswords([]);
       showToast('Evil Twin started', 'success');
     } else {
       showToast(res.error || 'Failed to start', 'error');
@@ -93,21 +138,22 @@ export function EvilTwin() {
         <section class="glass-card card-body reveal">
           <div class="section-head">
             <h3 class="section-title">Captured Credentials</h3>
-            <span class="badge ok">{passwords.length}</span>
+            <span class={`badge ${verified ? 'ok' : ''}`}>
+              {verified ? 'Verified' : passwords.length}
+            </span>
           </div>
           <div class="table-wrap">
             <table class="table">
-              <thead>
-                <tr>
-                  <th>Time</th>
-                  <th>Password</th>
-                </tr>
-              </thead>
+              <thead><tr><th>#</th><th>Submitted data</th></tr></thead>
               <tbody>
-                {passwords.map((pw) => (
+                {passwords.map((pw, i) => (
                   <tr key={pw.id}>
-                    <td>{pw.time}</td>
-                    <td>{pw.password}</td>
+                    <td>{passwords.length - i}</td>
+                    <td>
+                      {(pw.fields && pw.fields.length) ? pw.fields.map((f) => (
+                        <div key={f.key}><span class="kv-key">{f.key}:</span> {f.value}</div>
+                      )) : pw.summary}
+                    </td>
                   </tr>
                 ))}
               </tbody>
