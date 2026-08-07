@@ -10,6 +10,9 @@ docs/manifest-*.json
 __pycache__/
 *.pyc
 
+# JavaScript dependencies are restored reproducibly from web/package-lock.json.
+web/node_modules/
+
 # ccache store used by tools/build_all_cache.py (compiler cache; can be huge).
 .ccache/
 
