@@ -137,6 +137,7 @@ export function SubGhzManage() {
                 <thead>
                   <tr>
                     <th>#</th>
+                    <th>Name</th>
                     <th>Type</th>
                     <th>MHz</th>
                     <th>Serial</th>
@@ -150,6 +151,7 @@ export function SubGhzManage() {
                   {signals.map((s) => (
                     <tr key={s.idx}>
                       <td>{s.idx}</td>
+                      <td>{s.name || '-'}</td>
                       <td>{s.type || s.signalType || '-'}</td>
                       <td>{Number(s.freq).toFixed(2)}</td>
                       <td>{s.serial || s.id || '-'}</td>
