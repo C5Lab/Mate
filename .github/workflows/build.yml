@@ -36,8 +36,11 @@ jobs:
     outputs:
       matrix: ${{ steps.set.outputs.matrix }}
       wc_version: ${{ steps.version.outputs.wc_version }}
+      version_changed: ${{ steps.version_change.outputs.changed }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
 
       - name: Build board matrix
         id: set
@@ -48,6 +51,29 @@ jobs:
         run: |
           ver=$(grep -oP '(?<=JANOS_WC_VERSION ")[^"]+' main/main.c)
           echo "wc_version=$ver" >> "$GITHUB_OUTPUT"
+
+      # A normal merge to main should only create a release when it changes
+      # the firmware version, rather than publishing every code-only update.
+      - name: Detect firmware version change
+        id: version_change
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          changed=false
+          if [ "$GITHUB_REF" = "refs/heads/main" ] &&
+             [ -n "$BEFORE" ] &&
+             [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
+            if ! git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+              git fetch --no-tags --depth=1 origin "$BEFORE"
+            fi
+            before=$(git show "$BEFORE:main/main.c" 2>/dev/null | grep -oP '(?<=JANOS_WC_VERSION ")[^"]+' || true)
+            after=$(grep -oP '(?<=JANOS_WC_VERSION ")[^"]+' main/main.c)
+            if [ -n "$before" ] && [ "$before" != "$after" ]; then
+              changed=true
+            fi
+          fi
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
 
   # ---------------------------------------------------------------------------
   # Build every board in parallel. fail-fast:false => one broken board does not
@@ -119,7 +145,8 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # Release gate: needs ALL build jobs => runs only after every board is green.
-  # Fires on a pushed v* tag, a published release, or a manual run with a tag.
+  # Fires on a pushed v* tag, a manual run with a tag, or a version bump merged
+  # into main.
   # ---------------------------------------------------------------------------
   release:
     name: Release
@@ -131,7 +158,9 @@ jobs:
       tag: ${{ steps.meta.outputs.tag }}
     if: >-
       startsWith(github.ref, 'refs/tags/v') ||
-      (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
+      (github.event_name == 'workflow_dispatch' && inputs.release_tag != '') ||
+      (github.ref == 'refs/heads/main' &&
+       needs.prepare.outputs.version_changed == 'true')
 
     steps:
       - name: Download all artifacts
