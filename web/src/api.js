@@ -86,6 +86,7 @@ export const api = {
   dashboard:      ()          => get('/api/dashboard'),
   subghzListen:   (freq, raw) => post('/api/subghz/listen', { freq, raw: !!raw }),
   subghzJam:      (freq)      => post('/api/subghz/jam', { freq }),
+  subghzStop:     ()          => post('/api/subghz/stop'),
   subghzTx:       (index, source = 'sd') => post('/api/subghz/tx', { index, source }),
   subghzTesla:    ()          => post('/api/subghz/tx', { preset: 'tesla' }),
   subghzSave:     (index)     => post('/api/subghz/save', { index }),

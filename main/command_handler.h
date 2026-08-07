@@ -376,6 +376,7 @@ bool cmd_do_wifi_disconnect(void);
 
 /** Stop all operations. */
 bool cmd_do_stop(void);
+bool cmd_do_subghz_stop(void);
 
 /** List HTML portal files from SD card. */
 bool cmd_do_list_portals(void);

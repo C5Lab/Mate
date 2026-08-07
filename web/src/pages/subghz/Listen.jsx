@@ -299,12 +299,12 @@ export function SubGhzListen() {
   }
 
   async function stop() {
-    await api.stop();
+    await api.subghzStop();
     setRunning(false);
   }
 
   return (
-    <Layout title="SubGHZ Listen" back="/subghz">
+    <Layout title="SubGHZ Listen" back="/subghz" onBack={() => api.subghzStop()}>
       <section class="glass-card card-body reveal">
         <div class="section-head">
           <h3 class="section-title">Receiver</h3>

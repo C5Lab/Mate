@@ -3755,10 +3755,10 @@ bool cmd_do_wifi_disconnect(void)
     return true;
 }
 
-bool cmd_do_stop(void)
+static bool cmd_do_stop_with_command(const char *command)
 {
-    if (s_display_cb) s_display_cb("stop", NULL);
-    uart_bridge_send("stop");
+    if (s_display_cb) s_display_cb(command, NULL);
+    uart_bridge_send(command);
 
     s_sniffer_collecting = false;
     s_wd_status.active = false;
@@ -3786,6 +3786,16 @@ bool cmd_do_stop(void)
 
     broadcast_json("{\"type\":\"attack_stopped\"}");
     return true;
+}
+
+bool cmd_do_stop(void)
+{
+    return cmd_do_stop_with_command("stop");
+}
+
+bool cmd_do_subghz_stop(void)
+{
+    return cmd_do_stop_with_command("subghz_stop");
 }
 
 bool cmd_do_list_portals(void)

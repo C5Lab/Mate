@@ -1585,7 +1585,10 @@ static esp_err_t api_subghz_post(httpd_req_t *req)
 
     bool ok = false;
 
-    if (strstr(uri, "/listen")) {
+    if (strstr(uri, "/stop")) {
+        ok = cmd_do_subghz_stop();
+    }
+    else if (strstr(uri, "/listen")) {
         float freq = 433.92f;
         bool raw = false;
         json_get_float(body, "\"freq\"", &freq);
