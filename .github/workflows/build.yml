@@ -104,6 +104,7 @@ jobs:
         run: |
           python3 tools/build_all.py \
             --no-docker \
+            --no-web \
             --retry 2 \
             --targets ${{ matrix.board }} \
             --output-dir artifacts
