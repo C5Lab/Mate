@@ -194,6 +194,19 @@ jobs:
             (cd "$d" && zip -r -q "${GITHUB_WORKSPACE}/release_zips/mate-${board}.zip" .)
           done
 
+      # GitHub Release assets are flat (no directory hierarchy). The generated
+      # filenames already contain the board id, so they remain unambiguous for
+      # browser flashers that fetch individual images instead of a ZIP.
+      - name: Collect raw firmware images
+        run: |
+          set -euo pipefail
+          mkdir -p release_bins
+          for d in release_artifacts/firmware-*; do
+            [ -d "$d" ] || continue
+            cp "$d"/*.bin release_bins/
+          done
+          test -n "$(find release_bins -maxdepth 1 -type f -name '*.bin' -print -quit)"
+
       - name: Build release notes
         run: |
           {
@@ -217,7 +230,8 @@ jobs:
             --target "$GITHUB_SHA" \
             --title "Mate $TAG" \
             --notes-file release_notes.md \
-            release_zips/*.zip
+            release_zips/*.zip \
+            release_bins/*.bin
 
   # ---------------------------------------------------------------------------
   # Web flasher: deploy the browser-based esptool-js flasher (docs/) to GitHub
