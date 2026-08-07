@@ -232,6 +232,7 @@ typedef struct {
 typedef struct {
     int   idx;
     char  type[16];
+    char  name[64];
     float freq;
     int   bits;
     char  serial[24];   /* KeeLoq/StarLine */

@@ -1233,6 +1233,12 @@ button:not(:disabled) {
   overflow: hidden;
 }
 
+.subghz-tx-modal-body {
+  min-height: 0;
+  max-height: min(58vh, 420px);
+  overflow-y: auto;
+}
+
 .scan-modal {
   width: min(96vw, 860px);
 }

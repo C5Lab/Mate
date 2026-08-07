@@ -1823,14 +1823,18 @@ static esp_err_t api_subghz_list_get(httpd_req_t *req)
     cw_printf(&cw, "{\"ok\":true,\"count\":%d,\"signals\":[", count);
     for (int i = 0; i < count; i++) {
         const subghz_signal_t *s = &sigs[i];
+        char name_esc[sizeof(s->name) * 2];
+        json_escape(name_esc, sizeof(name_esc), s->name);
         cw_printf(&cw,
             "%s{\"idx\":%d,\"type\":\"%s\",\"freq\":%.2f,\"bits\":%d,"
             "\"serial\":\"%s\",\"btn\":%d,\"cnt\":%d,\"mf\":\"%s\","
+            "\"name\":\"%s\","
             "\"id\":\"%s\",\"te\":%d,\"proto\":%d,"
             "\"is_raw\":%s,\"edges\":%d}",
             i > 0 ? "," : "",
             s->idx, s->type, s->freq, s->bits,
             s->serial, s->btn, s->cnt, s->mf,
+            name_esc,
             s->id_str, s->te, s->proto,
             s->is_raw ? "true" : "false", s->edges);
     }

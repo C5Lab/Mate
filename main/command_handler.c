@@ -1428,6 +1428,23 @@ static void parse_subghz_rx_fields(const char *data, subghz_signal_t *out)
     if ((p = strstr(data, "serial="))) sscanf(p, "serial=%23s", out->serial);
     if ((p = strstr(data, "btn=")))    sscanf(p, "btn=%d",      &out->btn);
     if ((p = strstr(data, "cnt=")))    sscanf(p, "cnt=%d",      &out->cnt);
+    if ((p = strstr(data, "name="))) {
+        p += 5;
+        static const char *const name_delims[] = {
+            " learn=", " mf=", " te=", " cnt=", " proto=",
+            " id=", " serial=", " btn=", " bits=", " freq=", " edges=",
+        };
+        const char *end = p + strlen(p);
+        for (size_t d = 0; d < sizeof(name_delims) / sizeof(name_delims[0]); d++) {
+            const char *hit = strstr(p, name_delims[d]);
+            if (hit && hit < end) end = hit;
+        }
+        size_t n = (size_t)(end - p);
+        while (n > 0 && (p[n - 1] == '\r' || p[n - 1] == '\n' || p[n - 1] == ' ')) n--;
+        if (n >= sizeof(out->name)) n = sizeof(out->name) - 1;
+        memcpy(out->name, p, n);
+        out->name[n] = '\0';
+    }
     if ((p = strstr(data, "id=")))     sscanf(p, "id=%23s",     out->id_str);
     if ((p = strstr(data, "te=")))     sscanf(p, "te=%d",       &out->te);
     if ((p = strstr(data, "proto=")))  sscanf(p, "proto=%d",    &out->proto);
