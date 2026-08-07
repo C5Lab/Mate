@@ -21,3 +21,4 @@ web/node_modules/
 build-*/
 build-*.log
 sdkconfig.build-*
+.vscode/settings.json

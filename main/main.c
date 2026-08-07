@@ -15,7 +15,7 @@
 
 static const char *TAG = "janos_wc";
 
-#define JANOS_WC_VERSION "1.0.1"
+#define JANOS_WC_VERSION "1.0.0"
 
 void app_main(void)
 {
