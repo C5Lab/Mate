@@ -188,9 +188,9 @@ static bool                 s_has_last_gps_fix = false;
 static float                s_last_gps_lat = 0.0f;
 static float                s_last_gps_lon = 0.0f;
 static int64_t              s_last_uart_ms = 0;
-/* Set true on the first line ever received from the C5. Once established the
- * connection is treated as sticky (no more keepalive pings), trading a slow
- * idle-disconnect indication for a quiet UART. */
+/* Set true only after the C5 confirms the initial ping with `pong`. Once
+ * established the connection is treated as sticky and no more keepalive
+ * pings are sent. */
 static bool                 s_c5_established = false;
 static bool                 s_sta_connected = false;
 static char                 s_sta_ssid[33] = {0};
@@ -1895,7 +1895,9 @@ static void on_uart_line(const char *line, void *ctx)
 {
     (void)ctx;
     s_last_uart_ms = esp_timer_get_time() / 1000;
-    s_c5_established = true;
+    if (strcmp(line, "pong") == 0) {
+        s_c5_established = true;
+    }
 
     /* Capture every raw line into the serial ring so the web can poll it
      * (reliable even when the WebSocket drops frames). */
@@ -3098,11 +3100,8 @@ void cmd_handler_init(void)
 
     uart_bridge_register_line_cb(on_uart_line, NULL);
 
-    /* Keepalive: JanOS only chatters on its own during active work, so an
-     * otherwise-idle C5 would drop below the 15s "connected" window even
-     * though it's perfectly healthy. Ping it periodically while idle; the
-     * pong (or any reply) refreshes s_last_uart_ms. Skipped while a command
-     * is running so we never inject a stray "ping" mid-listing/attack. */
+    /* Retry the initial detection while idle. Stop permanently after the C5
+     * confirms the ping with `pong`; never inject a stray ping mid-command. */
     const esp_timer_create_args_t ka_args = {
         .callback = keepalive_timer_cb,
         .name     = "c5_keepalive",
@@ -4255,9 +4254,8 @@ bool cmd_handshake_initial_done(void)
 
 bool cmd_is_c5_connected(void)
 {
-    /* Sticky: once the C5 has ever replied we consider it connected. This
-     * avoids periodic pings just to keep the indicator green while idle.
-     * Tradeoff: an idle unplug isn't reflected until a real command times out. */
+    /* Sticky: once the C5 confirms the initial ping with `pong`, it remains
+     * considered connected and automatic detection pings stay disabled. */
     return s_c5_established;
 }
 
