@@ -432,7 +432,8 @@ def parse_args() -> argparse.Namespace:
                    help="Keep build-<board>/ (only affects --no-docker path)")
     p.add_argument("--output-dir", default=str(BINARIES_DIR))
     p.add_argument("--no-docker", action="store_true",
-                   help="Run idf.py directly (inside esp-idf container / CI)")
+                   help="Run idf.py directly (inside esp-idf container / CI); "
+                        "requires --no-web because the web build uses Docker")
     p.add_argument("--no-web", action="store_true", help="Skip the web UI rebuild")
     p.add_argument("--ccache-max", default="20G", metavar="SIZE",
                    help="ccache max size, e.g. 20G / 30G (default: 20G)")

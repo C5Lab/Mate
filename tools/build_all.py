@@ -246,25 +246,19 @@ def build_web(use_docker: bool) -> None:
     The ESP-IDF container has no npm, so the firmware build alone embeds
     whatever stale spiffs/app.js is on disk. Run `npm run build` here (vite
     outputs to ../spiffs per web/vite.config.js) so the flashed UI always
-    matches web/src. Uses a local npm if present, otherwise the node Docker
-    image (host doesn't need Node installed)."""
+    matches web/src. Always run this in the Node Docker image: it keeps the
+    host's platform-specific node_modules out of the build."""
     if not (WEB_DIR / "package.json").exists():
         log("web/ not found — skipping web build")
         return
 
-    log("=== Building web UI (npm run build -> spiffs/) ===")
-    npm = shutil.which("npm")
-    if npm:
-        run([npm, "ci", "--no-audit", "--no-fund"], cwd=WEB_DIR)
-        run([npm, "run", "build"], cwd=WEB_DIR)
-        return
-
     if not use_docker:
-        sys.exit("No local npm and --no-docker set: cannot build the web UI. "
-                 "Install Node or drop --no-docker.")
+        sys.exit("The web UI build requires Docker. Use Docker or pass --no-web "
+                 "with --no-docker.")
 
-    # Shadow the host node_modules with an anonymous volume so Windows-installed
-    # binaries don't leak into the Linux container, then do a clean install.
+    log("=== Building web UI in Docker (npm run build -> spiffs/) ===")
+    # Shadow the host node_modules with an anonymous volume so host-installed
+    # binaries never leak into the Linux container.
     run([
         "docker", "run", "--rm",
         "--volume", f"{REPO_ROOT}:/proj",
@@ -689,7 +683,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--no-docker", action="store_true",
         help="Run idf.py directly instead of via Docker (for CI inside the "
-             "espressif/idf container, or a host with esp-idf installed)",
+             "espressif/idf container, or a host with esp-idf installed); "
+             "requires --no-web",
     )
     p.add_argument(
         "--no-web", action="store_true",
