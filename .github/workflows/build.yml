@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Optional tag name to upload assets to a release (example 'v1.2.3')"
+        description: "Optional tag name to cut a release (example 'v1.2.3'). Leave empty for build-only."
         required: false
   push:
     branches: [main]
@@ -14,55 +14,61 @@ on:
       - 'sdkconfig*'
       - 'partitions_*.csv'
       - 'CMakeLists.txt'
-      - '.github/scripts/**'
+      - 'tools/build_all.py'
+      - 'tools/gen_web_flasher.py'
       - '.github/workflows/build.yml'
-  release:
-    types: [published, edited]
+    tags:
+      - 'v*'
+
+# A new push to the same ref supersedes in-flight builds.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  build:
-    name: ${{ matrix.board }}
-    permissions:
-      contents: write
+  # ---------------------------------------------------------------------------
+  # Single source of truth: derive the board matrix from tools/build_all.py so
+  # adding a board there automatically adds it to CI.
+  # ---------------------------------------------------------------------------
+  prepare:
+    name: Prepare matrix
     runs-on: ubuntu-24.04
-    container:
-      image: espressif/idf:release-v6.0
     outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
       wc_version: ${{ steps.version.outputs.wc_version }}
-
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - board: xiao-c6
-            idf_target: esp32c6
-            sdkconfig_extra: sdkconfig.defaults.esp32c6
-
-          - board: cores3
-            idf_target: esp32s3
-            sdkconfig_extra: sdkconfig.defaults.cores3
-
-          - board: atoms3r
-            idf_target: esp32s3
-            sdkconfig_extra: sdkconfig.defaults.atoms3r
-
-          - board: stickc-plus2
-            idf_target: esp32
-            sdkconfig_extra: sdkconfig.defaults.esp32
-
-          - board: atom-lite
-            idf_target: esp32
-            sdkconfig_extra: sdkconfig.defaults.esp32
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+
+      - name: Build board matrix
+        id: set
+        run: echo "matrix=$(python3 tools/build_all.py --print-matrix)" >> "$GITHUB_OUTPUT"
 
       - name: Read firmware version
         id: version
         run: |
           ver=$(grep -oP '(?<=JANOS_WC_VERSION ")[^"]+' main/main.c)
           echo "wc_version=$ver" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # Build every board in parallel. fail-fast:false => one broken board does not
+  # cancel the others, so you see every failure in a single run.
+  # ---------------------------------------------------------------------------
+  build:
+    name: ${{ matrix.board }}
+    needs: prepare
+    permissions:
+      contents: read
+    runs-on: ubuntu-24.04
+    container:
+      image: espressif/idf:release-v6.0
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Cache ESP-IDF artifacts
         uses: actions/cache@v4
@@ -88,22 +94,20 @@ jobs:
         run: npm run build
         working-directory: web
 
+      # build_all.py runs the firmware build, generates the per-board
+      # flash_board.py, and verifies the generated sdkconfig matches the
+      # board's defaults (catches config leakage). --no-docker because we are
+      # already inside the esp-idf container. --retry 2 re-attempts the board
+      # up to 2 extra times so a flaky failure (e.g. transient component-manager
+      # network error) does not fail the job and block the release gate.
       - name: Build firmware (${{ matrix.board }})
-        env:
-          BOARD: ${{ matrix.board }}
-          IDF_TARGET: ${{ matrix.idf_target }}
-          SDKCONFIG_DEFAULTS: "sdkconfig.defaults;${{ matrix.sdkconfig_extra }}"
-          BUILD_DIR: build-${{ matrix.board }}
-        run: bash .github/scripts/container_build.sh --no-docker
-
-      - name: Collect binaries
         run: |
-          set -e
-          mkdir -p artifacts/${{ matrix.board }}
-          cp build-${{ matrix.board }}/janos-web-client.bin              artifacts/${{ matrix.board }}/mate-${{ matrix.board }}.bin
-          cp build-${{ matrix.board }}/partition_table/partition-table.bin artifacts/${{ matrix.board }}/partition-table-${{ matrix.board }}.bin
-          cp build-${{ matrix.board }}/bootloader/bootloader.bin          artifacts/${{ matrix.board }}/bootloader-${{ matrix.board }}.bin
-          cp build-${{ matrix.board }}/storage.bin                        artifacts/${{ matrix.board }}/storage-${{ matrix.board }}.bin
+          python3 tools/build_all.py \
+            --no-docker \
+            --no-web \
+            --retry 2 \
+            --targets ${{ matrix.board }} \
+            --output-dir artifacts
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -113,13 +117,21 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  # ---------------------------------------------------------------------------
+  # Release gate: needs ALL build jobs => runs only after every board is green.
+  # Fires on a pushed v* tag, a published release, or a manual run with a tag.
+  # ---------------------------------------------------------------------------
   release:
     name: Release
-    needs: build
+    needs: [prepare, build]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
-    if: github.ref == 'refs/heads/main' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    if: >-
+      startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
 
     steps:
       - name: Download all artifacts
@@ -130,24 +142,38 @@ jobs:
       - name: Resolve release tag
         id: meta
         env:
-          EVENT_TAG: ${{ github.event.release.tag_name }}
           INPUT_TAG: ${{ inputs.release_tag }}
-          WC_VERSION: ${{ needs.build.outputs.wc_version }}
+          WC_VERSION: ${{ needs.prepare.outputs.wc_version }}
         run: |
-          TAG="${EVENT_TAG:-}"
-          if [ -z "$TAG" ]; then TAG="${INPUT_TAG:-}"; fi
+          TAG="${GITHUB_REF#refs/tags/}"
+          if [ "$TAG" = "$GITHUB_REF" ]; then TAG="${INPUT_TAG:-}"; fi
           if [ -z "$TAG" ]; then TAG="v${WC_VERSION}"; fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "Using tag: $TAG"
 
+      # Bundle each board into its own zip (bins + flash_board.py). Release
+      # assets share a flat namespace, so the per-board flash_board.py files
+      # would otherwise collide — one zip per board keeps them separate and
+      # gives users a single self-contained download.
+      - name: Package per-board zips
+        run: |
+          set -euo pipefail
+          mkdir -p release_zips
+          for d in release_artifacts/firmware-*; do
+            [ -d "$d" ] || continue
+            board="${d#release_artifacts/firmware-}"
+            (cd "$d" && zip -r -q "${GITHUB_WORKSPACE}/release_zips/mate-${board}.zip" .)
+          done
+
       - name: Build release notes
         run: |
-          printf 'Auto-build from commit %s\n\nBoards:\n' "${{ github.sha }}" > release_notes.md
-          printf -- '- mate-xiao-c6.bin      -> XIAO ESP32-C6\n' >> release_notes.md
-          printf -- '- mate-cores3.bin       -> M5Stack CoreS3 SE\n' >> release_notes.md
-          printf -- '- mate-atoms3r.bin      -> AtomS3R Dev Kit\n' >> release_notes.md
-          printf -- '- mate-stickc-plus2.bin -> M5StickC PLUS2\n' >> release_notes.md
-          printf -- '- mate-atom-lite.bin    -> Atom Lite\n' >> release_notes.md
+          {
+            printf 'Auto-build from commit %s\n\nBoards:\n' "${GITHUB_SHA}"
+            for z in release_zips/mate-*.zip; do
+              board="$(basename "$z" .zip)"
+              printf -- '- %s.zip\n' "$board"
+            done
+          } > release_notes.md
 
       - name: Create or update GitHub Release
         env:
@@ -156,15 +182,76 @@ jobs:
         run: |
           set -euo pipefail
 
-          files=()
-          while IFS= read -r -d '' f; do
-            files+=("$f")
-          done < <(find release_artifacts -name "*.bin" -print0)
-
           gh release delete "$TAG" -R "$GITHUB_REPOSITORY" --yes 2>/dev/null || true
 
           gh release create "$TAG" -R "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
             --title "Mate $TAG" \
             --notes-file release_notes.md \
-            "${files[@]}"
+            release_zips/*.zip
+
+  # ---------------------------------------------------------------------------
+  # Web flasher: deploy the browser-based esptool-js flasher (docs/) to GitHub
+  # Pages, arranging every board's bins under docs/firmware/<board>/ and
+  # generating a per-board manifest + boards.json (the dropdown). needs release
+  # => only publishes once every board is green AND a release was cut, so the
+  # flasher never points at a half-built matrix.
+  # ---------------------------------------------------------------------------
+  pages:
+    name: Web Flasher (Pages)
+    needs: [prepare, build, release]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all firmware artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: _artifacts
+          pattern: firmware-*
+
+      # Each artifact "firmware-<board>" holds that board's bins at its root.
+      # Fan them out into docs/firmware/<board>/ so the manifests (and Pages)
+      # can serve firmware/<board>/<file>.bin by relative URL.
+      - name: Arrange firmware under docs/firmware/
+        run: |
+          set -euo pipefail
+          rm -rf docs/firmware
+          mkdir -p docs/firmware
+          for d in _artifacts/firmware-*; do
+            [ -d "$d" ] || continue
+            board="${d#_artifacts/firmware-}"
+            mkdir -p "docs/firmware/${board}"
+            cp "$d"/*.bin "docs/firmware/${board}/"
+          done
+          ls -R docs/firmware
+
+      - name: Generate manifests + boards.json
+        run: |
+          python3 tools/gen_web_flasher.py \
+            --firmware-dir docs/firmware \
+            --out-dir docs \
+            --version "${{ needs.prepare.outputs.wc_version }}" \
+            --build "${{ needs.release.outputs.tag }}"
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v4
+        with:
+          enablement: true
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs
+
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v4

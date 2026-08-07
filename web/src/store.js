@@ -24,6 +24,17 @@ let state = {
   heapFree: 0,
   heapInternal: 0,
   status: 'idle',
+  /* Global foreground-attack lock. Mirrors whether the Monster is running a
+   * Scan-page attack (deauth/handshake/mitm/nmap/arp/…). Kept here — not in the
+   * Scan component's local state — so it survives navigation, WS reconnects and
+   * the disconnect→return case: the /api/status poll reconciles it against the
+   * authoritative device FSM, so the Scan lock can no longer stay stuck on
+   * "Attack running" after the Monster has actually gone idle.
+   * `attackRunningSince` timestamps the optimistic launch so the poll won't
+   * clear a freshly-armed lock in the brief window before the device reports
+   * the new state (see setAttackRunning + the reconcile in app.jsx). */
+  attackRunning: false,
+  attackRunningSince: 0,
   networks: [],
   selected: new Set(),
   scanCount: 0,
@@ -56,7 +67,28 @@ let state = {
    * monitor isn't open at the moment the lines arrive over UART. */
   arpHosts: [],
   arpHostsAt: 0,
+  /* Wardrive 2.0 live state. Kept in the global store (like arpHosts) so the
+   * stream survives navigation away from the Wardrive page and WS reconnects.
+   * `nets` is a bounded ring buffer of the most recent CSV sightings. */
+  wardrive: {
+    running: false,
+    trace: false,
+    gps: 'idle', /* idle | waiting | fix | lost | timeout */
+    gpsCur: 0,
+    gpsTotal: 0,
+    stats: null, /* { nets, bt, relogs, bestCh, sats, dist, gpsValid } */
+    file: '',    /* active log file, e.g. "w2.log" */
+    nets: [],
+  },
+  antisurv: {
+    running: false,
+    followers: [],
+    seen: 0,
+    flagged: 0,
+  },
 };
+
+const WARDRIVE_NET_CAP = 200;
 
 let listeners = [];
 
@@ -87,6 +119,16 @@ export function setAllNetworks(selectAll) {
   const next = new Set();
   if (selectAll) state.networks.forEach((n) => next.add(n.index));
   setState({ selected: next });
+}
+
+/* Arm/disarm the global attack lock. Callers set it optimistically on launch
+ * (true) and on Stop (false); the /api/status poll in app.jsx reconciles it
+ * against the real device state afterwards. */
+export function setAttackRunning(running) {
+  setState({
+    attackRunning: !!running,
+    attackRunningSince: running ? Date.now() : 0,
+  });
 }
 
 export function clearArpHosts() {
@@ -120,6 +162,61 @@ export function setArpHosts(hosts, atMs) {
   setState({
     arpHosts: next,
     arpHostsAt: typeof atMs === 'number' && atMs > 0 ? atMs : Date.now(),
+  });
+}
+
+/* ---------- Wardrive 2.0 live state ---------- */
+
+export function wardriveReset(patch = {}) {
+  setState({
+    wardrive: {
+      running: false,
+      trace: false,
+      gps: 'idle',
+      gpsCur: 0,
+      gpsTotal: 0,
+      stats: null,
+      file: '',
+      nets: [],
+      ...patch,
+    },
+  });
+}
+
+export function wardrivePatch(patch) {
+  setState({ wardrive: { ...state.wardrive, ...patch } });
+}
+
+export function wardrivePushNet(net) {
+  if (!net || !net.bssid) return;
+  const nets = [net, ...state.wardrive.nets];
+  if (nets.length > WARDRIVE_NET_CAP) nets.length = WARDRIVE_NET_CAP;
+  setState({ wardrive: { ...state.wardrive, nets } });
+}
+
+export function antisurvReset(patch = {}) {
+  setState({
+    antisurv: { running: false, followers: [], seen: 0, flagged: 0, ...patch },
+  });
+}
+
+export function antisurvPatch(patch) {
+  setState({ antisurv: { ...state.antisurv, ...patch } });
+}
+
+export function antisurvPushFollower(f) {
+  if (!f || !f.mac) return;
+  const macUp = f.mac.toUpperCase();
+  const existing = state.antisurv.followers.find((x) => x.mac === macUp);
+  const followers = existing
+    ? state.antisurv.followers.map((x) => (x.mac === macUp ? { ...x, ...f, mac: macUp } : x))
+    : [{ ...f, mac: macUp }, ...state.antisurv.followers];
+  setState({
+    antisurv: {
+      ...state.antisurv,
+      followers,
+      flagged: existing ? state.antisurv.flagged : state.antisurv.flagged + 1,
+    },
   });
 }
 

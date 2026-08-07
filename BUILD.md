@@ -15,7 +15,7 @@ partition layout, display driver, and Grove UART pins — all selected through
 
 | Board          | MCU              | Flash | Display            | UART TX/RX (Grove) | Notes                          |
 |----------------|------------------|-------|--------------------|--------------------|--------------------------------|
-| `xiao-c6`      | ESP32-C6         | 4 MB  | —                  | 21 / 20            | Default board in Kconfig       |
+| `xiao-c6`      | ESP32-C6         | 4 MB  | —                  | 7 / 6              | Default board in Kconfig       |
 | `nanoc6`       | ESP32-C6         | 4 MB  | —                  | 2 / 1              | M5Stack NanoC6                 |
 | `cores3`       | ESP32-S3         | 16 MB | ILI9342C 320×240   | 2 / 1              | CoreS3 SE                      |
 | `atoms3r`      | ESP32-S3         | 8 MB  | GC9107 128×128     | 5 / 6              | AtomS3R Dev Kit                |
@@ -23,7 +23,12 @@ partition layout, display driver, and Grove UART pins — all selected through
 | `atoms3-lite`  | ESP32-S3FN8      | 8 MB  | —                  | 2 / 1              | No display                     |
 | `stickc-plus2` | ESP32            | 8 MB  | ST7789V2 135×240   | 32 / 33            | Bootloader @ 0x1000            |
 | `sticks3`      | ESP32-S3         | 8 MB  | ST7789P3 135×240   | 9 / 10             | M5PM1 PMIC (5V boost + L3B)    |
-| `atom-lite`    | ESP32-PICO-D4    | 4 MB  | —                  | 26 / 32            | Needs no-stub flashing fallback|
+| `atom-lite`    | ESP32-PICO-D4    | 4 MB  | —                  | 26 / 32            | Defaults to no-stub @ 115200   |
+| `atom-lite-c25_21` | ESP32-PICO-D4 | 4 MB  | —                  | 25 / 21            | C25_21 variant; no-stub @ 115200 |
+| `atom-matrix`  | ESP32-PICO-D4    | 4 MB  | —                  | 26 / 32            | 5×5 RGB LED (no LCD); no-stub   |
+| `coreink`      | ESP32            | 4 MB  | GDEW0154M09 200×200| 32 / 33            | E-paper; bootloader @ 0x1000    |
+| `atoms3u`      | ESP32-S3FN8      | 8 MB  | —                  | 2 / 1              | No display (USB stick, mic)     |
+| `cardkb2`      | ESP32-C61        | 4 MB  | —                  | 26 / 25            | Keyboard unit; flashing repurposes its C61 as headless WebClient |
 
 > UART TX is the Grove **yellow** wire, RX the **white** wire. If the Monster does
 > not respond or you see garbage on RX, swap TX/RX in `main/Kconfig.projbuild`.
@@ -95,16 +100,134 @@ python tools/build_all.py --targets sticks3,atoms3,atoms3-lite
 
 # Keep the per-board build-<board>/ dirs for inspection
 python tools/build_all.py --targets cores3 --keep-build
+
+# Rebuild only the boards that failed on the last run (others left untouched)
+python tools/build_all.py --retry-failed
+
+# Auto re-attempt flaky failures up to 2 extra times in the same run
+python tools/build_all.py --retry 2
 ```
+
+Failed boards are recorded in `binaries/.build_failed`; `--retry-failed` reads
+it, and it is cleared once every board builds cleanly. `--retry N` is handy for
+flaky Docker/network failures during a full build.
 
 Requirements:
 - **Docker** running (the script runs `docker info` first and aborts otherwise).
 - First run pulls the `espressif/idf:release-v6.0` image and populates a local
   `.espressif/` toolchain cache (subsequent runs are much faster).
 
-> ⚠️ `build_all.py` **wipes the entire `binaries/` directory** at the start of
-> every run (`shutil.rmtree`) and recreates it. Anything you add there manually
-> (e.g. a custom top-level script) is deleted on the next run.
+> ⚠️ A **full build** (no `--targets`) **wipes the entire `binaries/` directory**
+> at the start (`shutil.rmtree`) so a removed board leaves no stale output.
+> A **subset build** (`--targets ...`) only clears the targeted boards'
+> subdirectories, leaving siblings intact. Either way, don't store hand-made
+> files under `binaries/` — keep tooling in `tools/`.
+
+### Method A+ — `tools/build_all_cache.py` (fast local builds: ccache + target lanes)
+
+Same output as `build_all.py`, but built for **fast local/repeat builds**. On a
+24-core / 96 GB box the full 13-board matrix dropped from **1140 s → 301 s
+(3.8×)**, and a repeat build of a single board from **53 s → 32 s** at **100 %
+ccache hits**:
+
+| stage | full matrix | ccache |
+|---|---|---|
+| `build_all.py` (reference) | 1140 s | — |
+| + in-container build dir + named-volume cache | 486 s | 0 % |
+| + working ccache (siblings, single run) | 368 s | 77 % |
+| **+ working ccache (warm repeat)** | **301 s** | **100 %** |
+
+Getting there took **four** fixes stacked on top of each other — the naive "just
+add ccache and build N boards in parallel" gets a flat **0 % hit rate**, and each
+fix below only reveals the next. If you touch this script, keep all four.
+
+```bash
+python tools/build_all_cache.py                 # all boards, auto lanes, ccache
+python tools/build_all_cache.py -n 3            # up to 3 target-lanes at once
+python tools/build_all_cache.py -n 2 --targets cores3,atoms3,nanoc6,xiao-c6
+python tools/build_all_cache.py --ccache-max 30G --build-cpus 8 --verbose
+```
+
+#### How ccache is keyed (and how it gets busted)
+
+ccache reuses a compiled object when its key — **preprocessed source + compiler
+identity + the compiler arguments** — matches a previous compile. Four things
+silently broke that key here; each was hidden behind the previous one:
+
+1. **Per-board build directory.** Building board `X` into `build-X/` puts
+   `-I build-X/config` on the command line; board `Y` uses `-I build-Y/config`.
+   Different args → different cache key → **every file misses**, even when the
+   `.c` is byte-identical. This is why the first attempt saw `0 hits / 11950`.
+
+   **Fix:** build inside the container at a **fixed path** `/tmp/idfbuild` for
+   *every* board. Identical `-I` across boards → same-target siblings share the
+   cache. Bonus: the build tree lives on the container's fast fs instead of the
+   slow Windows bind mount, so builds are quicker too. The 4 images + sdkconfig
+   are copied out to `binaries/<board>/` at the end.
+
+2. **Same target compiled concurrently.** If two `esp32c6` boards compile at the
+   same moment they **both miss** — neither's objects are cached yet. And two
+   *different* targets never share a cache anyway (different arch/flags).
+
+   **Fix — target lanes:** group boards by `idf_target`. Boards of the **same
+   target run sequentially** (board 1 primes the cache, boards 2..N are near-full
+   hits); **different targets run in parallel** (up to `-n` lanes). For this
+   matrix that's 3 lanes (`esp32`, `esp32c6`, `esp32s3`).
+
+3. **Direct-mode header hashing** (the sneaky one — kept ccache at 0 % even after
+   fixes 1 & 2). ccache's default *direct mode* hashes the full **content** of
+   every included header, and nearly every ESP-IDF source includes the
+   **per-board `sdkconfig.h`** (different `CONFIG_JANOS_BOARD_*`, UART pins, …) —
+   so even same-target siblings miss on ~every file.
+
+   **Fix:** run ccache in **preprocessor mode** (`CCACHE_NODIRECT=1`). It hashes
+   the *preprocessed* output instead, so a file that includes `sdkconfig.h` but
+   doesn't reference the board-specific `CONFIG_JANOS_*` defines produces
+   identical output across same-target boards → hit. Only the handful of files
+   in `main/` that actually read those defines miss (correctly).
+   `CCACHE_SLOPPINESS=time_macros` stops `__DATE__`/`__TIME__` from busting it.
+
+4. **Compiler hashed by mtime, on a bind-mounted toolchain** (the sneakiest —
+   kept it at 0 % even after fixes 1–3, *including* on an identical rebuild of
+   the *same* board). ccache's default `compiler_check = mtime` folds the
+   compiler binary's mtime into the key. The IDF toolchain lives on the
+   bind-mounted `.espressif/` (Windows), and virtiofs reports an **unstable
+   mtime across container instances** — so every `docker run` got a fresh key
+   and missed everything.
+
+   **Fix:** `CCACHE_COMPILERCHECK=content` — hash the compiler's *content*, which
+   is stable across containers. This is what finally flipped a repeat build to
+   **100 % hits (53 s → 32 s** for one board). Diagnosis trick: if `ccache -s`
+   shows 0 hits even when you build the *same* target twice, it's almost always
+   `compiler_check`.
+
+Before any concurrency, one board is built as a **warmup** (sequential) to
+populate the shared component-manager cache (`managed_components/` +
+`dependencies.lock`) so the parallel lanes only *read* it.
+
+#### What to expect
+
+- **First board of each target = cold** (full compile). Every sibling after it
+  in the lane = mostly cache hits → much faster.
+- The run prints a live `[n/13] ✓/✗` counter and a ccache summary at the end
+  (`ccache: 71 % hit (…) · 1.9/20 GiB`). Stats are **per-run** (`ccache -z` at
+  start). `-n` = max concurrent lanes (default: number of distinct targets);
+  `--build-cpus` auto-splits CPUs across lanes (`~ncpu/lanes`).
+- `--no-docker` keeps the per-board build-dir path (for CI, where each board is
+  a separate runner and cross-board sharing doesn't apply).
+
+The ccache store lives in a **Docker named volume** `mate_ccache` (not a
+bind-mounted `.ccache/` — bind-mounting a Windows dir makes ccache *store* but
+never *hit*, because virtiofs breaks its atomic lookups; the named volume is on
+ext4 in the WSL2 VM where ccache works and is faster). Inspect/clear it with
+`docker volume inspect mate_ccache` / `docker volume rm mate_ccache`. Per-board
+logs are `build-<board>.log`, isolated configs `sdkconfig.build-*` (both
+git-ignored). `--no-docker` uses the host `.ccache/` instead.
+
+> `build_all.py` (the plain one) is still the reference for CI and clean
+> reproducible artifacts. `build_all_cache.py` is the local speed tool — it
+> imports the board matrix + helpers from `build_all.py`, so there's one source
+> of truth.
 
 ### Method B — local `idf.py` (fast single-board iteration)
 
@@ -125,6 +248,56 @@ classic ESP32 boards use `set-target esp32`.
 > **Always delete `sdkconfig` first** when switching boards. `idf.py clean` does
 > **not** remove it — it only cleans `build/`.
 
+### Web UI (SPIFFS assets)
+
+The web GUI is a Preact/Vite app in [`web/`](web/). `vite build` compiles it into
+[`spiffs/`](spiffs/) (`app.js`, `index.css`, `index.html`) — see
+[`web/vite.config.js`](web/vite.config.js) (`outDir: '../spiffs'`). That `spiffs/`
+directory is then packed into **`storage-<board>.bin`** and flashed at the SPIFFS
+offset, so the web UI ships inside the firmware.
+
+**`build_all.py` rebuilds the web automatically** (`build_web()`), once per run,
+before packaging any board — using a local `npm` if present, otherwise the
+`node:20-alpine` Docker image (so the host needs no Node). Skip it with
+`--no-web` when the web was already built (e.g. a separate CI step).
+
+```bash
+python tools/build_all.py --targets nanoc6            # rebuilds web + firmware
+python tools/build_all.py --targets nanoc6 --no-web   # embed existing spiffs/ as-is
+```
+
+Manual web build (e.g. Method B, or to preview the UI without flashing):
+
+```bash
+# Local Node
+npm --prefix web ci && npm --prefix web run build
+
+# Or via Docker (no local Node); shadow host node_modules to avoid OS-specific binaries
+docker run --rm -v "$PWD:/proj" -v /proj/web/node_modules -w /proj/web \
+  node:20-alpine sh -c "npm ci && npm run build"
+```
+
+> ⚠️ **The ESP-IDF container has no `npm`**, so a firmware-only build
+> (`idf.py build`, or `build_all.py --no-web`) embeds whatever `app.js` is already
+> in `spiffs/`. If you edit `web/src/**` and rebuild firmware *without* rebuilding
+> the web, you will flash a **stale UI**. `build_all.py` (without `--no-web`) does
+> this for you; a bare `idf.py build` does not.
+
+> Cache note: the server sends `Cache-Control: no-store` for HTML/JS/CSS, but a
+> phone that already loaded the old UI (especially a captive-portal WebView) may
+> still show it. After reflashing, hard-refresh or open `http://192.168.4.1` in a
+> private/incognito tab to bypass the cache.
+
+#### Build version stamp — **always bump on any `web/src/**` change**
+
+`WEB_VERSION` in [`web/src/app.jsx`](web/src/app.jsx) is rendered in a footer on
+every page (`JanOS Web v0001`). **Every time you change anything under
+`web/src/`, increment it by 1** (zero-padded 4 digits: `0001` → `0002` → …).
+This is the ground truth for "is the new UI actually on the device": if the
+footer shows an older number than the change you just flashed, you're looking at
+a **stale cached `app.js`**, not a code bug — clear the cache / use incognito.
+No exceptions: treat the bump as part of the web change itself.
+
 ---
 
 ## 4. Flashing
@@ -137,18 +310,29 @@ flash size/mode/freq and the four image offsets. It auto-installs `esptool` +
 
 ```bash
 cd binaries/sticks3
-python flash_board.py                 # auto-detect port
+python flash_board.py                 # auto-detect port; FULL ERASE + flash (default)
 python flash_board.py --port COM13
 python flash_board.py --baud 115200   # slower, more robust link
-python flash_board.py --erase         # full erase first
+python flash_board.py --no-erase      # skip erase (faster; same-board reflash only)
 python flash_board.py --monitor       # open serial monitor after flashing
 python flash_board.py --no-stub       # force the no-stub path (see below)
+python flash_board.py --stub          # force the faster RAM stub where supported
 ```
 
-**Automatic no-stub fallback:** some ESP32 modules (notably the **ESP32-PICO-D4**
-on Atom Lite) drop the esptool *stub* when the baud is bumped, failing with
-`The chip stopped responding`. The generated flasher detects a failed flash and
-automatically retries once with `--no-stub -b 115200` (slower but reliable).
+> **The flasher erases the whole chip by default.** A plain `write-flash` already
+> replaces every partition, but switching boards/flash sizes can leave stale data
+> at old offsets, so a full erase is the reliable default. For rapid same-board
+> iteration use `--no-erase` to skip it. (If a *reflashed* web UI still looks old,
+> that's browser cache, not the flash — check the `v####` footer and use
+> incognito; see §3 Web UI.)
+
+**Atom Lite slow path:** some ESP32 modules (notably the **ESP32-PICO-D4** on
+Atom Lite) drop the esptool *stub* when the baud is bumped, failing with
+`The chip stopped responding`. Atom Lite flashers therefore default to
+`--no-stub -b 115200`; because the ESP32 ROM loader does not support
+`erase-flash`, the flasher erases the full chip with `erase-region 0x0 <size>`
+on that path. Other boards still default to the faster stub path, with an
+automatic retry to `--no-stub -b 115200` if erase or write fails.
 
 ### Manual esptool (fallback)
 
@@ -162,7 +346,7 @@ python -m esptool --chip esp32s3 -p COM13 -b 460800 \
   0x3d0000 storage-sticks3.bin
 ```
 
-> Classic-ESP32 boards (`stickc-plus2`, `atom-lite`) place the bootloader at
+> Classic-ESP32 boards (`stickc-plus2`, `atom-lite`, `atom-lite-c25_21`) place the bootloader at
 > **0x1000**, not 0x0. The per-board flasher handles this automatically.
 
 ### Output layout
@@ -188,8 +372,9 @@ Boards with `JANOS_HAS_DISPLAY=y` show a 4-row UI:
   line, RX line count.
 
 The view switches automatically on Wi-Fi AP STA connect/disconnect events.
-Headless boards (`*-lite`, `xiao-c6`, `nanoc6`) confirm success via the serial
-log (`RX: ping` / `RX: pong` against the Monster).
+Headless boards (`*-lite`, `xiao-c6`, `nanoc6`, `atom-matrix`, `atoms3u`,
+`cardkb2`) confirm success via the serial log (`RX: ping` / `RX: pong` against
+the Monster).
 
 ### StickS3 power note
 
@@ -240,7 +425,7 @@ Checklist:
 | Log shows wrong UART pins, build warns *"Default value … mismatch … Using default value from sdkconfig"* | Stale `sdkconfig` keeps old per-board values; Kconfig defaults are ignored when the symbol already exists | Delete `sdkconfig` (and `sdkconfig.old`) before reconfiguring — `idf.py clean` does **not** remove it |
 | Display geometry wrong (e.g. `320x240` on a 135×240 board) | Built with the wrong `JANOS_BOARD_*` | Rebuild with the correct `sdkconfig.defaults.<board>`; confirm `CONFIG_JANOS_BOARD_*` in the generated `sdkconfig` |
 | Bootloop with `octal_psram: PSRAM chip is not connected` / `Failed to init external RAM` | `CONFIG_SPIRAM=y` on a no-PSRAM module (e.g. ESP32-S3**FN8** AtomS3/Lite) — leaked from a PSRAM board's config | No-PSRAM board defaults explicitly carry `# CONFIG_SPIRAM is not set`; `build_all.py` applies defaults via `-D` per board and verifies the generated `sdkconfig` afterwards. Rebuild via `build_all.py` and reflash |
-| `esptool ... The chip stopped responding` after *"Changing baud rate"* | ESP32-PICO-D4 stub drops at high baud | `python flash_board.py --baud 115200`, or rely on the auto no-stub fallback, or `--no-stub` manually. Try another USB cable/port |
+| `esptool ... The chip stopped responding` after *"Changing baud rate"* | ESP32-PICO-D4 stub drops at high baud | Rebuild/regenerate the flasher; Atom Lite now defaults to `--no-stub -b 115200`. For old flashers use `python flash_board.py --baud 115200 --no-stub`. Try another USB cable/port if it still drops |
 | StickS3: no 5 V on Grove | M5PM1 5V boost disabled by default | `power_sticks3.c` sets `PWR_CFG` bit3 at boot — ensure the board is built as `sticks3` |
 | StickS3: LCD dark after enabling Grove 5V | Enabling the boost dropped the L3B rail | `power_sticks3.c` forces M5PM1 GPIO2 (L3B) on, before `display_init()` |
 | `binaries/` lost custom files after a build | `build_all.py` wipes `binaries/` each run | Don't store hand-made files under `binaries/`; keep tooling in `tools/` |

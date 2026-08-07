@@ -6,9 +6,11 @@ import { showToast } from '../components/Toast';
 const MODULES = [
   { id: 'scan', title: 'Scan APs', note: 'WiFi scan', icon: 'wifi', path: '/scan', accent: 'blue' },
   { id: 'attacks', title: 'Attacks', note: 'Controls', icon: 'radar', path: '/global', accent: 'red' },
+  { id: 'detector', title: 'Detector', note: 'Deauth watch', icon: 'alert', path: '/detector', accent: 'red' },
   { id: 'subghz', title: 'SubGHZ', note: 'RF tools', icon: 'radio', path: '/subghz', accent: 'violet' },
   { id: 'observer', title: 'Observer', note: 'Telemetry', icon: 'eye', path: '/sniffer', accent: 'slate' },
   { id: 'wardrive', title: 'Wardrive', note: 'GPS logs', icon: 'map', path: '/wardrive', accent: 'yellow' },
+  { id: 'mesh', title: 'Mesh Recon', note: 'Zigbee/802.15.4', icon: 'mesh', path: '/mesh', accent: 'violet' },
   { id: 'bluetooth', title: 'Bluetooth', note: 'BT scan', icon: 'bt', path: '/bluetooth', accent: 'green' },
   { id: 'data', title: 'Data', note: 'Files', icon: 'disk', path: '/sddata', accent: 'cyan' },
 ];
@@ -98,6 +100,14 @@ function Glyph({ name }) {
         <path d="M5.5 5.5a9 9 0 0 0 0 13M18.5 5.5a9 9 0 0 1 0 13" />
       </svg>
     ),
+    mesh: (
+      <svg {...common}>
+        <circle cx="12" cy="5" r="2.2" />
+        <circle cx="5" cy="18" r="2.2" />
+        <circle cx="19" cy="18" r="2.2" />
+        <path d="M10.7 6.7 6.3 16.3M13.3 6.7 17.7 16.3M7.2 18h9.6" />
+      </svg>
+    ),
   };
 
   return icons[name] || icons.wifi;
@@ -111,6 +121,7 @@ function formatGps(st) {
 function operationLabel(status) {
   const labels = {
     idle: 'Chillin',
+    scan: 'AP Scan',
     scanning: 'AP Scan',
     deauth: 'Deauth',
     blackout: 'Blackout',
@@ -123,13 +134,28 @@ function operationLabel(status) {
     karma: 'Karma',
     portal: 'Portal',
     subghz: 'SubGHz',
+    subghz_listen: 'SubGHz Listen',
+    subghz_jam: 'SubGHz Jam',
+    wardrive: 'Wardrive',
+    wardrive_run: 'Wardrive',
+    antisurv: 'Anti-Surveillance',
+    antisurv_run: 'Anti-Surveillance',
+    zig_recon: 'Mesh Recon',
   };
-  return labels[status] || String(status || 'Chillin');
+  if (labels[status]) return labels[status];
+  if (!status) return 'Chillin';
+  /* Prettify any unmapped device-state string, e.g. "listing_wardrive"
+   * -> "Listing Wardrive", instead of leaking the raw token. */
+  return String(status).replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
 }
 
 function operationMeta(st) {
   if (st.status === 'idle') return 'Ready';
   if (st.status === 'scanning') return `${st.scanCount || st.networks.length || 0} APs discovered`;
+  if (st.status === 'wardrive' || st.status === 'wardrive_run') {
+    const s = st.wardrive && st.wardrive.stats;
+    return s ? `${s.nets} nets · ${s.bt} BT · ${Math.round(s.dist)} m` : 'Waiting for GPS fix';
+  }
   if (st.packetCount) return `${st.packetCount} packets captured`;
   return 'Operation running';
 }
@@ -163,10 +189,12 @@ export function Home() {
           <div class="operation-name">{operationLabel(st.status)}</div>
           <div class="operation-caption">{operationMeta(st)}</div>
         </div>
-        <button class="btn btn-danger operation-stop" onClick={stopOperation}>
-          <Glyph name="stop" />
-          Stop
-        </button>
+        {isBusy && (
+          <button class="btn btn-danger operation-stop" onClick={stopOperation}>
+            <Glyph name="stop" />
+            Stop
+          </button>
+        )}
       </section>
 
       <section class="glass-card card-body">

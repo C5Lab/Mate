@@ -112,6 +112,54 @@ typedef struct {
     uint32_t at_ms;           /* monotonic timestamp of last update */
 } nmap_state_t;
 
+/* ---------- Zigbee / 802.15.4 mesh recon (Mesh Recon tile) ----------
+ * The Monster emits key=value lines prefixed "[ZIG] status|pan|node|edge",
+ * each response burst terminated by "[ZIG] END". We upsert them into the caches
+ * below (keyed by pan id / addr / from-to) so the graph survives poll cycles
+ * and web reconnects. Mirrors Tab5's iot_recon_* data model. */
+typedef struct {
+    char id[16];          /* PAN id, e.g. "0x1A2B" */
+    char proto[24];       /* zigbee | thread | ieee802154 | ... */
+    char confidence[16];
+    char channels[48];    /* human list, e.g. "11,15,20" (from channel bitmask) */
+    int  nodes;
+    int  packets;
+    int  rssi;
+    int  age_ms;
+} zig_pan_t;
+
+typedef struct {
+    char pan[16];
+    char addr[24];        /* short "0x1234" or "EXT ...ABCD" */
+    char role[24];        /* coordinator | router | end_device | ... */
+    char vendor[32];
+    char device_hint[32];
+    int  packets;
+    int  rssi;
+    int  lqi;
+    int  last_channel;
+    int  age_ms;
+} zig_node_t;
+
+typedef struct {
+    char pan[16];
+    char from[24];
+    char to[24];
+    char kind[24];        /* parent-child | sibling | ... */
+    int  packets;
+    int  rssi;
+    int  age_ms;
+} zig_edge_t;
+
+typedef struct {
+    bool     active;
+    int      channel;
+    int      packets;
+    int      pans;
+    int      dropped;
+    uint32_t at_ms;
+} zig_status_t;
+
 typedef enum {
     STATE_IDLE = 0,
     STATE_SCANNING,
@@ -139,8 +187,12 @@ typedef enum {
     STATE_LISTING_SNIFFER,
     STATE_LISTING_HANDSHAKES,
     STATE_LISTING_WARDRIVE,
+    STATE_WARDRIVE_CONFIG,      /* reading get_wardrive_config [WDCFG] block */
+    STATE_WARDRIVE_BLACKLIST,   /* reading wardrive_blacklist list */
+    STATE_WARDRIVE_RUN,         /* start_wardrive_promisc[_trace] streaming */
+    STATE_ANTISURV_RUN,         /* start_antisurveillance streaming */
+    STATE_DEAUTH_DETECT,        /* deauth_detector streaming */
     STATE_WARDRIVE,
-    STATE_WARDRIVE_CONFIG,
     STATE_LISTING_WARDRIVE_FILES,
     STATE_WARDRIVE_UPLOAD,
     STATE_GPS_RAW,
@@ -151,6 +203,7 @@ typedef enum {
     STATE_SUBGHZ_LIST,
     STATE_SUBGHZ_IMPORT,
     STATE_SUBGHZ_EXPORT,
+    STATE_ZIG_RECON,            /* start_zig_recon streaming (Mesh Recon) */
 } cmd_state_t;
 
 /** Captured-password category (matches JanOS `show_pass [evil|portal]`). */
@@ -179,6 +232,7 @@ typedef struct {
 typedef struct {
     int   idx;
     char  type[16];
+    char  name[64];
     float freq;
     int   bits;
     char  serial[24];   /* KeeLoq/StarLine */
@@ -251,6 +305,11 @@ bool cmd_do_sniffer(void);
 /** Start sniffer using existing scan results (no fresh scan). */
 bool cmd_do_sniffer_noscan(void);
 
+/** Start the Network Observer: runs a scan, then auto-starts the sniffer
+ *  (start_sniffer_noscan) once results are in. The scan->sniffer handoff
+ *  happens in firmware so it survives the web client disconnecting mid-scan. */
+bool cmd_do_observer_start(void);
+
 /** Start Sniffer Dog (capture AP-STA pairs + targeted deauth). */
 bool cmd_do_sniffer_dog(void);
 
@@ -286,6 +345,17 @@ bool cmd_do_arp(void);
 /** Start ARP ban (poison) for a single host MAC, optionally with IP. */
 bool cmd_do_arp_ban(const char *mac, const char *ip);
 
+/** Mesh Recon (Zigbee/802.15.4): start capture (start_zig_recon all 250). */
+bool cmd_do_zig_recon_start(void);
+
+/** Mesh Recon: pull the latest snapshot from the Monster (sends the
+ *  zig_recon_status / zig_recon_list all / zig_recon_nodes all queries). The
+ *  [ZIG] response lines are parsed asynchronously into the caches below. */
+bool cmd_do_zig_recon_refresh(void);
+
+/** Mesh Recon: clear on-device + local caches (zig_recon_clear). */
+bool cmd_do_zig_recon_clear(void);
+
 /** Start a one-time Bluetooth LE device scan (`scan_bt`). Clears cache. */
 bool cmd_do_bt_scan(void);
 
@@ -307,6 +377,7 @@ bool cmd_do_wifi_disconnect(void);
 
 /** Stop all operations. */
 bool cmd_do_stop(void);
+bool cmd_do_subghz_stop(void);
 
 /** List HTML portal files from SD card. */
 bool cmd_do_list_portals(void);
@@ -328,6 +399,20 @@ bool cmd_do_sd_status(void);
 
 /** Request wardrive log files from SD card. */
 bool cmd_do_list_wardrive_logs(void);
+
+/* ---------- Serial console (UART line ring buffer, polled over HTTP) ----------
+ * The WebSocket drops frames in some environments, so raw UART telemetry is
+ * also kept in a ring the web can poll — same robustness pattern as the
+ * sniffer/wardrive/deauth caches. */
+#define SERIAL_LINE_LEN 128
+typedef struct {
+    uint32_t seq;
+    char     text[SERIAL_LINE_LEN];
+} serial_line_t;
+
+/** Snapshot UART lines newer than `since` (oldest first, up to `max`).
+ *  Returns the current sequence number; writes the count copied to *n_out. */
+uint32_t cmd_serial_snapshot(uint32_t since, serial_line_t *out, int max, int *n_out);
 
 /** Start a wardrive session. trace=true enables the KML track
  *  (`start_wardrive_promisc_trace`) vs. plain `start_wardrive_promisc`. */
@@ -413,6 +498,99 @@ const char *cmd_get_sta_ssid(void);
 int cmd_get_wardrive_logs(parsed_portal_file_t *out, int max);
 int cmd_get_wardrive_logs_count(void);
 
+/* ---------- Wardrive 2.0 config / control ---------- */
+
+/** Snapshot of the C5 wardrive config ([WDCFG] block from get_wardrive_config). */
+typedef struct {
+    bool valid;             /* a complete block has been parsed at least once */
+    char bands[32];         /* e.g. "wifi24,wifi5,ble" */
+    char channels[16];      /* "popular" | "all" | "custom" */
+    char custom[128];       /* e.g. "1:6:11:36" (channel list) */
+    int  wifi_delta;        /* re-log threshold dBm (0 = log once) */
+    int  ble_delta;
+    int  cooldown;          /* startup cooldown seconds */
+    int  mem_cap;           /* in-RAM entry cap */
+    char antisurv[8];       /* "low" | "med" | "high" */
+} wardrive_cfg_t;
+
+/** Fields to push to the C5 on Apply. Empty string / -1 means "leave unchanged". */
+typedef struct {
+    char bands[32];         /* "wifi24,wifi5,ble" ("" = skip) */
+    char channels[16];      /* "popular"|"all"|"custom" ("" = skip) */
+    char custom[128];       /* channel list for custom mode */
+    int  wifi_delta;        /* -1 = skip */
+    int  ble_delta;         /* -1 = skip */
+    int  cooldown;          /* -1 = skip */
+    int  mem_cap;           /* -1 = skip */
+    char antisurv[8];       /* "low"|"med"|"high" ("" = skip) */
+    char gps[16];           /* "m5"|"atgm"|"external"|"cap" ("" = skip) */
+} wardrive_apply_t;
+
+/** Request the current config block from the C5 (get_wardrive_config). */
+bool cmd_do_wardrive_config_load(void);
+
+/** Copy the cached config snapshot. `out->valid` reflects freshness. */
+void cmd_get_wardrive_cfg(wardrive_cfg_t *out);
+
+/** Apply a batch of config settings (fires set_wardrive_* / set_antisurv_* / gps_set). */
+bool cmd_do_wardrive_config_set(const wardrive_apply_t *a);
+
+/** Start promiscuous wardrive. trace=true adds KML (start_wardrive_promisc_trace). */
+bool cmd_do_wardrive_start(bool trace);
+
+/** Start anti-surveillance (follower detection). */
+bool cmd_do_antisurv_start(void);
+
+/** Request the MAC blacklist (wardrive_blacklist list). */
+bool cmd_do_wardrive_blacklist_load(void);
+
+/** Edit the MAC blacklist. action = "add" | "remove" | "clear"; mac ignored for clear. */
+bool cmd_do_wardrive_blacklist_edit(const char *action, const char *mac);
+
+/** Copy up to `max` cached blacklist MAC strings into `out` (18 bytes each). */
+int cmd_get_wardrive_blacklist(char (*out)[18], int max);
+int cmd_get_wardrive_blacklist_count(void);
+
+/** True once a blacklist listing has completed (distinguishes empty from unloaded). */
+bool cmd_get_wardrive_blacklist_valid(void);
+
+/** Live wardrive status, parsed from the C5 stream and cached so the web can
+ *  poll it over HTTP (robust to WebSocket drops during the CSV flood). */
+typedef struct {
+    bool  active;      /* a wardrive run is in progress */
+    bool  gps_valid;   /* GPS fix acquired */
+    int   nets;        /* unique WiFi networks */
+    int   bt;          /* BT devices */
+    int   relogs;
+    int   best_ch;     /* D-UCB best channel */
+    int   sats;        /* satellites */
+    float dist;        /* travelled metres */
+    char  file[24];    /* active log file, e.g. "w10.log" */
+} wardrive_status_t;
+
+/** Copy the cached live wardrive status. */
+void cmd_get_wardrive_status(wardrive_status_t *out);
+
+/* ---------- Deauth detector ---------- */
+
+/** One detected AP under deauth attack, aggregated by BSSID. */
+typedef struct {
+    char     bssid[18];
+    char     ap[33];
+    int      channel;
+    int      rssi;       /* most recent */
+    int      hits;       /* deauth frames seen for this AP */
+    uint32_t last_ms;    /* monotonic ms of last sighting */
+} deauth_event_t;
+
+/** Start the deauth detector (deauth_detector). Streams into a cache the web
+ *  polls over HTTP (robust to WebSocket drops). */
+bool cmd_do_deauth_detect_start(void);
+
+/** Copy up to `max` aggregated deauth events into `out`; returns count copied. */
+int cmd_get_deauth_events(deauth_event_t *out, int max);
+int cmd_get_deauth_events_count(void);
+
 /** Copy the cached wardrive config into `out`. Returns true if the config has
  *  been loaded at least once from JanOS (`get_wardrive_config`). */
 bool cmd_get_wardrive_config(wardrive_config_t *out);
@@ -465,6 +643,15 @@ uint32_t cmd_get_arp_hosts_at_ms(void);
 /** Get cached Nmap results. Returns count of hosts copied (capped at `max`). */
 int cmd_get_nmap_hosts(nmap_host_t *out, int max);
 int cmd_get_nmap_hosts_count(void);
+
+/** Mesh Recon caches. Each getter copies a snapshot under the module mutex. */
+int  cmd_get_zig_pans(zig_pan_t *out, int max);
+int  cmd_get_zig_pan_count(void);
+int  cmd_get_zig_nodes(zig_node_t *out, int max);
+int  cmd_get_zig_node_count(void);
+int  cmd_get_zig_edges(zig_edge_t *out, int max);
+int  cmd_get_zig_edge_count(void);
+void cmd_get_zig_status(zig_status_t *out);
 
 /** Snapshot the scan-level Nmap state (level, total hosts, currently-scanning IP,
  *  port progress, completion flag, last-update timestamp). */

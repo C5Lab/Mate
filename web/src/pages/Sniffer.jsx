@@ -7,7 +7,6 @@ import { showToast } from '../components/Toast';
 import { wsAddListener } from '../ws';
 
 const REFRESH_INTERVAL_MS = 4000;
-const RESULTS_POLL_MS = 2000;
 const SCAN_POLL_MS = 2000;
 const SCAN_TIMEOUT_MS = 60000;
 
@@ -120,7 +119,6 @@ export function Sniffer() {
   const [aps, setAps] = useState([]);
   const [probes, setProbes] = useState([]);
   const refreshTimerRef = useRef(null);
-  const resultsPollRef = useRef(null);
   const scanPollRef = useRef(null);
   const scanTimeoutRef = useRef(null);
   const refreshTickRef = useRef(0);
@@ -133,11 +131,9 @@ export function Sniffer() {
       try {
         const status = await api.status();
         if (status?.ok && status.state === 'sniffer') {
-          setRunning(true);
-          await loadSnifferResults();
-          await loadProbes();
-          startRefreshLoop();
-          startResultsPoll();
+          /* Observer already running on the device (e.g. we reconnected after
+           * launching it and leaving) — pick it straight back up. */
+          beginObserverMonitoring();
         } else {
           await loadSnifferResults();
           await loadProbes();
@@ -162,7 +158,10 @@ export function Sniffer() {
       }
 
       if (msg.type === 'attack_started' && msg.attack === 'sniffer') {
-        setRunning(true);
+        /* Fast path: the observer's firmware-driven scan just finished and the
+         * sniffer is live. Begin the results refresh loop (the status watch in
+         * start() is the reliable fallback if this WS frame is dropped). */
+        beginObserverMonitoring();
       }
 
       if (msg.type === 'attack_stopped') {
@@ -182,10 +181,6 @@ export function Sniffer() {
     if (refreshTimerRef.current) {
       clearInterval(refreshTimerRef.current);
       refreshTimerRef.current = null;
-    }
-    if (resultsPollRef.current) {
-      clearInterval(resultsPollRef.current);
-      resultsPollRef.current = null;
     }
     if (scanPollRef.current) {
       clearInterval(scanPollRef.current);
@@ -229,28 +224,21 @@ export function Sniffer() {
 
   async function tickRefresh() {
     /* Alternate between the two listing commands so JanOS never sees them
-       overlap (each listing locks state until its prompt completes). */
+       overlap (each listing locks state until its prompt completes).
+       Pull the fresh results ourselves ~700ms after asking JanOS to print
+       them, rather than depending solely on the `sniffer_results_updated`
+       WS frame (which can be dropped). This is what makes the Observed
+       Networks list update live instead of only on remount. */
     const tick = refreshTickRef.current++;
     try {
       if (tick % 2 === 0) {
         await api.refreshSniffer();
+        setTimeout(loadSnifferResults, 700);
       } else {
         await api.refreshProbes();
+        setTimeout(loadProbes, 700);
       }
     } catch (e) { /* ignore */ }
-  }
-
-  async function refreshAll() {
-    try { await api.refreshSniffer(); } catch (e) { /* ignore */ }
-    setTimeout(async () => {
-      try { await api.refreshProbes(); } catch (e) { /* ignore */ }
-      /* Pull the freshly-collected snapshot over GET so the button works even
-         when the WS push is lost under the packet-count flood. */
-      setTimeout(() => {
-        loadSnifferResults();
-        loadProbes();
-      }, 1200);
-    }, 1000);
   }
 
   function startRefreshLoop() {
@@ -259,36 +247,27 @@ export function Sniffer() {
     refreshTimerRef.current = setInterval(tickRefresh, REFRESH_INTERVAL_MS);
   }
 
-  /* Pull results over plain GET, independent of the WS push. The observer's
-     structured events (sniffer_results_updated / probes_updated) can be dropped
-     when the WS queue saturates under the sniffer packet-count flood, so we poll
-     the cached snapshot directly to keep the UI live without a full reload. */
-  function startResultsPoll() {
-    if (resultsPollRef.current) return;
-    resultsPollRef.current = setInterval(() => {
-      loadSnifferResults();
-      loadProbes();
-    }, RESULTS_POLL_MS);
-  }
-
-  async function startSnifferAfterScan() {
-    const res = await api.snifferNoscan();
-    if (!res.ok) {
-      showToast(res.error || 'Failed to start observer', 'error');
-      setIsScanning(false);
-      return;
+  /* The Monster is now sniffing (Mate fired start_sniffer_noscan after its
+   * scan). Stop the status watch and start polling results. Idempotent and
+   * safe to call from the WS attack_started fast-path, the status watch, or the
+   * initial mount detection; returns true only on the transition that actually
+   * begins monitoring so the caller can toast exactly once. */
+  function beginObserverMonitoring() {
+    if (refreshTimerRef.current) return false;
+    if (scanPollRef.current) {
+      clearInterval(scanPollRef.current);
+      scanPollRef.current = null;
     }
-
+    if (scanTimeoutRef.current) {
+      clearTimeout(scanTimeoutRef.current);
+      scanTimeoutRef.current = null;
+    }
     setRunning(true);
     setIsScanning(false);
-    setPacketCount(0);
-    setAps([]);
-    setProbes([]);
-    await loadSnifferResults();
-    await loadProbes();
+    loadSnifferResults();
+    loadProbes();
     startRefreshLoop();
-    startResultsPoll();
-    showToast('Network Observer started', 'success');
+    return true;
   }
 
   async function start() {
@@ -301,36 +280,33 @@ export function Sniffer() {
     setState({ networks: [], selected: new Set(), status: 'scanning' });
 
     try {
-      const res = await api.scan();
+      /* One request: Mate scans, then auto-starts the sniffer on its own (see
+       * cmd_do_observer_start). Unlike the old scan->poll->snifferNoscan dance
+       * that lived here, the launch now survives navigating away / disconnecting
+       * mid-scan — the observer starts on the Monster regardless of the web. */
+      const res = await api.observer();
       if (!res.ok) {
-        showToast(res.error || 'Scan failed', 'error');
+        showToast(res.error || 'Failed to start observer', 'error');
         setIsScanning(false);
         return;
       }
     } catch (e) {
-      showToast('Scan failed', 'error');
+      showToast('Failed to start observer', 'error');
       setIsScanning(false);
       return;
     }
 
+    /* Watch the device state until the firmware flips to 'sniffer', then begin
+     * monitoring. Display-only: if we disconnect here the observer is already
+     * launching on the Monster and the next mount picks it up. The WS
+     * attack_started frame is the fast path; this poll is the reliable one. */
     scanPollRef.current = setInterval(async () => {
       try {
-        const data = await api.scanResults();
-        if (!data.ok) return;
-
-        setState({ networks: data.networks || [], selected: new Set() });
-
-        if (data.complete) {
-          if (scanPollRef.current) {
-            clearInterval(scanPollRef.current);
-            scanPollRef.current = null;
+        const s = await api.status();
+        if (s?.ok && s.state === 'sniffer') {
+          if (beginObserverMonitoring()) {
+            showToast('Network Observer started', 'success');
           }
-          if (scanTimeoutRef.current) {
-            clearTimeout(scanTimeoutRef.current);
-            scanTimeoutRef.current = null;
-          }
-          showToast(`Scan complete: ${data.count} networks`, 'success');
-          await startSnifferAfterScan();
         }
       } catch (e) {
         /* ignore poll error */
@@ -340,7 +316,7 @@ export function Sniffer() {
     scanTimeoutRef.current = setTimeout(() => {
       stopAllTimers();
       setIsScanning(false);
-      showToast('Scan timed out', 'warning');
+      showToast('Observer start timed out', 'warning');
     }, SCAN_TIMEOUT_MS);
   }
 
@@ -385,16 +361,14 @@ export function Sniffer() {
           <button class="btn btn-success" onClick={start} disabled={running || isScanning}>
             {isScanning ? <><span class="spinner" /> Scanning...</> : 'Start Observer'}
           </button>
-          <button class="btn btn-secondary" onClick={refreshAll} disabled={!running}>
-            Refresh
-          </button>
           <button class="btn btn-danger" onClick={stop} disabled={!running && !isScanning}>
             Stop
           </button>
         </div>
 
         <div class="section-note">
-          Start runs one scan, then launches sniffer (noscan) and refreshes clients + probes every 4s.
+          Start tells the Monster to scan then launch the sniffer itself (keeps
+          running if you disconnect); clients + probes refresh every 4s.
         </div>
       </section>
 

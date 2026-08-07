@@ -15,7 +15,7 @@
 
 static const char *TAG = "janos_wc";
 
-#define JANOS_WC_VERSION "0.1.0"
+#define JANOS_WC_VERSION "1.0.0"
 
 void app_main(void)
 {
@@ -73,7 +73,7 @@ void app_main(void)
     /* HTTP server + WebSocket + SPIFFS */
     ESP_ERROR_CHECK(web_server_start());
 
-    /* Send ping to Monster to verify connection */
+    /* Send ping to Monster to verify connection (fast one-shot check) */
     vTaskDelay(pdMS_TO_TICKS(500));
     uart_bridge_send("ping");
 

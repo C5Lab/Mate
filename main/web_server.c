@@ -291,11 +291,15 @@ static esp_err_t serve_spiffs_file(httpd_req_t *req, const char *filepath)
         httpd_resp_set_type(req, get_content_type(fullpath));
     }
 
-    /* Cache only binary assets; never cache JS/CSS which can become stale */
+    /* Cache only binary assets; JS/CSS/HTML must never be cached. Use
+     * "no-store" (not just "no-cache"): captive-portal WebViews and some
+     * mobile browsers keep serving a stale app.js under "no-cache" because we
+     * emit no ETag/Last-Modified to revalidate against. no-store forbids
+     * caching outright, so a reflash always shows the new UI. */
     if (strstr(fullpath, ".png") || strstr(fullpath, ".ico") || strstr(fullpath, ".svg")) {
         httpd_resp_set_hdr(req, "Cache-Control", "public, max-age=86400");
     } else {
-        httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+        httpd_resp_set_hdr(req, "Cache-Control", "no-store, must-revalidate");
     }
 
     FILE *f = fopen(fullpath, "r");
@@ -476,6 +480,7 @@ static esp_err_t api_attack_post(httpd_req_t *req)
     else if (strstr(uri, "/eviltwin"))   ok = cmd_do_evil_twin();
     else if (strstr(uri, "/sae"))        ok = cmd_do_sae();
     else if (strstr(uri, "/handshake"))  ok = cmd_do_handshake();
+    else if (strstr(uri, "/observer"))   ok = cmd_do_observer_start();
     else if (strstr(uri, "/sniffer_noscan")) ok = cmd_do_sniffer_noscan();
     else if (strstr(uri, "/sniffer_dog")) ok = cmd_do_sniffer_dog();
     else if (strstr(uri, "/sniffer"))    ok = cmd_do_sniffer();
@@ -1010,6 +1015,87 @@ static esp_err_t api_nmap_results_get(httpd_req_t *req)
     return cw_finish(&cw);
 }
 
+/* ---------- Mesh Recon (Zigbee) ---------- */
+
+static esp_err_t api_zigbee_start_post(httpd_req_t *req)
+{
+    send_json(req, cmd_do_zig_recon_start()
+        ? "{\"ok\":true}" : "{\"ok\":false,\"error\":\"busy\"}");
+    return ESP_OK;
+}
+
+static esp_err_t api_zigbee_refresh_post(httpd_req_t *req)
+{
+    send_json(req, cmd_do_zig_recon_refresh()
+        ? "{\"ok\":true}" : "{\"ok\":false,\"error\":\"not running\"}");
+    return ESP_OK;
+}
+
+static esp_err_t api_zigbee_clear_post(httpd_req_t *req)
+{
+    cmd_do_zig_recon_clear();
+    send_json(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
+static esp_err_t api_zigbee_results_get(httpd_req_t *req)
+{
+    zig_status_t st;
+    cmd_get_zig_status(&st);
+
+    int np = cmd_get_zig_pan_count();
+    int nn = cmd_get_zig_node_count();
+    int ne = cmd_get_zig_edge_count();
+    zig_pan_t  *pans  = NULL;
+    zig_node_t *nodes = NULL;
+    zig_edge_t *edges = NULL;
+    if (np > 0) { pans  = psram_malloc((size_t)np * sizeof(*pans));  np = pans  ? cmd_get_zig_pans(pans, np)   : 0; }
+    if (nn > 0) { nodes = psram_malloc((size_t)nn * sizeof(*nodes)); nn = nodes ? cmd_get_zig_nodes(nodes, nn) : 0; }
+    if (ne > 0) { edges = psram_malloc((size_t)ne * sizeof(*edges)); ne = edges ? cmd_get_zig_edges(edges, ne) : 0; }
+
+    chunked_writer_t cw;
+    cw_init(&cw, req);
+    cw_printf(&cw,
+        "{\"ok\":true,\"running\":%s,\"active\":%s,\"channel\":%d,\"packets\":%d,"
+        "\"pans_seen\":%d,\"dropped\":%d,\"at\":%u,\"pans\":[",
+        cmd_get_state() == STATE_ZIG_RECON ? "true" : "false",
+        st.active ? "true" : "false", st.channel, st.packets,
+        st.pans, st.dropped, (unsigned)st.at_ms);
+    for (int i = 0; i < np; i++) {
+        cw_printf(&cw,
+            "%s{\"id\":\"%s\",\"proto\":\"%s\",\"confidence\":\"%s\","
+            "\"channels\":\"%s\",\"nodes\":%d,\"packets\":%d,\"rssi\":%d,\"age_ms\":%d}",
+            i > 0 ? "," : "",
+            pans[i].id, pans[i].proto, pans[i].confidence, pans[i].channels,
+            pans[i].nodes, pans[i].packets, pans[i].rssi, pans[i].age_ms);
+    }
+    cw_printf(&cw, "],\"nodes\":[");
+    for (int i = 0; i < nn; i++) {
+        cw_printf(&cw,
+            "%s{\"pan\":\"%s\",\"addr\":\"%s\",\"role\":\"%s\",\"vendor\":\"%s\","
+            "\"device_hint\":\"%s\",\"packets\":%d,\"rssi\":%d,\"lqi\":%d,"
+            "\"last_channel\":%d,\"age_ms\":%d}",
+            i > 0 ? "," : "",
+            nodes[i].pan, nodes[i].addr, nodes[i].role, nodes[i].vendor,
+            nodes[i].device_hint, nodes[i].packets, nodes[i].rssi, nodes[i].lqi,
+            nodes[i].last_channel, nodes[i].age_ms);
+    }
+    cw_printf(&cw, "],\"edges\":[");
+    for (int i = 0; i < ne; i++) {
+        cw_printf(&cw,
+            "%s{\"pan\":\"%s\",\"from\":\"%s\",\"to\":\"%s\",\"kind\":\"%s\","
+            "\"packets\":%d,\"rssi\":%d,\"age_ms\":%d}",
+            i > 0 ? "," : "",
+            edges[i].pan, edges[i].from, edges[i].to, edges[i].kind,
+            edges[i].packets, edges[i].rssi, edges[i].age_ms);
+    }
+    cw_printf(&cw, "]}");
+    free(pans);
+    free(nodes);
+    free(edges);
+    return cw_finish(&cw);
+}
+
 static esp_err_t api_status_get(httpd_req_t *req)
 {
     const char *sta_ssid = cmd_get_sta_ssid();
@@ -1177,6 +1263,277 @@ static esp_err_t api_handshakes_get(httpd_req_t *req)
     return ESP_OK;
 }
 
+/* ---------- Wardrive 2.0 handlers ---------- */
+
+static bool json_get_string(const char *json, const char *key, char *out, int out_len);
+static bool json_get_int(const char *json, const char *key, int *out);
+static bool json_get_bool(const char *json, const char *key, bool *out);
+
+/* GET /api/wardrive/config
+ * Returns the cached [WDCFG] snapshot. If none is cached yet (or it was
+ * invalidated by a prior Apply) and the device is idle, triggers a fresh
+ * load and reports {status:"loading"} so the client polls again. */
+static esp_err_t api_wardrive_config_get(httpd_req_t *req)
+{
+    cmd_state_t state = cmd_get_state();
+
+    if (state == STATE_WARDRIVE_CONFIG) {
+        send_json(req, "{\"ok\":true,\"status\":\"loading\"}");
+        return ESP_OK;
+    }
+
+    wardrive_cfg_t cfg;
+    cmd_get_wardrive_cfg(&cfg);
+    if (cfg.valid) {
+        char buf[400];
+        snprintf(buf, sizeof(buf),
+            "{\"ok\":true,\"config\":{\"bands\":\"%s\",\"channels\":\"%s\","
+            "\"custom\":\"%s\",\"wifi_delta\":%d,\"ble_delta\":%d,"
+            "\"cooldown\":%d,\"mem_cap\":%d,\"antisurv\":\"%s\"}}",
+            cfg.bands, cfg.channels, cfg.custom, cfg.wifi_delta,
+            cfg.ble_delta, cfg.cooldown, cfg.mem_cap, cfg.antisurv);
+        send_json(req, buf);
+        return ESP_OK;
+    }
+
+    if (state != STATE_IDLE) {
+        httpd_resp_set_status(req, "409 Conflict");
+        send_json(req, "{\"ok\":false,\"error\":\"busy\"}");
+        return ESP_OK;
+    }
+
+    if (cmd_do_wardrive_config_load()) {
+        send_json(req, "{\"ok\":true,\"status\":\"loading\"}");
+    } else {
+        httpd_resp_set_status(req, "409 Conflict");
+        send_json(req, "{\"ok\":false,\"error\":\"busy\"}");
+    }
+    return ESP_OK;
+}
+
+/* POST /api/wardrive/config  -> apply settings (all fields optional) */
+static esp_err_t api_wardrive_config_post(httpd_req_t *req)
+{
+    char body[320] = {0};
+    if (req->content_len > 0) {
+        int received = httpd_req_recv(req, body, sizeof(body) - 1);
+        if (received < 0) body[0] = '\0';
+    }
+
+    wardrive_apply_t a;
+    memset(&a, 0, sizeof(a));
+    a.wifi_delta = a.ble_delta = a.cooldown = a.mem_cap = -1;
+
+    json_get_string(body, "\"bands\"",    a.bands,    sizeof(a.bands));
+    json_get_string(body, "\"channels\"", a.channels, sizeof(a.channels));
+    json_get_string(body, "\"custom\"",   a.custom,   sizeof(a.custom));
+    json_get_string(body, "\"antisurv\"", a.antisurv, sizeof(a.antisurv));
+    json_get_string(body, "\"gps\"",      a.gps,      sizeof(a.gps));
+    json_get_int(body, "\"wifi_delta\"", &a.wifi_delta);
+    json_get_int(body, "\"ble_delta\"",  &a.ble_delta);
+    json_get_int(body, "\"cooldown\"",   &a.cooldown);
+    json_get_int(body, "\"mem_cap\"",    &a.mem_cap);
+
+    if (cmd_do_wardrive_config_set(&a)) {
+        send_json(req, "{\"ok\":true}");
+    } else {
+        httpd_resp_set_status(req, "409 Conflict");
+        send_json(req, "{\"ok\":false,\"error\":\"busy\"}");
+    }
+    return ESP_OK;
+}
+
+/* GET /api/wardrive/status -> live status polled by the Wardrive page (robust
+ * to WebSocket drops during the CSV flood). */
+static esp_err_t api_wardrive_status_get(httpd_req_t *req)
+{
+    wardrive_status_t s;
+    cmd_get_wardrive_status(&s);
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+        "{\"ok\":true,\"active\":%s,\"gps_valid\":%s,\"nets\":%d,\"bt\":%d,"
+        "\"relogs\":%d,\"best_ch\":%d,\"sats\":%d,\"dist\":%.1f,\"file\":\"%s\"}",
+        s.active ? "true" : "false", s.gps_valid ? "true" : "false",
+        s.nets, s.bt, s.relogs, s.best_ch, s.sats, s.dist, s.file);
+    send_json(req, buf);
+    return ESP_OK;
+}
+
+/* POST /api/wardrive/start  -> body {trace:bool} */
+static esp_err_t api_wardrive_start_post(httpd_req_t *req)
+{
+    char body[64] = {0};
+    if (req->content_len > 0) {
+        int received = httpd_req_recv(req, body, sizeof(body) - 1);
+        if (received < 0) body[0] = '\0';
+    }
+    bool trace = false;
+    json_get_bool(body, "\"trace\"", &trace);
+
+    if (cmd_do_wardrive_start(trace)) {
+        send_json(req, "{\"ok\":true}");
+    } else {
+        httpd_resp_set_status(req, "409 Conflict");
+        send_json(req, "{\"ok\":false,\"error\":\"busy\"}");
+    }
+    return ESP_OK;
+}
+
+/* POST /api/wardrive/antisurv  -> start anti-surveillance */
+static esp_err_t api_wardrive_antisurv_post(httpd_req_t *req)
+{
+    if (cmd_do_antisurv_start()) {
+        send_json(req, "{\"ok\":true}");
+    } else {
+        httpd_resp_set_status(req, "409 Conflict");
+        send_json(req, "{\"ok\":false,\"error\":\"busy\"}");
+    }
+    return ESP_OK;
+}
+
+/* GET /api/wardrive/blacklist -> cached MAC list (loads on demand) */
+static esp_err_t api_wardrive_blacklist_get(httpd_req_t *req)
+{
+    cmd_state_t state = cmd_get_state();
+
+    if (cmd_get_wardrive_blacklist_valid()) {
+        int n = cmd_get_wardrive_blacklist_count();
+        chunked_writer_t cw;
+        cw_init(&cw, req);
+        cw_printf(&cw, "{\"ok\":true,\"macs\":[");
+        if (n > 0) {
+            char (*macs)[18] = psram_malloc((size_t)n * sizeof(*macs));
+            if (!macs) { send_json(req, "{\"ok\":false,\"error\":\"oom\"}"); return ESP_OK; }
+            n = cmd_get_wardrive_blacklist(macs, n);
+            for (int i = 0; i < n; i++)
+                cw_printf(&cw, "%s\"%s\"", i > 0 ? "," : "", macs[i]);
+            free(macs);
+        }
+        cw_printf(&cw, "]}");
+        return cw_finish(&cw);
+    }
+
+    if (state == STATE_WARDRIVE_BLACKLIST) {
+        send_json(req, "{\"ok\":true,\"status\":\"loading\"}");
+        return ESP_OK;
+    }
+    if (state != STATE_IDLE) {
+        httpd_resp_set_status(req, "409 Conflict");
+        send_json(req, "{\"ok\":false,\"error\":\"busy\"}");
+        return ESP_OK;
+    }
+    if (cmd_do_wardrive_blacklist_load()) {
+        send_json(req, "{\"ok\":true,\"status\":\"loading\"}");
+    } else {
+        httpd_resp_set_status(req, "409 Conflict");
+        send_json(req, "{\"ok\":false,\"error\":\"busy\"}");
+    }
+    return ESP_OK;
+}
+
+/* POST /api/wardrive/blacklist -> body {action:"add|remove|clear", mac:"..."} */
+static esp_err_t api_wardrive_blacklist_post(httpd_req_t *req)
+{
+    char body[96] = {0};
+    if (req->content_len > 0) {
+        int received = httpd_req_recv(req, body, sizeof(body) - 1);
+        if (received < 0) body[0] = '\0';
+    }
+    char action[12] = {0};
+    char mac[20] = {0};
+    json_get_string(body, "\"action\"", action, sizeof(action));
+    json_get_string(body, "\"mac\"", mac, sizeof(mac));
+
+    if (cmd_do_wardrive_blacklist_edit(action, mac)) {
+        send_json(req, "{\"ok\":true}");
+    } else {
+        httpd_resp_set_status(req, "409 Conflict");
+        send_json(req, "{\"ok\":false,\"error\":\"busy or bad params\"}");
+    }
+    return ESP_OK;
+}
+
+/* GET /api/serial?since=N -> raw UART lines newer than N (polled console).
+ * Reliable transport for the serial view; the WS can drop frames. */
+static esp_err_t api_serial_get(httpd_req_t *req)
+{
+    uint32_t since = 0;
+    char q[48];
+    if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK) {
+        char val[24];
+        if (httpd_query_key_value(q, "since", val, sizeof(val)) == ESP_OK) {
+            since = (uint32_t)strtoul(val, NULL, 10);
+        }
+    }
+
+    static serial_line_t lines[100];
+    int n = 0;
+    uint32_t seq = cmd_serial_snapshot(since, lines, (int)(sizeof(lines) / sizeof(lines[0])), &n);
+
+    chunked_writer_t cw;
+    cw_init(&cw, req);
+    cw_printf(&cw, "{\"ok\":true,\"seq\":%u,\"lines\":[", (unsigned)seq);
+    for (int i = 0; i < n; i++) {
+        /* Escape the line for JSON (quotes/backslashes). */
+        cw_printf(&cw, "%s\"", i > 0 ? "," : "");
+        const char *p = lines[i].text;
+        char esc[SERIAL_LINE_LEN * 2];
+        int j = 0;
+        for (int k = 0; p[k] && j < (int)sizeof(esc) - 2; k++) {
+            char c = p[k];
+            if (c == '"' || c == '\\') esc[j++] = '\\';
+            if ((unsigned char)c < 0x20) c = ' ';
+            esc[j++] = c;
+        }
+        esc[j] = '\0';
+        cw_printf(&cw, "%s\"", esc);
+    }
+    cw_printf(&cw, "]}");
+    return cw_finish(&cw);
+}
+
+/* ---------- Deauth detector handlers ---------- */
+
+/* POST /api/deauth/detect -> start the deauth detector */
+static esp_err_t api_deauth_detect_post(httpd_req_t *req)
+{
+    if (cmd_do_deauth_detect_start()) {
+        send_json(req, "{\"ok\":true}");
+    } else {
+        httpd_resp_set_status(req, "409 Conflict");
+        send_json(req, "{\"ok\":false,\"error\":\"busy\"}");
+    }
+    return ESP_OK;
+}
+
+/* GET /api/deauth/detected -> aggregated events, polled by the page */
+static esp_err_t api_deauth_detected_get(httpd_req_t *req)
+{
+    bool active = (cmd_get_state() == STATE_DEAUTH_DETECT);
+    int n = cmd_get_deauth_events_count();
+
+    chunked_writer_t cw;
+    cw_init(&cw, req);
+    cw_printf(&cw, "{\"ok\":true,\"active\":%s,\"events\":[",
+              active ? "true" : "false");
+    if (n > 0) {
+        deauth_event_t *ev = psram_malloc((size_t)n * sizeof(*ev));
+        if (!ev) { send_json(req, "{\"ok\":false,\"error\":\"oom\"}"); return ESP_OK; }
+        n = cmd_get_deauth_events(ev, n);
+        uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+        for (int i = 0; i < n; i++) {
+            cw_printf(&cw,
+                "%s{\"bssid\":\"%s\",\"ap\":\"%s\",\"ch\":%d,\"rssi\":%d,"
+                "\"hits\":%d,\"age_ms\":%u}",
+                i > 0 ? "," : "", ev[i].bssid, ev[i].ap, ev[i].channel,
+                ev[i].rssi, ev[i].hits, (unsigned)(now - ev[i].last_ms));
+        }
+        free(ev);
+    }
+    cw_printf(&cw, "]}");
+    return cw_finish(&cw);
+}
+
 /* ---------- Sub-GHz handlers ---------- */
 
 static bool json_get_float(const char *json, const char *key, float *out)
@@ -1228,7 +1585,10 @@ static esp_err_t api_subghz_post(httpd_req_t *req)
 
     bool ok = false;
 
-    if (strstr(uri, "/listen")) {
+    if (strstr(uri, "/stop")) {
+        ok = cmd_do_subghz_stop();
+    }
+    else if (strstr(uri, "/listen")) {
         float freq = 433.92f;
         bool raw = false;
         json_get_float(body, "\"freq\"", &freq);
@@ -1282,136 +1642,6 @@ static esp_err_t api_subghz_post(httpd_req_t *req)
     } else {
         httpd_resp_set_status(req, "409 Conflict");
         send_json(req, "{\"ok\":false,\"error\":\"busy or bad params\"}");
-    }
-    return ESP_OK;
-}
-
-static esp_err_t api_wardrive_start_post(httpd_req_t *req)
-{
-    char body[64] = {0};
-    if (req->content_len > 0) {
-        int received = httpd_req_recv(req, body, sizeof(body) - 1);
-        if (received < 0) body[0] = '\0';
-    }
-    bool trace = false;
-    json_get_bool(body, "\"trace\"", &trace);
-
-    if (cmd_do_start_wardrive(trace)) {
-        send_json(req, "{\"ok\":true,\"status\":\"wardrive\"}");
-    } else {
-        httpd_resp_set_status(req, "409 Conflict");
-        send_json(req, "{\"ok\":false,\"error\":\"busy\"}");
-    }
-    return ESP_OK;
-}
-
-static const char *wardrive_channel_mode_str(wardrive_channel_mode_t m)
-{
-    return m == WARDRIVE_CH_POPULAR ? "popular" :
-           m == WARDRIVE_CH_CUSTOM  ? "custom"  : "all";
-}
-
-static const char *wardrive_antisurv_str(wardrive_antisurv_sens_t s)
-{
-    return s == WARDRIVE_ANTISURV_LOW  ? "low"  :
-           s == WARDRIVE_ANTISURV_HIGH ? "high" : "med";
-}
-
-static esp_err_t api_wardrive_config_get(httpd_req_t *req)
-{
-    wardrive_config_t cfg;
-    bool loaded = cmd_get_wardrive_config(&cfg);
-    cmd_state_t state = cmd_get_state();
-
-    if (!loaded) {
-        /* Kick off the query if idle; otherwise tell the client to keep polling. */
-        if (state == STATE_IDLE) {
-            cmd_do_get_wardrive_config();
-        }
-        send_json(req, "{\"ok\":true,\"status\":\"loading\"}");
-        return ESP_OK;
-    }
-
-    char bands[40] = "";
-    if (cfg.bands & WARDRIVE_BAND_WIFI24) strcat(bands, "wifi24,");
-    if (cfg.bands & WARDRIVE_BAND_WIFI5)  strcat(bands, "wifi5,");
-    if (cfg.bands & WARDRIVE_BAND_BLE)    strcat(bands, "ble,");
-    size_t bl = strlen(bands);
-    if (bl && bands[bl - 1] == ',') bands[bl - 1] = '\0';
-
-    char buf[384];
-    snprintf(buf, sizeof(buf),
-        "{\"ok\":true,\"config\":{"
-        "\"bands\":\"%s\",\"channels\":\"%s\",\"custom_channels\":\"%s\","
-        "\"wifi_rssi_delta\":%d,\"ble_rssi_delta\":%d,\"startup_cooldown\":%d,"
-        "\"mem_cap\":%d,\"antisurv\":\"%s\",\"gps_module\":\"%s\"}}",
-        bands,
-        wardrive_channel_mode_str(cfg.channel_mode),
-        cfg.custom_channels,
-        cfg.wifi_rssi_delta, cfg.ble_rssi_delta, cfg.startup_cooldown,
-        cfg.mem_cap, wardrive_antisurv_str(cfg.antisurv_sensitivity),
-        cfg.gps_module);
-    send_json(req, buf);
-    return ESP_OK;
-}
-
-static esp_err_t api_wardrive_config_post(httpd_req_t *req)
-{
-    char body[384] = {0};
-    if (req->content_len > 0) {
-        int received = httpd_req_recv(req, body, sizeof(body) - 1);
-        if (received < 0) body[0] = '\0';
-    }
-
-    /* Seed from the cached config so unspecified fields keep their value. */
-    wardrive_config_t cfg;
-    if (!cmd_get_wardrive_config(&cfg)) {
-        memset(&cfg, 0, sizeof(cfg));
-        cfg.bands = WARDRIVE_BAND_WIFI24 | WARDRIVE_BAND_WIFI5 | WARDRIVE_BAND_BLE;
-        cfg.channel_mode = WARDRIVE_CH_ALL;
-        cfg.wifi_rssi_delta = 5;
-        cfg.ble_rssi_delta = 15;
-        cfg.startup_cooldown = 0;
-        cfg.mem_cap = 40000;
-        cfg.antisurv_sensitivity = WARDRIVE_ANTISURV_MED;
-    }
-
-    char bands[48] = {0};
-    if (json_get_string(body, "\"bands\"", bands, sizeof(bands))) {
-        cfg.bands = 0;
-        if (strstr(bands, "wifi24")) cfg.bands |= WARDRIVE_BAND_WIFI24;
-        if (strstr(bands, "wifi5"))  cfg.bands |= WARDRIVE_BAND_WIFI5;
-        if (strstr(bands, "ble"))    cfg.bands |= WARDRIVE_BAND_BLE;
-    }
-
-    char channels[16] = {0};
-    if (json_get_string(body, "\"channels\"", channels, sizeof(channels))) {
-        if (strncmp(channels, "popular", 7) == 0) cfg.channel_mode = WARDRIVE_CH_POPULAR;
-        else if (strncmp(channels, "custom", 6) == 0) cfg.channel_mode = WARDRIVE_CH_CUSTOM;
-        else cfg.channel_mode = WARDRIVE_CH_ALL;
-    }
-    json_get_string(body, "\"custom_channels\"", cfg.custom_channels, sizeof(cfg.custom_channels));
-
-    json_get_int(body, "\"wifi_rssi_delta\"", &cfg.wifi_rssi_delta);
-    json_get_int(body, "\"ble_rssi_delta\"", &cfg.ble_rssi_delta);
-    json_get_int(body, "\"startup_cooldown\"", &cfg.startup_cooldown);
-    json_get_int(body, "\"mem_cap\"", &cfg.mem_cap);
-
-    char antisurv[8] = {0};
-    if (json_get_string(body, "\"antisurv\"", antisurv, sizeof(antisurv))) {
-        if (strncmp(antisurv, "low", 3) == 0) cfg.antisurv_sensitivity = WARDRIVE_ANTISURV_LOW;
-        else if (strncmp(antisurv, "high", 4) == 0) cfg.antisurv_sensitivity = WARDRIVE_ANTISURV_HIGH;
-        else cfg.antisurv_sensitivity = WARDRIVE_ANTISURV_MED;
-    }
-
-    bool apply_gps = json_get_string(body, "\"gps_module\"", cfg.gps_module,
-                                     sizeof(cfg.gps_module)) && cfg.gps_module[0];
-
-    if (cmd_do_set_wardrive_config(&cfg, apply_gps)) {
-        send_json(req, "{\"ok\":true}");
-    } else {
-        httpd_resp_set_status(req, "409 Conflict");
-        send_json(req, "{\"ok\":false,\"error\":\"busy or no band selected\"}");
     }
     return ESP_OK;
 }
@@ -1564,40 +1794,6 @@ static esp_err_t api_gps_raw_status_get(httpd_req_t *req)
     return cw_finish(&cw);
 }
 
-/* Live wardrive session status + recently-seen networks (HTTP-poll fallback
- * for the WS wardrive_status + raw CSV rows). */
-static esp_err_t api_wardrive_status_get(httpd_req_t *req)
-{
-    bool running = cmd_wardrive_running();
-    int sats = 0, unique = 0, relogs = 0;
-    float dist = 0.0f;
-    cmd_get_wardrive_live(&sats, &dist, &unique, &relogs);
-
-    wardrive_net_t *nets = psram_malloc((size_t)WARDRIVE_NET_RING_MAX * sizeof(*nets));
-    int n = nets ? cmd_get_wardrive_nets(nets, WARDRIVE_NET_RING_MAX) : 0;
-
-    chunked_writer_t cw;
-    cw_init(&cw, req);
-    cw_printf(&cw,
-        "{\"ok\":true,\"running\":%s,\"sats\":%d,\"dist\":%.2f,"
-        "\"unique\":%d,\"relogs\":%d,\"networks\":[",
-        running ? "true" : "false", sats, dist, unique, relogs);
-    char essid[WARDRIVE_NET_SSID_MAX * 2];
-    char esec[WARDRIVE_NET_SEC_MAX * 2];
-    for (int i = 0; i < n; i++) {
-        json_escape(essid, sizeof(essid), nets[i].ssid);
-        json_escape(esec, sizeof(esec), nets[i].sec);
-        cw_printf(&cw,
-            "%s{\"mac\":\"%s\",\"ssid\":\"%s\",\"sec\":\"%s\",\"ch\":%d,"
-            "\"rssi\":%d,\"lat\":%.6f,\"lon\":%.6f}",
-            i > 0 ? "," : "", nets[i].mac, essid, esec,
-            nets[i].ch, nets[i].rssi, nets[i].lat, nets[i].lon);
-    }
-    cw_printf(&cw, "]}");
-    free(nets);
-    return cw_finish(&cw);
-}
-
 static esp_err_t api_subghz_list_get(httpd_req_t *req)
 {
     /* Stream the response in 1 KB chunks instead of preallocating a single
@@ -1627,14 +1823,18 @@ static esp_err_t api_subghz_list_get(httpd_req_t *req)
     cw_printf(&cw, "{\"ok\":true,\"count\":%d,\"signals\":[", count);
     for (int i = 0; i < count; i++) {
         const subghz_signal_t *s = &sigs[i];
+        char name_esc[sizeof(s->name) * 2];
+        json_escape(name_esc, sizeof(name_esc), s->name);
         cw_printf(&cw,
             "%s{\"idx\":%d,\"type\":\"%s\",\"freq\":%.2f,\"bits\":%d,"
             "\"serial\":\"%s\",\"btn\":%d,\"cnt\":%d,\"mf\":\"%s\","
+            "\"name\":\"%s\","
             "\"id\":\"%s\",\"te\":%d,\"proto\":%d,"
             "\"is_raw\":%s,\"edges\":%d}",
             i > 0 ? "," : "",
             s->idx, s->type, s->freq, s->bits,
             s->serial, s->btn, s->cnt, s->mf,
+            name_esc,
             s->id_str, s->te, s->proto,
             s->is_raw ? "true" : "false", s->edges);
     }
@@ -1738,7 +1938,12 @@ esp_err_t web_server_start(void)
      * (classic stack-smash signature). 8 KB gives the SPI/LCD path
      * comfortable headroom. */
     config.stack_size       = 8192;
-    config.max_uri_handlers = 44;
+    config.max_uri_handlers = 64;   /* generous headroom for every REGISTER_URI
+                                     * entry (wifi/bt/wardrive/gps/zigbee/subghz);
+                                     * the last-registered wildcard SPA route must
+                                     * never be dropped -> "Nothing matches the
+                                     * given URI" 404 on every page. Bump this
+                                     * whenever you add REGISTER_URI entries. */
     /* LWIP allows 16 sockets (CONFIG_LWIP_MAX_SOCKETS=16). The send-only
      * WebSocket registers no recv activity, so with a tight cap + LRU purge
      * it becomes the eviction victim whenever the browser opens short-lived
@@ -1822,15 +2027,21 @@ esp_err_t web_server_start(void)
     REGISTER_URI("/api/passwords",     HTTP_GET,  api_passwords_get);
     REGISTER_URI("/api/handshakes",    HTTP_GET,  api_handshakes_get);
     REGISTER_URI("/api/wardrive/logs", HTTP_GET,  api_wardrive_logs_get);
-    REGISTER_URI("/api/wardrive/start", HTTP_POST, api_wardrive_start_post);
-    REGISTER_URI("/api/wardrive/config", HTTP_GET,  api_wardrive_config_get);
-    REGISTER_URI("/api/wardrive/config", HTTP_POST, api_wardrive_config_post);
-    REGISTER_URI("/api/wardrive/files", HTTP_GET,  api_wardrive_files_get);
-    REGISTER_URI("/api/wardrive/upload", HTTP_POST, api_wardrive_upload_post);
-    REGISTER_URI("/api/gps/module",     HTTP_POST, api_gps_module_post);
-    REGISTER_URI("/api/gps/raw",        HTTP_POST, api_gps_raw_post);
-    REGISTER_URI("/api/gps/raw/status", HTTP_GET,  api_gps_raw_status_get);
-    REGISTER_URI("/api/wardrive/status", HTTP_GET, api_wardrive_status_get);
+    REGISTER_URI("/api/wardrive/config",    HTTP_GET,  api_wardrive_config_get);
+    REGISTER_URI("/api/wardrive/config",    HTTP_POST, api_wardrive_config_post);
+    REGISTER_URI("/api/wardrive/start",     HTTP_POST, api_wardrive_start_post);
+    REGISTER_URI("/api/wardrive/status",    HTTP_GET,  api_wardrive_status_get);
+    REGISTER_URI("/api/wardrive/antisurv",  HTTP_POST, api_wardrive_antisurv_post);
+    REGISTER_URI("/api/wardrive/blacklist", HTTP_GET,  api_wardrive_blacklist_get);
+    REGISTER_URI("/api/wardrive/blacklist", HTTP_POST, api_wardrive_blacklist_post);
+    REGISTER_URI("/api/serial",             HTTP_GET,  api_serial_get);
+    REGISTER_URI("/api/deauth/detect",      HTTP_POST, api_deauth_detect_post);
+    REGISTER_URI("/api/deauth/detected",    HTTP_GET,  api_deauth_detected_get);
+    REGISTER_URI("/api/wardrive/files",     HTTP_GET,  api_wardrive_files_get);
+    REGISTER_URI("/api/wardrive/upload",    HTTP_POST, api_wardrive_upload_post);
+    REGISTER_URI("/api/gps/module",         HTTP_POST, api_gps_module_post);
+    REGISTER_URI("/api/gps/raw",            HTTP_POST, api_gps_raw_post);
+    REGISTER_URI("/api/gps/raw/status",     HTTP_GET,  api_gps_raw_status_get);
     REGISTER_URI("/api/sniffer/results", HTTP_GET,  api_sniffer_results_get);
     REGISTER_URI("/api/sniffer/results", HTTP_POST, api_sniffer_refresh_post);
     REGISTER_URI("/api/probes",          HTTP_GET,  api_probes_get);
@@ -1839,6 +2050,10 @@ esp_err_t web_server_start(void)
     REGISTER_URI("/api/portal/captures", HTTP_GET,  api_portal_captures_get);
     REGISTER_URI("/api/sniffer_dog/results", HTTP_GET, api_sniffer_dog_results_get);
     REGISTER_URI("/api/nmap/results",    HTTP_GET,  api_nmap_results_get);
+    REGISTER_URI("/api/zigbee/start",    HTTP_POST, api_zigbee_start_post);
+    REGISTER_URI("/api/zigbee/refresh",  HTTP_POST, api_zigbee_refresh_post);
+    REGISTER_URI("/api/zigbee/clear",    HTTP_POST, api_zigbee_clear_post);
+    REGISTER_URI("/api/zigbee/results",  HTTP_GET,  api_zigbee_results_get);
     REGISTER_URI("/api/bt/devices",      HTTP_GET,  api_bt_devices_get);
     REGISTER_URI("/api/status",        HTTP_GET,  api_status_get);
     REGISTER_URI("/api/dashboard",     HTTP_GET,  api_dashboard_get);

@@ -3,3 +3,8 @@ CONFIG_IDF_TARGET="esp32s3"
 CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_8mb.csv"
 CONFIG_JANOS_BOARD_ATOMS3R=y
+
+# AtomS3R (ESP32-S3-PICO-1-N8R8) DOES have 8MB PSRAM, but we keep SPIRAM off
+# (cores3 policy): enabling it triggered a watchdog reset on boot in testing,
+# and forcing it off also keeps the build deterministic across boards.
+# CONFIG_SPIRAM is not set

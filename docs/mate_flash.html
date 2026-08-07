@@ -1,0 +1,509 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Mate Web Flasher</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #0a0f1c;
+      --card: #10182a;
+      --accent: #40f0ff;
+      --accent-2: #ff7bd4;
+      --text: #e8f1ff;
+      --muted: #9db2d4;
+      --border: rgba(255, 255, 255, 0.08);
+      --success: #5af29e;
+      --error: #ff6b6b;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Space Grotesk", system-ui, -apple-system, sans-serif;
+      background: radial-gradient(circle at 20% 20%, rgba(64, 240, 255, 0.06), transparent 30%),
+                  radial-gradient(circle at 80% 0%, rgba(255, 123, 212, 0.08), transparent 30%),
+                  var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      padding: 32px 18px 64px;
+    }
+    .container { max-width: 1200px; margin: 0 auto; display: grid; gap: 18px; }
+    header {
+      background: linear-gradient(135deg, rgba(64, 240, 255, 0.08), rgba(255, 123, 212, 0.05));
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 24px 24px 28px;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.45);
+    }
+    header .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      padding: 6px 12px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: rgba(255, 255, 255, 0.04);
+      color: var(--muted);
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+    h1 { margin: 12px 0 10px; font-size: clamp(32px, 4vw, 44px); letter-spacing: -0.02em; }
+    header p { margin: 0; max-width: 760px; color: var(--muted); line-height: 1.55; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 18px;
+      box-shadow: 0 12px 36px rgba(0,0,0,0.35);
+    }
+    .card h2 { margin: 0 0 10px; font-size: 18px; letter-spacing: 0.01em; }
+    .card p { margin: 0; color: var(--muted); line-height: 1.55; }
+    .controls { display: flex; flex-direction: column; gap: 14px; }
+    .actions { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+    label.field { display: flex; flex-direction: column; gap: 4px; font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
+    select {
+      border-radius: 12px;
+      border: 1px solid rgba(255,255,255,0.14);
+      background: rgba(255,255,255,0.04);
+      color: var(--text);
+      padding: 10px 12px;
+      font-size: 13px;
+      font-weight: 600;
+      letter-spacing: 0.01em;
+      appearance: none;
+      min-width: 200px;
+    }
+    select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 2px rgba(64,240,255,0.2); }
+    button {
+      border: none;
+      cursor: pointer;
+      font-size: 14px;
+      padding: 12px 18px;
+      border-radius: 12px;
+      font-weight: 600;
+      color: #0a0f1c;
+      background: linear-gradient(135deg, var(--accent), #56a0ff);
+      box-shadow: 0 12px 32px rgba(64, 240, 255, 0.3);
+      transition: transform 0.08s ease, box-shadow 0.12s ease, opacity 0.2s;
+    }
+    button:disabled { opacity: 0.6; cursor: not-allowed; box-shadow: none; }
+    button:hover:not(:disabled) { transform: translateY(-1px); }
+    .ghost { background: rgba(255,255,255,0.04); color: var(--text); box-shadow: inset 0 0 0 1px var(--border); }
+    .status-line { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 8px; color: var(--muted); font-size: 14px; align-items: center; }
+    .pill {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 6px 10px; border-radius: 10px;
+      border: 1px solid var(--border); background: rgba(255,255,255,0.03);
+      font-size: 13px; color: var(--muted);
+    }
+    .pill strong { color: var(--text); }
+    .log {
+      background: rgba(0,0,0,0.35);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 12px;
+      min-height: 140px;
+      max-height: 240px;
+      overflow-y: auto;
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      font-size: 13px;
+      color: #b8c7e6;
+      line-height: 1.45;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .progress {
+      width: 100%; height: 10px; border-radius: 999px;
+      background: rgba(255,255,255,0.05); overflow: hidden;
+      border: 1px solid var(--border); margin-top: 10px;
+    }
+    .progress span {
+      display: block; height: 100%; width: 0%;
+      background: linear-gradient(90deg, var(--accent), var(--accent-2));
+      transition: width 0.12s ease;
+    }
+    .split { display: grid; grid-template-columns: 1.3fr 1fr; gap: 14px; }
+    .steps { display: grid; gap: 8px; margin: 8px 0 0; padding: 0; }
+    .steps li {
+      list-style: none; padding: 10px 12px; border-radius: 12px;
+      border: 1px solid var(--border); background: rgba(255,255,255,0.03);
+      color: var(--muted); line-height: 1.5;
+    }
+    .badge {
+      display: inline-block; padding: 2px 10px; border-radius: 999px;
+      background: rgba(90, 242, 158, 0.12); color: var(--success);
+      font-size: 12px; border: 1px solid rgba(90, 242, 158, 0.4);
+    }
+    .error { color: var(--error); }
+    .mono { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; }
+    footer { margin-top: 18px; color: var(--muted); font-size: 13px; text-align: center; }
+    footer a { color: inherit; text-decoration: none; border-bottom: 1px solid transparent; }
+    footer a:hover { border-bottom-color: currentColor; }
+    @media (max-width: 980px) {
+      body { padding: 20px 14px 60px; }
+      .split { grid-template-columns: 1fr; }
+    }
+  </style>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/crypto-js/4.1.1/crypto-js.min.js"></script>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div class="eyebrow">🧠 Mate — web control for JanOS</div>
+      <h1>Flash Mate straight from your browser</h1>
+      <p>WebSerial flasher powered by esptool-js. Pick your board, click Connect, choose the serial port
+        (Chrome/Edge desktop over HTTPS), then Flash to stream the bootloader, partition table, firmware
+        and web-UI (SPIFFS) image from the latest GitHub build.</p>
+    </header>
+
+    <div class="split">
+      <div class="card">
+        <h2>Control</h2>
+        <div class="controls">
+          <div class="actions">
+            <label class="field">Board
+              <select id="boardSelect" aria-label="Board"><option>Loading…</option></select>
+            </label>
+            <label class="field">Baud
+              <select id="baudSelect" aria-label="Baud rate">
+                <option value="460800">460800</option>
+                <option value="921600">921600</option>
+                <option value="230400">230400</option>
+                <option value="115200">115200</option>
+              </select>
+            </label>
+            <button id="connectBtn">Connect</button>
+            <button id="flashBtn" class="ghost" disabled>Flash</button>
+          </div>
+          <div class="status-line">
+            <span id="statusText">Loading board list…</span>
+            <span id="chipText" class="pill" style="display:none;"></span>
+            <span id="manifestText" class="pill" style="display:none;"></span>
+          </div>
+          <div class="progress" aria-label="Flash progress"><span id="progressBar"></span></div>
+          <div class="log" id="log"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Release info</h2>
+        <p id="releaseInfo">Loading manifest…</p>
+        <ul class="steps">
+          <li><strong>ROM mode:</strong> hold BOOT, plug the board in, then release (some boards enter it automatically).</li>
+          <li><strong>Close serial hogs:</strong> quit any monitor/qFlipper/IDE holding the COM port.</li>
+          <li><strong>Stuck?</strong> unplug, click Connect again, replug with BOOT held, then Flash.</li>
+          <li><strong>Reset:</strong> after flashing, press RESET if the board doesn't auto-reboot.</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <h2>What happens</h2>
+        <p>esptool-js enters the ROM stub, sets the baud rate, then writes each image at the offsets from
+          <code>manifest-&lt;board&gt;.json</code> — bootloader, partition table, app and the SPIFFS web UI.
+          Progress and MD5 checks mirror the Python <code>esptool</code> flow.</p>
+      </div>
+      <div class="card">
+        <h2>Need offline / no Web Serial?</h2>
+        <p>Grab the per-board ZIP from the GitHub Release and run the bundled <code>flash_board.py</code>.
+          It auto-installs esptool + pyserial and knows the same offsets.</p>
+      </div>
+      <div class="card">
+        <h2>Browser support</h2>
+        <p>Chrome or Edge on desktop over HTTPS. Web Serial is required. On Firefox/Safari or mobile the
+          flasher can't open a serial port — use <code>flash_board.py</code> instead.</p>
+      </div>
+    </div>
+  </div>
+  <footer>
+    🧠 Mate — <span id="pageVersion" class="mono">Web flasher v1.0.0</span> · Control the chaos. LAB5.
+  </footer>
+
+  <script type="module">
+    import { ESPLoader, Transport } from "https://unpkg.com/esptool-js/bundle.js";
+
+    const PAGE_VERSION = "1.0.0";
+
+    const ui = {
+      status: document.getElementById("statusText"),
+      chip: document.getElementById("chipText"),
+      manifest: document.getElementById("manifestText"),
+      log: document.getElementById("log"),
+      progress: document.getElementById("progressBar"),
+      connectBtn: document.getElementById("connectBtn"),
+      flashBtn: document.getElementById("flashBtn"),
+      baud: document.getElementById("baudSelect"),
+      board: document.getElementById("boardSelect"),
+      releaseInfo: document.getElementById("releaseInfo"),
+      pageVersion: document.getElementById("pageVersion"),
+    };
+
+    const state = {
+      index: null,       // boards.json
+      manifest: null,    // manifest-<board>.json
+      port: null,
+      onDisconnect: null,
+      transport: null,
+      esploader: null,
+      chip: null,
+      connected: false,
+      isFlashing: false,
+    };
+
+    const log = (msg) => {
+      const time = new Date().toLocaleTimeString();
+      const lines = Array.isArray(msg) ? msg : [msg];
+      for (const line of lines) ui.log.textContent += `[${time}] ${line}\n`;
+      ui.log.scrollTop = ui.log.scrollHeight;
+    };
+
+    const setStatus = (text, level = "info") => {
+      ui.status.textContent = text;
+      ui.status.classList.toggle("error", level === "error");
+    };
+
+    const bytesToBinaryString = (bytes) => {
+      const chunk = 0x8000;
+      let result = "";
+      for (let i = 0; i < bytes.length; i += chunk) {
+        result += String.fromCharCode(...bytes.subarray(i, i + chunk));
+      }
+      return result;
+    };
+
+    const getBoard = () => ui.board.value;
+
+    const currentBoardMeta = () =>
+      (state.index?.boards || []).find((b) => b.id === getBoard()) || null;
+
+    const setFooterVersion = () => {
+      const v = state.index?.version || "n/a";
+      const build = state.manifest?.build || state.index?.build || "n/a";
+      ui.pageVersion.textContent = `Web flasher v${PAGE_VERSION} · fw ${v} · build ${build}`;
+    };
+
+    // Load boards.json and populate the dropdown with every built mutation.
+    const loadBoardIndex = async () => {
+      const res = await fetch("boards.json", { cache: "no-store" });
+      if (!res.ok) throw new Error(`boards.json fetch failed (${res.status})`);
+      const index = await res.json();
+      state.index = index;
+      ui.board.innerHTML = "";
+      for (const b of index.boards || []) {
+        const opt = document.createElement("option");
+        opt.value = b.id;
+        opt.textContent = `${b.label} · ${b.chipFamily} · ${b.flashSize}`;
+        ui.board.appendChild(opt);
+      }
+      // Honor ?board=<id> deep-link.
+      const params = new URLSearchParams(window.location.search);
+      const wanted = (params.get("board") || "").trim().toLowerCase();
+      if (wanted && (index.boards || []).some((b) => b.id === wanted)) {
+        ui.board.value = wanted;
+      }
+      setFooterVersion();
+    };
+
+    const manifestUrl = () => currentBoardMeta()?.manifest || `manifest-${getBoard()}.json`;
+
+    const loadManifest = async () => {
+      try {
+        const res = await fetch(manifestUrl(), { cache: "no-store" });
+        if (!res.ok) throw new Error("Manifest fetch failed");
+        state.manifest = await res.json();
+        const m = state.manifest;
+        const files = (m.parts || []).length;
+        ui.manifest.style.display = "inline-flex";
+        ui.manifest.innerHTML = `<strong>${m.chipFamily}</strong> · fw ${m.version} · ${files} part(s)`;
+        ui.releaseInfo.innerHTML =
+          `<span class="badge">Manifest</span> ${m.name} — ${files} image(s), ` +
+          `chip ${m.chipFamily}, flash ${m.flashSize} ${m.flashMode}@${m.flashFreq}.`;
+        setStatus(state.connected ? `Connected to ${state.chip}. Ready to flash.` : "Ready to connect.");
+        setFooterVersion();
+      } catch (err) {
+        setStatus("Manifest not found for this board. Publish a build first.", "error");
+        ui.releaseInfo.textContent = "No manifest available for this board.";
+        state.manifest = null;
+        throw err;
+      }
+    };
+
+    const ensureSupport = () => {
+      if (!("serial" in navigator)) {
+        setStatus("Web Serial not available. Use Chrome/Edge over HTTPS.", "error");
+        throw new Error("Web Serial unavailable");
+      }
+    };
+
+    const connect = async () => {
+      ensureSupport();
+      if (state.connected) { await disconnect(); return; }
+      ui.connectBtn.disabled = true;
+      ui.flashBtn.disabled = true;
+      setStatus("Requesting serial port…");
+      log("Requesting port access");
+      try {
+        state.port = await navigator.serial.requestPort({});
+        state.onDisconnect = () => {
+          log("Device disconnected.");
+          disconnect().catch(() => {});
+          setStatus("Device disconnected. Reconnect to flash.", "error");
+        };
+        try { state.port.addEventListener("disconnect", state.onDisconnect); } catch {}
+        const baud = parseInt(ui.baud.value, 10);
+        state.transport = new Transport(state.port, true);
+        state.esploader = new ESPLoader({
+          transport: state.transport,
+          baudrate: baud,
+          terminal: { clean() {}, writeLine(d) { log(d); }, write(d) { log(d); } },
+          debugLogging: false,
+        });
+        setStatus("Syncing with chip (hold BOOT + RESET to enter ROM)…");
+        log("Syncing with chip");
+        state.chip = await state.esploader.main();
+        state.connected = true;
+        ui.chip.style.display = "inline-flex";
+        ui.chip.textContent = `Chip ${state.chip}`;
+        ui.connectBtn.textContent = "Disconnect";
+        // Warn if the connected chip doesn't match the selected board's family.
+        const meta = currentBoardMeta();
+        if (meta && state.chip && !String(state.chip).toUpperCase().includes(meta.chipFamily.replace("ESP32-", "").toUpperCase())
+            && meta.chipFamily !== "ESP32") {
+          log(`⚠ Selected board is ${meta.chipFamily} but connected chip reports ${state.chip}. Double-check the board dropdown.`);
+        }
+        setStatus(`Connected to ${state.chip}. Ready to flash.`);
+        log(`Connected: ${state.chip}`);
+        ui.flashBtn.disabled = !state.manifest;
+      } catch (err) {
+        console.error(err);
+        setStatus(err.message || "Connection failed", "error");
+        log(`Error: ${err.message || err}`);
+        await disconnect();
+      } finally {
+        ui.connectBtn.disabled = false;
+      }
+    };
+
+    const fetchFiles = async () => {
+      if (!state.manifest) await loadManifest();
+      const parts = state.manifest.parts || [];
+      const files = [];
+      for (const part of parts) {
+        setStatus(`Downloading ${part.path}…`);
+        log(`Fetching ${part.path} @ 0x${part.offset.toString(16)}`);
+        const res = await fetch(part.path, { cache: "no-store", redirect: "follow" });
+        if (!res.ok) throw new Error(`Fetch ${part.path} failed (${res.status} ${res.statusText})`);
+        const buf = await res.arrayBuffer();
+        files.push({ data: new Uint8Array(buf), address: part.offset });
+      }
+      return files;
+    };
+
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+    const resetAfterFlash = async () => {
+      if (!state.port || typeof state.port.setSignals !== "function") return false;
+      try {
+        await state.port.setSignals({ dataTerminalReady: false, requestToSend: true });
+        await sleep(120);
+        await state.port.setSignals({ dataTerminalReady: false, requestToSend: false });
+        await sleep(120);
+        await state.port.setSignals({ dataTerminalReady: true, requestToSend: false });
+        return true;
+      } catch { return false; }
+    };
+
+    const flash = async () => {
+      ensureSupport();
+      if (!state.esploader) await connect();
+      if (!state.manifest) { setStatus("No manifest for this board.", "error"); return; }
+      ui.flashBtn.disabled = true;
+      ui.connectBtn.disabled = true;
+      state.isFlashing = true;
+      ui.progress.style.width = "0%";
+      try {
+        const files = await fetchFiles();
+        setStatus("Uploading stub and flashing…");
+        log("Preparing flash writes");
+        const m = state.manifest;
+        await state.esploader.writeFlash({
+          fileArray: files,
+          flashSize: m.flashSize || "keep",
+          flashMode: m.flashMode || "keep",
+          flashFreq: m.flashFreq || "keep",
+          eraseAll: false,
+          compress: true,
+          reportProgress: (fileIndex, written, total) => {
+            const pct = Math.min(100, Math.round((written / total) * 100));
+            ui.progress.style.width = `${pct}%`;
+            setStatus(`Flashing ${fileIndex + 1}/${files.length} — ${pct}%`);
+          },
+          calculateMD5Hash: (image) =>
+            CryptoJS.MD5(CryptoJS.enc.Latin1.parse(bytesToBinaryString(image))).toString(),
+        });
+        await state.esploader.after();
+        const resetOk = await resetAfterFlash();
+        ui.progress.style.width = "100%";
+        setStatus(resetOk ? "Flash complete. Device rebooted."
+                          : "Flash complete. Press RESET if the board doesn't reboot.");
+        log("Flash complete.");
+      } catch (err) {
+        console.error(err);
+        setStatus(err.message || "Flash failed", "error");
+        log(`Error: ${err.message || err}`);
+      } finally {
+        state.isFlashing = false;
+        ui.flashBtn.disabled = false;
+        ui.connectBtn.disabled = false;
+      }
+    };
+
+    const disconnect = async () => {
+      if (state.port && state.onDisconnect) {
+        try { state.port.removeEventListener("disconnect", state.onDisconnect); } catch {}
+      }
+      try {
+        if (state.transport) await state.transport.disconnect();
+        else if (state.port && state.port.close) await state.port.close();
+      } catch {}
+      state.port = null;
+      state.onDisconnect = null;
+      state.transport = null;
+      state.esploader = null;
+      state.chip = null;
+      state.connected = false;
+      ui.chip.style.display = "none";
+      ui.flashBtn.disabled = true;
+      ui.connectBtn.textContent = "Connect";
+      setStatus("Disconnected.");
+    };
+
+    ui.connectBtn.addEventListener("click", () => connect().catch(() => {}));
+    ui.flashBtn.addEventListener("click", () => flash().catch(() => {}));
+    ui.board.addEventListener("change", () => {
+      state.manifest = null;
+      ui.manifest.style.display = "none";
+      ui.releaseInfo.textContent = "Loading manifest…";
+      ui.flashBtn.disabled = true;
+      loadManifest().then(() => { ui.flashBtn.disabled = !state.connected; }).catch(() => {});
+    });
+
+    (async () => {
+      try {
+        await loadBoardIndex();
+        await loadManifest();
+        setStatus("Ready to connect.");
+      } catch (err) {
+        setStatus(err.message || "Failed to load board list.", "error");
+        log(`Init error: ${err.message || err}`);
+      }
+    })();
+  </script>
+</body>
+</html>

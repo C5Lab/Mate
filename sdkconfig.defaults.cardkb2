@@ -1,0 +1,9 @@
+# M5Stack CardKB2 specific
+# https://docs.m5stack.com/en/unit/Unit_CardKB2
+# ESP32-C61, 4MB flash, no display (headless WebClient).
+# Grove HY2.0-4P: G26/G25. Verified on HW: TX=G26, RX=G25 (swapped vs datasheet labels).
+# Flashing Mate repurposes the keyboard's ESP32-C61 as a headless WebClient.
+CONFIG_JANOS_BOARD_CARDKB2=y
+CONFIG_IDF_TARGET="esp32c61"
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_4mb.csv"

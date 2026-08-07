@@ -548,3 +548,21 @@ When porting from Tab5 (1280x720) to CoreS3 (320x240):
 6. Update UI inside `bsp_display_lock()`/`unlock()` from background tasks
 7. Implement cleanup: set `monitoring = false`, send `"stop"`, delete LVGL objects, free memory
 8. Wire up the back/home button to call cleanup and return to parent screen
+
+## Building & Flashing
+
+Full build/flash docs live in [`BUILD.md`](../BUILD.md). Two build entry points:
+
+- **`tools/build_all.py`** — reference builder (all boards, Docker per board);
+  the single source of truth for the board matrix, mirrored into CI.
+- **`tools/build_all_cache.py`** — fast **local** builder with an *effective*
+  ccache. Key ideas (see BUILD.md → "Method A+"): build every board at a fixed
+  in-container path (`/tmp/idfbuild`) so the `-I` args match and ccache shares
+  across boards, and schedule **target lanes** — same `idf_target` runs
+  **sequentially** (first primes the cache, siblings hit), different targets run
+  **in parallel** (`-n` = max lanes). A naive "ccache + N parallel" gets ~0 %
+  hits because per-board build dirs and concurrent same-target compiles both
+  bust the cache key.
+
+Rule of thumb: **`-n` = number of distinct targets** among the boards you're
+building (3 for the full matrix: `esp32`, `esp32c6`, `esp32s3`).

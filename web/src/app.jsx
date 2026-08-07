@@ -1,5 +1,5 @@
 import Router from 'preact-router';
-import { useEffect, useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 import { api } from './api';
 import { wsAddListener, wsConnect } from './ws';
 import {
@@ -7,10 +7,16 @@ import {
   clearArpHosts,
   getState,
   setArpHosts,
+  setAttackRunning,
   setQuickActions,
   setState,
   subscribe,
+  wardriveReset,
+  wardrivePatch,
+  antisurvReset,
+  antisurvPatch,
 } from './store';
+import { ingestWardriveLine } from './wardriveParse';
 import { ToastContainer } from './components/Toast';
 import { QUICK_ACTION_OPTIONS } from './quickActions';
 
@@ -26,6 +32,7 @@ import { GlobalAttacks } from './pages/GlobalAttacks';
 import { SDData } from './pages/SDData';
 import { Bluetooth } from './pages/Bluetooth';
 import { Wardrive } from './pages/Wardrive';
+import { MeshRecon } from './pages/MeshRecon';
 import { WardriveUpload } from './pages/WardriveUpload';
 import { GpsDiag } from './pages/GpsDiag';
 import { Karma } from './pages/Karma';
@@ -45,6 +52,21 @@ function normalizeStatus(value) {
   if (value === 'scan') return 'scanning';
   return value;
 }
+
+/* Device FSM states (mirrors the firmware `cmd_state_name` strings) that count
+ * as a foreground attack for the global Scan lock. Scanning / listing /
+ * wardrive / antisurv / subghz are deliberately excluded — they have their own
+ * UI and run flags. */
+const ATTACK_RUNNING_STATES = new Set([
+  'deauth', 'eviltwin', 'rogueap', 'portal', 'sae', 'handshake',
+  'sniffer', 'blackout', 'mitm', 'nmap', 'arp', 'arp_ban', 'karma',
+]);
+
+/* Don't let the poll clear a just-armed lock during the sliver between an
+ * optimistic launch and the device reporting the new state. A wrongly-cleared
+ * lock also self-heals on the next poll (the device is really busy), so this is
+ * only about avoiding a cosmetic unlock→relock flicker right after Launch. */
+const ATTACK_LOCK_GRACE_MS = 5000;
 
 function WifiMetricIcon({ connected }) {
   return (
@@ -66,9 +88,15 @@ function SettingsIcon() {
   );
 }
 
+/* Bump this on every web change so the footer confirms which build is loaded.
+ * If the footer version doesn't match the latest, the browser is serving a
+ * cached/stale app.js (hard-refresh or open in a private tab). */
+export const WEB_VERSION = '0015';
+
 export function App() {
   const [, forceUpdate] = useState(0);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const syncStatusRef = useRef(null);
 
   useEffect(() => {
     wsConnect();
@@ -89,6 +117,36 @@ export function App() {
           heapFree: data.heap_free || 0,
           heapInternal: data.heap_internal || 0,
         });
+
+        /* Reconcile the wardrive/anti-surv run flags from the authoritative
+         * device state. The WS attack_started/stopped events are the fast
+         * path but a single dropped frame (or a page reload mid-run) would
+         * otherwise leave the Engine UI out of sync with the top menu. */
+        const s = getState();
+        const wdRun = data.state === 'wardrive_run';
+        const asRun = data.state === 'antisurv_run';
+        if (s.wardrive.running !== wdRun) {
+          if (wdRun) wardriveReset({ running: true, gps: 'waiting' });
+          else wardrivePatch({ running: false, gps: 'idle' });
+        }
+        if (s.antisurv.running !== asRun) antisurvPatch({ running: asRun });
+
+        /* Reconcile the global attack lock from the authoritative FSM state.
+         * This is what un-sticks the Scan page's "Attack running" lock after
+         * the Monster has gone idle while the web was disconnected (or the
+         * attack was stopped from the device / auto-completed). Arm on any
+         * attack state; clear once the device is no longer attacking, honoring
+         * a short grace window so a launch-time in-flight poll can't wipe the
+         * freshly-armed lock. */
+        const attackNow = ATTACK_RUNNING_STATES.has(data.state);
+        if (attackNow) {
+          if (!s.attackRunning) setAttackRunning(true);
+        } else if (
+          s.attackRunning &&
+          Date.now() - (s.attackRunningSince || 0) > ATTACK_LOCK_GRACE_MS
+        ) {
+          setAttackRunning(false);
+        }
       } catch (e) {
         /* ignore status polling errors */
       }
@@ -119,7 +177,12 @@ export function App() {
 
     syncStatus();
     syncDashboard();
-    const pollStatusId = setInterval(syncStatus, 12000);
+    /* Poll fairly briskly: /api/status just reads the cached FSM state (no
+     * UART round-trip), and the WS attack_stopped event is unreliable here, so
+     * this poll is what clears the top "Current Operation" tile after an attack
+     * ends. 12s felt like a ~20s lag; 3s keeps it snappy. */
+    syncStatusRef.current = syncStatus;
+    const pollStatusId = setInterval(syncStatus, 3000);
     /* Refresh dashboard-only fields (handshake count, SD status, GPS) so they
      * appear once the C5 link comes up, not just on the very first mount. */
     const pollDashboardId = setInterval(syncDashboard, 15000);
@@ -148,47 +211,51 @@ export function App() {
       }
 
       if (msg.type === 'attack_started') {
-        const patch = { status: normalizeStatus(msg.attack) };
-        if (msg.attack === 'wardrive') {
-          patch.wardriveRunning = true;
-          patch.wardriveSats = 0;
-          patch.wardriveDistance = 0;
+        setState({ status: normalizeStatus(msg.attack) });
+        /* Fast-path arm of the global lock (the 3s poll is the safety net).
+         * attack_stopped intentionally does NOT clear it here — clearing is
+         * left to the authoritative /api/status reconcile, which avoids a
+         * spurious WS-stop event (or an auto-completing attack) flipping the
+         * Scan button back to Launch mid-session. */
+        if (ATTACK_RUNNING_STATES.has(msg.attack)) setAttackRunning(true);
+        /* Only (re)initialize if not already running. This frame can arrive
+         * AFTER the one-shot "GPS fix obtained" line and the first CSV rows
+         * (WS vs uart_line are separate transports), so blindly resetting
+         * would wipe the fix state + table and strand the badge on
+         * "Waiting for GPS fix". The optimistic startRun() already armed it. */
+        if (msg.attack === 'wardrive' && !st.wardrive.running) {
+          wardriveReset({ running: true, gps: 'waiting' });
+        } else if (msg.attack === 'antisurv' && !st.antisurv.running) {
+          antisurvReset({ running: true });
         }
         if (msg.attack === 'wardrive_upload') {
-          patch.wardriveUploadRunning = true;
-          patch.wardriveUploadProvider = msg.provider || '';
-          patch.wardriveUploadResult = null;
-          patch.wardriveUploadError = null;
-          patch.wardriveUploadLast = '';
+          setState({
+            wardriveUploadRunning: true,
+            wardriveUploadProvider: msg.provider || '',
+            wardriveUploadResult: null,
+            wardriveUploadError: null,
+            wardriveUploadLast: '',
+          });
         }
         if (msg.attack === 'gps_raw') {
-          patch.gpsRawRunning = true;
-          patch.gpsRawLines = [];
+          setState({ gpsRawRunning: true, gpsRawLines: [] });
         }
-        setState(patch);
       }
 
       if (msg.type === 'attack_stopped') {
         setState({
           status: 'idle',
-          wardriveRunning: false,
           wardriveUploadRunning: false,
           gpsRawRunning: false,
         });
+        if (st.wardrive.running) wardrivePatch({ running: false, gps: 'idle' });
+        if (st.antisurv.running) antisurvPatch({ running: false });
       }
 
       if (msg.type === 'gps_nmea' && typeof msg.line === 'string') {
         const next = [...st.gpsRawLines, msg.line];
         if (next.length > 60) next.splice(0, next.length - 60);
         setState({ gpsRawRunning: true, gpsRawLines: next });
-      }
-
-      if (msg.type === 'wardrive_status') {
-        setState({
-          wardriveRunning: true,
-          wardriveSats: typeof msg.sats === 'number' && msg.sats >= 0 ? msg.sats : st.wardriveSats,
-          wardriveDistance: typeof msg.dist === 'number' ? msg.dist : st.wardriveDistance,
-        });
       }
 
       if (msg.type === 'wardrive_upload_done') {
@@ -247,6 +314,8 @@ export function App() {
        * We skip the ICMP-only rows because arp_ban needs a usable MAC. */
       if (msg.type === 'uart_line' && typeof msg.data === 'string') {
         const line = msg.data;
+        // Wardrive / anti-surveillance stream (CSV rows, stats, GPS, followers).
+        if (ingestWardriveLine(line)) return;
         if (line.includes('=== Discovered Hosts ===')) {
           clearArpHosts();
         } else {
@@ -312,7 +381,7 @@ export function App() {
       </header>
 
       <main class="page-shell">
-        <Router>
+        <Router onChange={() => { window.scrollTo(0, 0); syncStatusRef.current?.(); }}>
           <Home path="/" />
           <Scan path="/scan" />
           <Deauth path="/deauth" />
@@ -326,6 +395,7 @@ export function App() {
           <SDData path="/sddata" />
           <Bluetooth path="/bluetooth" />
           <Wardrive path="/wardrive" />
+          <MeshRecon path="/mesh" />
           <WardriveUpload path="/wardrive/upload" />
           <GpsDiag path="/gps/diag" />
           <Karma path="/karma" />
@@ -370,6 +440,10 @@ export function App() {
           </section>
         </div>
       ) : null}
+
+      <footer class="app-version">
+        JanOS Web <span>v{WEB_VERSION}</span>
+      </footer>
 
       <ToastContainer />
     </div>

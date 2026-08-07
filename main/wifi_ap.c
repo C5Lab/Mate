@@ -9,6 +9,7 @@
 #include "esp_netif.h"
 #include "esp_log.h"
 #include "esp_mac.h"
+#include "esp_timer.h"
 #include "lwip/sockets.h"
 #include "display.h"
 
@@ -19,11 +20,25 @@ static const char *s_ip = "192.168.4.1";
 static int s_client_count = 0;
 
 /* ---------- Captive Portal DNS ----------
- * Minimal DNS server: responds to every A-record query
- * with our AP IP so phones auto-detect the captive portal.
- */
+ * The OS captive-portal check works by resolving a probe hostname
+ * (connectivitycheck.gstatic.com, captive.apple.com, ...) and fetching a
+ * known URL over Wi-Fi. To make that probe hit us we must answer DNS with our
+ * AP IP -- but if we keep hijacking *every* query forever, the phone treats
+ * Wi-Fi as the internet path and stops falling back to cellular, so the user
+ * loses their mobile data while connected to Mate.
+ *
+ * Compromise: hijack DNS only for a short window after each client associates
+ * (long enough for the captive check to fire and auto-open the portal), then
+ * relax -- answer subsequent queries with an empty "no A record" response.
+ * After that the phone flags Wi-Fi as "no internet" and routes traffic over
+ * cellular, while the web UI stays reachable by IP (http://192.168.4.1) with
+ * no DNS needed. Re-arming on every STACONNECTED keeps auto-open working on
+ * reconnect. Set DNS_HIJACK_WINDOW_US to 0 to disable hijacking entirely. */
 
 #define DNS_PORT 53
+#define DNS_HIJACK_WINDOW_US (90 * 1000000LL)  /* 90 s after a client joins */
+
+static volatile int64_t s_dns_hijack_until_us = 0;
 
 typedef struct __attribute__((packed)) {
     uint16_t id;
@@ -71,23 +86,36 @@ static void dns_server_task(void *arg)
         dns_header_t *hdr = (dns_header_t *)rx;
         if (ntohs(hdr->qcount) == 0) continue;
 
-        /* Build response: copy header, set response flags, add answer */
+        const bool hijack = (esp_timer_get_time() < s_dns_hijack_until_us);
+
+        /* Build response: copy header, set response flags */
         memcpy(tx, rx, len);
         dns_header_t *rhdr = (dns_header_t *)tx;
-        rhdr->flags  = htons(0x8180); /* QR=1 AA=1 RD=1 RA=1 */
-        rhdr->acount = htons(1);
-
-        /* Append answer: pointer to query name + A record with our IP */
+        rhdr->flags   = htons(0x8180); /* QR=1 AA=1 RD=1 RA=1 */
+        rhdr->nscount = 0;
+        rhdr->arcount = 0;
         int pos = len;
-        tx[pos++] = 0xC0; /* pointer */
-        tx[pos++] = 0x0C; /* offset to name in question */
-        tx[pos++] = 0x00; tx[pos++] = 0x01; /* type A */
-        tx[pos++] = 0x00; tx[pos++] = 0x01; /* class IN */
-        tx[pos++] = 0x00; tx[pos++] = 0x00;
-        tx[pos++] = 0x00; tx[pos++] = 0x0A; /* TTL = 10s */
-        tx[pos++] = 0x00; tx[pos++] = 0x04; /* data len */
-        tx[pos++] = 192; tx[pos++] = 168;
-        tx[pos++] = 4;   tx[pos++] = 1;
+
+        if (hijack) {
+            /* Within the post-connect window: answer with our AP IP so the
+             * OS captive-portal probe reaches us and auto-opens the portal. */
+            rhdr->acount = htons(1);
+            tx[pos++] = 0xC0; /* pointer */
+            tx[pos++] = 0x0C; /* offset to name in question */
+            tx[pos++] = 0x00; tx[pos++] = 0x01; /* type A */
+            tx[pos++] = 0x00; tx[pos++] = 0x01; /* class IN */
+            tx[pos++] = 0x00; tx[pos++] = 0x00;
+            tx[pos++] = 0x00; tx[pos++] = 0x0A; /* TTL = 10s */
+            tx[pos++] = 0x00; tx[pos++] = 0x04; /* data len */
+            tx[pos++] = 192; tx[pos++] = 168;
+            tx[pos++] = 4;   tx[pos++] = 1;
+        } else {
+            /* Window elapsed: return an empty answer (no A record) so we do
+             * NOT hijack general DNS. The phone then treats Wi-Fi as having
+             * no internet and keeps using cellular; the web UI is still
+             * reachable directly at http://192.168.4.1 (no DNS involved). */
+            rhdr->acount = 0;
+        }
 
         sendto(sock, tx, pos, 0, (struct sockaddr *)&from, from_len);
     }
@@ -101,6 +129,10 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
     if (id == WIFI_EVENT_AP_STACONNECTED) {
         wifi_event_ap_staconnected_t *e = data;
         s_client_count++;
+        /* Arm the captive-portal DNS hijack window so this client's OS probe
+         * auto-opens the portal; it relaxes again after DNS_HIJACK_WINDOW_US
+         * so the phone keeps its cellular internet. */
+        s_dns_hijack_until_us = esp_timer_get_time() + DNS_HIJACK_WINDOW_US;
         ESP_LOGI(TAG, "Client connected: " MACSTR, MAC2STR(e->mac));
         display_set_client_count(s_client_count);
     } else if (id == WIFI_EVENT_AP_STADISCONNECTED) {

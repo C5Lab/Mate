@@ -1,1 +1,23 @@
 .vscode/settings.json
+
+# Web flasher: firmware bins + manifests are generated in CI from build
+# artifacts, not committed. Only the static flasher HTML lives in docs/.
+docs/firmware/
+docs/boards.json
+docs/manifest-*.json
+
+# Python bytecode (regenerated on every run; was accidentally tracked before).
+__pycache__/
+*.pyc
+
+# JavaScript dependencies are restored reproducibly from web/package-lock.json.
+web/node_modules/
+
+# ccache store used by tools/build_all_cache.py (compiler cache; can be huge).
+.ccache/
+
+# Per-board build output, logs and isolated sdkconfigs
+# (tools/build_all.py / build_all_cache.py — transient, never committed).
+build-*/
+build-*.log
+sdkconfig.build-*

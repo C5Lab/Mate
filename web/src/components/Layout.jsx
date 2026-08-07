@@ -1,12 +1,17 @@
 import { route } from 'preact-router';
 
-export function Layout({ title, subtitle, back = '/', actions = null, children }) {
+export function Layout({ title, subtitle, back = '/', onBack, actions = null, children }) {
+  async function handleBack() {
+    if (onBack) await onBack();
+    route(back);
+  }
+
   return (
     <section class="module-page reveal">
       <div class="page-head">
         <div class="page-copy">
           {back && (
-            <button class="back-link" onClick={() => route(back)}>
+            <button class="back-link" onClick={handleBack}>
               <span aria-hidden="true">&larr;</span>
               Back
             </button>

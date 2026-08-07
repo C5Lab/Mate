@@ -116,6 +116,7 @@ export function SubGhzTransmit() {
               <thead>
                 <tr>
                   <th>#</th>
+                  <th>Name</th>
                   <th>Type</th>
                   <th>MHz</th>
                   <th>Serial</th>
@@ -129,6 +130,7 @@ export function SubGhzTransmit() {
                 {signals.map((s) => (
                   <tr key={s.idx}>
                     <td>{s.idx}</td>
+                    <td>{s.name || '-'}</td>
                     <td>{s.type || s.signalType || '-'}</td>
                     <td>{Number(s.freq).toFixed(2)}</td>
                     <td>{s.serial || s.id || '-'}</td>
@@ -161,18 +163,24 @@ export function SubGhzTransmit() {
             <div class="section-head">
               <h3 class="section-title">Confirm Transmit</h3>
             </div>
-            <div class="kv">
-              <div class="kv-row">
-                <span class="kv-key">Index</span>
-                <span class="kv-val">#{confirm.idx}</span>
-              </div>
-              <div class="kv-row">
-                <span class="kv-key">Type</span>
-                <span class="kv-val">{confirm.type || confirm.signalType || '-'}</span>
-              </div>
-              <div class="kv-row">
-                <span class="kv-key">Frequency</span>
-                <span class="kv-val">{Number(confirm.freq).toFixed(2)} MHz</span>
+            <div class="subghz-tx-modal-body">
+              <div class="kv">
+                <div class="kv-row">
+                  <span class="kv-key">Name</span>
+                  <span class="kv-val">{confirm.name || '-'}</span>
+                </div>
+                <div class="kv-row">
+                  <span class="kv-key">Index</span>
+                  <span class="kv-val">#{confirm.idx}</span>
+                </div>
+                <div class="kv-row">
+                  <span class="kv-key">Type</span>
+                  <span class="kv-val">{confirm.type || confirm.signalType || '-'}</span>
+                </div>
+                <div class="kv-row">
+                  <span class="kv-key">Frequency</span>
+                  <span class="kv-val">{Number(confirm.freq).toFixed(2)} MHz</span>
+                </div>
               </div>
             </div>
             <div class="btn-row">

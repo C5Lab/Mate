@@ -52,6 +52,13 @@ static void broadcast_json(const char *fmt, ...)
  * expensive (consuming several KB of scarce internal DRAM at boot). */
 static scan_results_t       s_scan;
 static int                  s_scan_expected = -1;
+/* Observer two-phase launch: when the web asks Mate to "start the observer",
+ * Mate runs scan_networks itself and then auto-fires start_sniffer_noscan once
+ * the scan completes. Keeping this handoff in the firmware (not the browser)
+ * means the observer still launches if the phone navigates away / disconnects
+ * between the scan finishing and the sniffer start. Mirrors Tab5's
+ * observer_start_task (which runs the same scan->sniffer sequence device-side). */
+static volatile bool        s_observer_pending = false;
 static dynvec_t             s_portals;        /* parsed_portal_file_t */
 static dynvec_t             s_passwords_evil;   /* parsed_password_t (show_pass evil) */
 static dynvec_t             s_passwords_portal; /* parsed_password_t (show_pass portal) */
@@ -69,13 +76,19 @@ static bool                 s_portal_header_seen = false;
 static sniffer_results_t    s_sniffer;
 static sniffer_results_t    s_sniffer_build;
 static bool                 s_sniffer_collecting = false;
+/* JanOS echoes "> show_sniffer_results" before printing the AP list, and
+ * is_prompt_line() treats any "> ..." line as a prompt. Without this guard the
+ * echo would end the snapshot instantly (0 APs) and the real AP rows -- which
+ * arrive right after -- would be dropped, so the console shows results but the
+ * UI stays empty. Only accept a prompt as the terminator once we've seen our
+ * own command echo. Reset in begin_sniffer_snapshot(). */
+static bool                 s_sniffer_echo_seen = false;
 static int                  s_sniffer_ap_index = -1;
 /* Echo guards: while the sniffer attack runs, JanOS keeps emitting background
  * "> Sniffer packet count: N" lines that is_prompt_line() would otherwise treat
  * as the end of a `show_sniffer_results` / `list_probes` reply, prematurely
  * finishing the snapshot with an empty buffer. Only honor a terminating prompt
  * once we've seen the command echo. Reset when the command is (re)issued. */
-static bool                 s_sniffer_echo_seen = false;
 static bool                 s_probes_echo_seen = false;
 static int                  s_handshake_count = -1;
 static bool                 s_handshake_initial_done = false;
@@ -88,6 +101,46 @@ static bool                 s_handshake_header_seen = false;
 static bool                 s_wardrive_header_seen = false;
 static dynvec_t             s_handshakes;     /* parsed_portal_file_t */
 static dynvec_t             s_wardrive_logs;  /* parsed_portal_file_t */
+static wardrive_cfg_t       s_wd_cfg;         /* last parsed [WDCFG] snapshot */
+static wardrive_cfg_t       s_wd_cfg_build;   /* accumulator during config load */
+static dynvec_t             s_wd_blacklist;   /* char[18] MAC strings */
+static bool                 s_wd_blacklist_valid = false; /* list fetched at least once */
+static wardrive_status_t    s_wd_status;      /* live status, polled over HTTP */
+static dynvec_t             s_deauth_events;  /* deauth_event_t, polled over HTTP */
+
+/* Serial console ring buffer (raw UART lines), polled over HTTP. */
+#define SERIAL_RING 100
+static serial_line_t        s_serial_ring[SERIAL_RING];
+static uint32_t             s_serial_seq = 0;
+
+static void serial_append(const char *line)
+{
+    if (!line || !line[0]) return;
+    uint32_t seq = ++s_serial_seq;
+    int idx = (int)(seq % SERIAL_RING);
+    strncpy(s_serial_ring[idx].text, line, SERIAL_LINE_LEN - 1);
+    s_serial_ring[idx].text[SERIAL_LINE_LEN - 1] = '\0';
+    s_serial_ring[idx].seq = seq;   /* written last so a poller sees a whole line */
+}
+
+uint32_t cmd_serial_snapshot(uint32_t since, serial_line_t *out, int max, int *n_out)
+{
+    uint32_t cur = s_serial_seq;
+    int n = 0;
+    uint32_t start = since + 1;
+    /* Clamp to what the ring still holds. */
+    if (cur > SERIAL_RING && start < cur - SERIAL_RING + 1) start = cur - SERIAL_RING + 1;
+    for (uint32_t s = start; s <= cur && n < max; s++) {
+        int idx = (int)(s % SERIAL_RING);
+        if (s_serial_ring[idx].seq == s) {
+            out[n] = s_serial_ring[idx];
+            n++;
+        }
+    }
+    if (n_out) *n_out = n;
+    return cur;
+}
+
 /* Cached wardrive config, populated from `get_wardrive_config` [WDCFG] lines. */
 static wardrive_config_t    s_wardrive_config = {0};
 static bool                 s_wardrive_config_loaded = false;
@@ -135,9 +188,9 @@ static bool                 s_has_last_gps_fix = false;
 static float                s_last_gps_lat = 0.0f;
 static float                s_last_gps_lon = 0.0f;
 static int64_t              s_last_uart_ms = 0;
-/* Set true on the first line ever received from the C5. Once established the
- * connection is treated as sticky (no more keepalive pings), trading a slow
- * idle-disconnect indication for a quiet UART. */
+/* Set true only after the C5 confirms the initial ping with `pong`. Once
+ * established the connection is treated as sticky and no more keepalive
+ * pings are sent. */
 static bool                 s_c5_established = false;
 static bool                 s_sta_connected = false;
 static char                 s_sta_ssid[33] = {0};
@@ -172,6 +225,18 @@ static nmap_state_t         s_nmap_state = {0};
 static int                  s_nmap_current_idx = -1; /* index into s_nmap_hosts */
 static bool                 s_nmap_active = false;   /* set by cmd_do_nmap, cleared on completion */
 
+/* Mesh Recon (Zigbee/802.15.4) caches. The Monster streams key=value
+ * "[ZIG] status|pan|node|edge" lines in response to zig_recon_* poll commands;
+ * we upsert them (keyed by pan id / addr / from-to) so the graph is stable
+ * across poll cycles and survives WS/web reconnects, exactly like the ARP and
+ * nmap caches. State-independent parsing (the [ZIG] prefix is unambiguous). */
+#define ZIG_MAX_PANS   32
+#define ZIG_MAX_NODES  128
+#define ZIG_MAX_EDGES  128
+static dynvec_t             s_zig_pans;       /* zig_pan_t */
+static dynvec_t             s_zig_nodes;      /* zig_node_t */
+static dynvec_t             s_zig_edges;      /* zig_edge_t */
+static zig_status_t         s_zig_status = {0};
 /* Bluetooth caches. Like nmap/ARP, BLE results stream in state-independently:
  * JanOS flips the FSM back to IDLE on the `> scan_bt` prompt echo before the
  * 10s scan actually finishes, so the device list is parsed in a
@@ -183,9 +248,18 @@ static bool                 s_airtag_active = false;   /* armed by cmd_do_airtag
 
 static bool is_prompt_line(const char *line)
 {
+    /* A real JanOS CLI prompt is a bare "> " (only whitespace after the '>').
+     * Command echoes ("> show_sniffer_results") and prompt-prefixed async
+     * status lines ("> Still waiting for GPS fix... (10s)") are NOT prompts:
+     * treating them as such prematurely ends listing/collection states, so the
+     * device console shows results while the UI stays empty. Require the rest
+     * of the line to be empty. */
     if (!line) return false;
     while (*line == ' ') line++;
-    return line[0] == '>' && (line[1] == '\0' || line[1] == ' ');
+    if (line[0] != '>') return false;
+    const char *p = line + 1;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    return *p == '\0';
 }
 
 static bool is_not_connected_line(const char *line)
@@ -369,18 +443,6 @@ static void sniffer_results_clear(sniffer_results_t *r)
     r->packet_count = 0;
     r->has_snapshot = false;
     r->empty        = false;
-}
-
-static void sniffer_results_free_buffers(sniffer_results_t *r)
-{
-    if (!r) return;
-    if (r->aps) {
-        for (int i = 0; i < r->count; i++) sniffer_ap_free(&r->aps[i]);
-        free(r->aps);
-        r->aps = NULL;
-    }
-    r->count = 0;
-    r->cap   = 0;
 }
 
 static bool sniffer_results_push_ap(sniffer_results_t *r, const parsed_sniffer_ap_t *ap)
@@ -595,6 +657,193 @@ static void handle_arp_discovery_line(const char *line)
             if (!dynvec_push(&s_arp_hosts, &host)) log_drop("arp_hosts");
             xSemaphoreGive(s_mutex);
         }
+    }
+}
+
+/* ---------- Mesh Recon (Zigbee) line parsing ---------- */
+
+/* Extract "key=value" (value runs to the next space). false if key absent. */
+static bool zig_get_value(const char *line, const char *key, char *out, size_t out_len)
+{
+    if (!line || !key || !out || out_len == 0) return false;
+    char pattern[32];
+    snprintf(pattern, sizeof(pattern), "%s=", key);
+    const char *p = strstr(line, pattern);
+    if (!p) return false;
+    p += strlen(pattern);
+    size_t i = 0;
+    while (p[i] && p[i] != ' ' && p[i] != '\r' && p[i] != '\n' && i < out_len - 1) {
+        out[i] = p[i];
+        i++;
+    }
+    out[i] = '\0';
+    return i > 0;
+}
+
+static int zig_get_int(const char *line, const char *key, int fallback)
+{
+    char value[24];
+    if (!zig_get_value(line, key, value, sizeof(value))) return fallback;
+    char *end = NULL;
+    long v = strtol(value, &end, 0);   /* base 0 => "0x.." hex and decimal */
+    if (end == value) return fallback;
+    return (int)v;
+}
+
+static uint32_t zig_get_u32(const char *line, const char *key, uint32_t fallback)
+{
+    char value[24];
+    if (!zig_get_value(line, key, value, sizeof(value))) return fallback;
+    return (uint32_t)strtoul(value, NULL, 0);
+}
+
+/* Channel bitmask (bits 11..26) -> "11,15,20". */
+static void zig_format_channels(uint32_t mask, char *out, size_t out_len)
+{
+    if (!out || out_len == 0) return;
+    out[0] = '\0';
+    for (int ch = 11; ch <= 26; ch++) {
+        if ((mask & (1UL << ch)) == 0) continue;
+        size_t used = strlen(out);
+        if (used >= out_len - 1) break;
+        snprintf(out + used, out_len - used, "%s%d", used > 0 ? "," : "", ch);
+    }
+    if (out[0] == '\0') snprintf(out, out_len, "--");
+}
+
+/* All three store helpers UPSERT so the graph is stable across polls; callers
+ * hold s_mutex. Broadcast PANs are hidden (Tab5 parity). */
+static void zig_store_pan_locked(const char *line)
+{
+    char kind[24] = {0};
+    zig_get_value(line, "kind", kind, sizeof(kind));
+    if (strcmp(kind, "broadcast") == 0) return;
+
+    char id[16] = {0};
+    if (!zig_get_value(line, "id", id, sizeof(id))) return;
+
+    zig_pan_t *pan = NULL;
+    for (size_t i = 0; i < s_zig_pans.count; i++) {
+        zig_pan_t *p = (zig_pan_t *)dynvec_at(&s_zig_pans, i);
+        if (p && strcmp(p->id, id) == 0) { pan = p; break; }
+    }
+    if (!pan) {
+        if ((int)s_zig_pans.count >= ZIG_MAX_PANS) return;
+        zig_pan_t fresh = {0};
+        pan = (zig_pan_t *)dynvec_push(&s_zig_pans, &fresh);
+        if (!pan) { log_drop("zig_pans"); return; }
+        strncpy(pan->id, id, sizeof(pan->id) - 1);
+    }
+    zig_get_value(line, "proto", pan->proto, sizeof(pan->proto));
+    zig_get_value(line, "confidence", pan->confidence, sizeof(pan->confidence));
+    pan->nodes   = zig_get_int(line, "nodes", pan->nodes);
+    pan->packets = zig_get_int(line, "packets", pan->packets);
+    pan->rssi    = zig_get_int(line, "best_rssi", zig_get_int(line, "last_rssi", pan->rssi));
+    pan->age_ms  = zig_get_int(line, "age_ms", -1);
+    zig_format_channels(zig_get_u32(line, "channels", 0), pan->channels, sizeof(pan->channels));
+}
+
+static void zig_store_node_locked(const char *line)
+{
+    char pan[16] = {0};
+    if (!zig_get_value(line, "pan", pan, sizeof(pan))) return;
+
+    /* Build a display addr: short "0x1234", or "EXT ...ABCD" for ext-only. */
+    char addr[24] = {0};
+    char addr_type[16] = {0}, short_addr[24] = {0}, ext_addr[32] = {0};
+    zig_get_value(line, "addr_type", addr_type, sizeof(addr_type));
+    zig_get_value(line, "short", short_addr, sizeof(short_addr));
+    zig_get_value(line, "ext", ext_addr, sizeof(ext_addr));
+    if (strcmp(addr_type, "ext") == 0 || strcmp(short_addr, "na") == 0) {
+        size_t el = strlen(ext_addr);
+        if (strncmp(ext_addr, "0x", 2) == 0 && el > 6)
+            snprintf(addr, sizeof(addr), "EXT ...%s", ext_addr + el - 4);
+        else
+            snprintf(addr, sizeof(addr), "EXT");
+    } else {
+        snprintf(addr, sizeof(addr), "%s", short_addr[0] ? short_addr : "0x????");
+    }
+
+    zig_node_t *node = NULL;
+    for (size_t i = 0; i < s_zig_nodes.count; i++) {
+        zig_node_t *n = (zig_node_t *)dynvec_at(&s_zig_nodes, i);
+        if (n && strcmp(n->pan, pan) == 0 && strcmp(n->addr, addr) == 0) { node = n; break; }
+    }
+    if (!node) {
+        if ((int)s_zig_nodes.count >= ZIG_MAX_NODES) return;
+        zig_node_t fresh = {0};
+        node = (zig_node_t *)dynvec_push(&s_zig_nodes, &fresh);
+        if (!node) { log_drop("zig_nodes"); return; }
+        strncpy(node->pan, pan, sizeof(node->pan) - 1);
+        strncpy(node->addr, addr, sizeof(node->addr) - 1);
+    }
+    zig_get_value(line, "role", node->role, sizeof(node->role));
+    zig_get_value(line, "vendor", node->vendor, sizeof(node->vendor));
+    zig_get_value(line, "device_hint", node->device_hint, sizeof(node->device_hint));
+    node->packets      = zig_get_int(line, "packets", node->packets);
+    node->rssi         = zig_get_int(line, "last_rssi", zig_get_int(line, "best_rssi", node->rssi));
+    node->lqi          = zig_get_int(line, "lqi", -1);
+    node->last_channel = zig_get_int(line, "last_channel", node->last_channel);
+    node->age_ms       = zig_get_int(line, "age_ms", -1);
+}
+
+static void zig_store_edge_locked(const char *line)
+{
+    char pan[16] = {0}, from[24] = {0}, to[24] = {0};
+    if (!zig_get_value(line, "pan", pan, sizeof(pan))) return;
+    if (!zig_get_value(line, "from", from, sizeof(from))) return;
+    if (!zig_get_value(line, "to", to, sizeof(to))) return;
+
+    zig_edge_t *edge = NULL;
+    for (size_t i = 0; i < s_zig_edges.count; i++) {
+        zig_edge_t *e = (zig_edge_t *)dynvec_at(&s_zig_edges, i);
+        if (e && strcmp(e->pan, pan) == 0 && strcmp(e->from, from) == 0 && strcmp(e->to, to) == 0) {
+            edge = e; break;
+        }
+    }
+    if (!edge) {
+        if ((int)s_zig_edges.count >= ZIG_MAX_EDGES) return;
+        zig_edge_t fresh = {0};
+        edge = (zig_edge_t *)dynvec_push(&s_zig_edges, &fresh);
+        if (!edge) { log_drop("zig_edges"); return; }
+        strncpy(edge->pan, pan, sizeof(edge->pan) - 1);
+        strncpy(edge->from, from, sizeof(edge->from) - 1);
+        strncpy(edge->to, to, sizeof(edge->to) - 1);
+    }
+    zig_get_value(line, "kind", edge->kind, sizeof(edge->kind));
+    edge->packets = zig_get_int(line, "packets", edge->packets);
+    edge->rssi    = zig_get_int(line, "last_rssi", zig_get_int(line, "rssi", edge->rssi));
+    edge->age_ms  = zig_get_int(line, "age_ms", -1);
+}
+
+/* Parse a single "[ZIG] ..." line into the mesh caches. State-independent:
+ * the [ZIG] prefix is unambiguous, so it works no matter which zig_recon_*
+ * poll is outstanding. "[ZIG] END" and unknown subtypes are ignored. */
+static void handle_zig_line(const char *line)
+{
+    if (!line || strncmp(line, "[ZIG] ", 6) != 0) return;
+
+    if (strncmp(line, "[ZIG] status ", 13) == 0) {
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        s_zig_status.active  = zig_get_int(line, "active", 0) != 0;
+        s_zig_status.channel = zig_get_int(line, "channel", 0);
+        s_zig_status.packets = zig_get_int(line, "packets", 0);
+        s_zig_status.pans    = zig_get_int(line, "pans", 0);
+        s_zig_status.dropped = zig_get_int(line, "dropped", 0);
+        s_zig_status.at_ms   = (uint32_t)(esp_timer_get_time() / 1000);
+        xSemaphoreGive(s_mutex);
+    } else if (strncmp(line, "[ZIG] pan ", 10) == 0) {
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        zig_store_pan_locked(line);
+        xSemaphoreGive(s_mutex);
+    } else if (strncmp(line, "[ZIG] node ", 11) == 0) {
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        zig_store_node_locked(line);
+        xSemaphoreGive(s_mutex);
+    } else if (strncmp(line, "[ZIG] edge ", 11) == 0) {
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        zig_store_edge_locked(line);
+        xSemaphoreGive(s_mutex);
     }
 }
 
@@ -1136,6 +1385,33 @@ static void sync_display_status(void)
     }
 }
 
+/* Aggregate a deauth sighting by BSSID (bump hit count / refresh fields, or
+ * append a new AP). Bounded so a flood can't grow memory without limit. */
+#define DEAUTH_EVENTS_MAX 128
+static void deauth_record(const char *bssid, const char *ap, int ch, int rssi)
+{
+    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+    deauth_event_t *arr = (deauth_event_t *)s_deauth_events.data;
+    for (int i = 0; i < (int)s_deauth_events.count; i++) {
+        if (strcmp(arr[i].bssid, bssid) == 0) {
+            arr[i].hits++;
+            arr[i].channel = ch;
+            arr[i].rssi    = rssi;
+            arr[i].last_ms = now;
+            if (ap[0]) { strncpy(arr[i].ap, ap, sizeof(arr[i].ap) - 1);
+                         arr[i].ap[sizeof(arr[i].ap) - 1] = '\0'; }
+            return;
+        }
+    }
+    if (s_deauth_events.count >= DEAUTH_EVENTS_MAX) return;
+    deauth_event_t e;
+    memset(&e, 0, sizeof(e));
+    strncpy(e.bssid, bssid, sizeof(e.bssid) - 1);
+    strncpy(e.ap,    ap,    sizeof(e.ap) - 1);
+    e.channel = ch; e.rssi = rssi; e.hits = 1; e.last_ms = now;
+    if (!dynvec_push(&s_deauth_events, &e)) log_drop("deauth_events");
+}
+
 /* Robust per-key parser. JanOS emits two RX schemas (KeeLoq/StarLine vs.
  * generic protocols), and the same applies to LIST entries; rather than
  * trying to anchor everything in one sscanf, look up each key and parse
@@ -1152,6 +1428,23 @@ static void parse_subghz_rx_fields(const char *data, subghz_signal_t *out)
     if ((p = strstr(data, "serial="))) sscanf(p, "serial=%23s", out->serial);
     if ((p = strstr(data, "btn=")))    sscanf(p, "btn=%d",      &out->btn);
     if ((p = strstr(data, "cnt=")))    sscanf(p, "cnt=%d",      &out->cnt);
+    if ((p = strstr(data, "name="))) {
+        p += 5;
+        static const char *const name_delims[] = {
+            " learn=", " mf=", " te=", " cnt=", " proto=",
+            " id=", " serial=", " btn=", " bits=", " freq=", " edges=",
+        };
+        const char *end = p + strlen(p);
+        for (size_t d = 0; d < sizeof(name_delims) / sizeof(name_delims[0]); d++) {
+            const char *hit = strstr(p, name_delims[d]);
+            if (hit && hit < end) end = hit;
+        }
+        size_t n = (size_t)(end - p);
+        while (n > 0 && (p[n - 1] == '\r' || p[n - 1] == '\n' || p[n - 1] == ' ')) n--;
+        if (n >= sizeof(out->name)) n = sizeof(out->name) - 1;
+        memcpy(out->name, p, n);
+        out->name[n] = '\0';
+    }
     if ((p = strstr(data, "id=")))     sscanf(p, "id=%23s",     out->id_str);
     if ((p = strstr(data, "te=")))     sscanf(p, "te=%d",       &out->te);
     if ((p = strstr(data, "proto=")))  sscanf(p, "proto=%d",    &out->proto);
@@ -1619,7 +1912,13 @@ static void on_uart_line(const char *line, void *ctx)
 {
     (void)ctx;
     s_last_uart_ms = esp_timer_get_time() / 1000;
-    s_c5_established = true;
+    if (strcmp(line, "pong") == 0) {
+        s_c5_established = true;
+    }
+
+    /* Capture every raw line into the serial ring so the web can poll it
+     * (reliable even when the WebSocket drops frames). */
+    serial_append(line);
 
     /* Sub-GHz event lines are state-independent; they can arrive at any time
      * while listening (RSSI/RX/RAW) or at any moment a TX completes. RSSI
@@ -1638,6 +1937,10 @@ static void on_uart_line(const char *line, void *ctx)
      * echo (long before the actual scan results arrive), so we accumulate
      * `Host:`/`port/tcp open` rows in a state-independent helper. */
     handle_nmap_line(line);
+
+    /* Mesh Recon: "[ZIG] pan|node|edge|status" lines arrive in response to the
+     * zig_recon_* polls; parse them regardless of FSM state. */
+    handle_zig_line(line);
 
     /* Bluetooth (scan_bt / scan_airtag) results also arrive after the FSM has
      * already flipped back to IDLE on the command echo, so parse them
@@ -1661,6 +1964,19 @@ static void on_uart_line(const char *line, void *ctx)
     /* Update display if available */
     if (s_display_cb) {
         s_display_cb(NULL, line);
+    }
+
+    /* Universal stop marker: JanOS prints "All operations stopped." whenever
+     * any long-running task ends -- via our `stop`, a physical button, or the
+     * serial console. Treat it as authoritative: force our FSM back to IDLE
+     * (so /api/status stops reporting the old run) and tell every client the
+     * operation ended, without waiting for the next status poll. */
+    if (strstr(line, "All operations stopped.")) {
+        s_wd_status.active = false;
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        s_state = STATE_IDLE;
+        xSemaphoreGive(s_mutex);
+        broadcast_json("{\"type\":\"attack_stopped\"}");
     }
 
     /* `sd_status` reply is state-independent (SD_OK / SD_NONE on its own line). */
@@ -1755,72 +2071,15 @@ static void on_uart_line(const char *line, void *ctx)
         xSemaphoreGive(s_mutex);
         broadcast_json("{\"type\":\"scan_complete\",\"count\":%d}", s_scan.count);
         ESP_LOGI(TAG, "Scan complete: %d networks", s_scan.count);
-        break;
-    }
-
-    case STATE_WARDRIVE_CONFIG: {
-        /* Swallow the `> get_wardrive_config` command echo so it isn't treated
-         * as the terminating prompt before any [WDCFG] line has arrived. */
-        if (!s_wardrive_config_echo_seen && strstr(line, "get_wardrive_config")) {
-            s_wardrive_config_echo_seen = true;
-            break;
-        }
-        /* Parse `[WDCFG] key=value` lines emitted by get_wardrive_config. */
-        const char *p = strstr(line, "[WDCFG]");
-        if (p) {
-            p += strlen("[WDCFG]");
-            while (*p == ' ') p++;
-            if (strncmp(p, "END", 3) == 0) {
-                s_wardrive_config.loaded = true;
-                s_wardrive_config_loaded = true;
-                xSemaphoreTake(s_mutex, portMAX_DELAY);
-                s_state = STATE_IDLE;
-                xSemaphoreGive(s_mutex);
-                broadcast_json("{\"type\":\"wardrive_config\",\"status\":\"loaded\"}");
-                break;
-            }
-            if (strncmp(p, "bands=", 6) == 0) {
-                s_wardrive_config.bands = 0;
-                if (strstr(p, "wifi24")) s_wardrive_config.bands |= WARDRIVE_BAND_WIFI24;
-                if (strstr(p, "wifi5"))  s_wardrive_config.bands |= WARDRIVE_BAND_WIFI5;
-                if (strstr(p, "ble"))    s_wardrive_config.bands |= WARDRIVE_BAND_BLE;
-            } else if (strncmp(p, "channels=", 9) == 0) {
-                const char *v = p + 9;
-                if (strncmp(v, "popular", 7) == 0) s_wardrive_config.channel_mode = WARDRIVE_CH_POPULAR;
-                else if (strncmp(v, "custom", 6) == 0) s_wardrive_config.channel_mode = WARDRIVE_CH_CUSTOM;
-                else s_wardrive_config.channel_mode = WARDRIVE_CH_ALL;
-            } else if (strncmp(p, "custom=", 7) == 0) {
-                snprintf(s_wardrive_config.custom_channels,
-                         sizeof(s_wardrive_config.custom_channels), "%s", p + 7);
-            } else if (strncmp(p, "wifi_rssi_delta=", 16) == 0) {
-                s_wardrive_config.wifi_rssi_delta = atoi(p + 16);
-            } else if (strncmp(p, "ble_rssi_delta=", 15) == 0) {
-                s_wardrive_config.ble_rssi_delta = atoi(p + 15);
-            } else if (strncmp(p, "startup_cooldown=", 17) == 0) {
-                s_wardrive_config.startup_cooldown = atoi(p + 17);
-            } else if (strncmp(p, "mem_cap=", 8) == 0) {
-                s_wardrive_config.mem_cap = atoi(p + 8);
-            } else if (strncmp(p, "antisurv_sensitivity=", 21) == 0) {
-                const char *v = p + 21;
-                if (strncmp(v, "low", 3) == 0) s_wardrive_config.antisurv_sensitivity = WARDRIVE_ANTISURV_LOW;
-                else if (strncmp(v, "high", 4) == 0) s_wardrive_config.antisurv_sensitivity = WARDRIVE_ANTISURV_HIGH;
-                else s_wardrive_config.antisurv_sensitivity = WARDRIVE_ANTISURV_MED;
-            } else if (strncmp(p, "gps=", 4) == 0) {
-                snprintf(s_wardrive_config.gps_module,
-                         sizeof(s_wardrive_config.gps_module), "%s", p + 4);
-            }
-            break;
-        }
-        /* Fallback: if the prompt arrives without an explicit [WDCFG] END, still
-         * finish so we never wedge in the config-read state. Only honor it after
-         * the command echo so the echo itself doesn't finalize the read early. */
-        if (is_prompt_line(line) && s_wardrive_config_echo_seen) {
-            s_wardrive_config.loaded = true;
-            s_wardrive_config_loaded = true;
-            xSemaphoreTake(s_mutex, portMAX_DELAY);
-            s_state = STATE_IDLE;
-            xSemaphoreGive(s_mutex);
-            broadcast_json("{\"type\":\"wardrive_config\",\"status\":\"loaded\"}");
+        /* Observer phase 2: this scan was launched as the first half of an
+         * observer start, so fire the sniffer now that JanOS has scan results
+         * to reuse. We're past the s_mutex give above, so cmd_do_sniffer_noscan
+         * (which re-takes it) is safe here. Independent of the web client, so
+         * the observer launches even if the phone left mid-scan. */
+        if (s_observer_pending) {
+            s_observer_pending = false;
+            ESP_LOGI(TAG, "Observer: scan done, auto-starting sniffer");
+            cmd_do_sniffer_noscan();
         }
         break;
     }
@@ -2394,6 +2653,12 @@ static void on_uart_line(const char *line, void *ctx)
             begin_sniffer_snapshot();
         }
 
+        /* Our own command echo -- mark it seen, don't treat as prompt. */
+        if (strstr(line, "show_sniffer_results")) {
+            s_sniffer_echo_seen = true;
+            break;
+        }
+
         if (parse_sniffer_empty_line(line)) {
             finish_sniffer_snapshot();
             break;
@@ -2424,7 +2689,7 @@ static void on_uart_line(const char *line, void *ctx)
             break;
         }
 
-        if (is_prompt_line(line)) {
+        if (is_prompt_line(line) && s_sniffer_echo_seen) {
             finish_sniffer_snapshot();
         }
         break;
@@ -2482,6 +2747,177 @@ static void on_uart_line(const char *line, void *ctx)
             xSemaphoreTake(s_mutex, portMAX_DELAY);
             s_state = STATE_IDLE;
             xSemaphoreGive(s_mutex);
+        }
+        break;
+    }
+
+    case STATE_WARDRIVE_CONFIG: {
+        const char *tag = strstr(line, "[WDCFG]");
+        if (tag) {
+            const char *p = tag + 7;         /* skip "[WDCFG]" */
+            while (*p == ' ') p++;
+            if (strncmp(p, "END", 3) == 0) {
+                s_wd_cfg = s_wd_cfg_build;
+                s_wd_cfg.valid = true;
+                xSemaphoreTake(s_mutex, portMAX_DELAY);
+                if (s_state == STATE_WARDRIVE_CONFIG) s_state = STATE_IDLE;
+                xSemaphoreGive(s_mutex);
+                broadcast_json("{\"type\":\"wardrive_config\"}");
+                break;
+            }
+            const char *eq = strchr(p, '=');
+            if (eq) {
+                char key[24];
+                int klen = (int)(eq - p);
+                if (klen > 0 && klen < (int)sizeof(key)) {
+                    memcpy(key, p, klen);
+                    key[klen] = '\0';
+                    const char *val = eq + 1;
+                    /* trim trailing CR/LF/space */
+                    char v[128];
+                    strncpy(v, val, sizeof(v) - 1);
+                    v[sizeof(v) - 1] = '\0';
+                    for (int i = (int)strlen(v) - 1; i >= 0 &&
+                         (v[i] == '\r' || v[i] == '\n' || v[i] == ' '); i--) v[i] = '\0';
+                    if      (!strcmp(key, "bands"))     strncpy(s_wd_cfg_build.bands, v, sizeof(s_wd_cfg_build.bands) - 1);
+                    else if (!strcmp(key, "channels"))  strncpy(s_wd_cfg_build.channels, v, sizeof(s_wd_cfg_build.channels) - 1);
+                    else if (!strcmp(key, "custom"))    strncpy(s_wd_cfg_build.custom, v, sizeof(s_wd_cfg_build.custom) - 1);
+                    else if (!strcmp(key, "wifi_rssi_delta"))    s_wd_cfg_build.wifi_delta = atoi(v);
+                    else if (!strcmp(key, "ble_rssi_delta"))     s_wd_cfg_build.ble_delta  = atoi(v);
+                    else if (!strcmp(key, "startup_cooldown"))   s_wd_cfg_build.cooldown   = atoi(v);
+                    else if (!strcmp(key, "mem_cap"))            s_wd_cfg_build.mem_cap    = atoi(v);
+                    else if (!strcmp(key, "antisurv_sensitivity")) strncpy(s_wd_cfg_build.antisurv, v, sizeof(s_wd_cfg_build.antisurv) - 1);
+                }
+            }
+            break;
+        }
+        if (is_prompt_line(line)) {
+            xSemaphoreTake(s_mutex, portMAX_DELAY);
+            if (s_state == STATE_WARDRIVE_CONFIG) s_state = STATE_IDLE;
+            xSemaphoreGive(s_mutex);
+        }
+        break;
+    }
+
+    case STATE_WARDRIVE_BLACKLIST: {
+        /* Rows are bare MACs "AA:BB:CC:DD:EE:FF"; header is
+         * "Blacklist: N/64 entries"; terminator is "Blacklist END". */
+        size_t len = strlen(line);
+        const char *p = line;
+        while (*p == ' ') p++;
+        if (strlen(p) >= 17 && p[2] == ':' && p[5] == ':' && !strstr(line, "Blacklist")) {
+            char mac[18];
+            strncpy(mac, p, 17);
+            mac[17] = '\0';
+            if (!dynvec_push(&s_wd_blacklist, mac)) log_drop("wd_blacklist");
+            break;
+        }
+        (void)len;
+        if (strstr(line, "Blacklist END") || is_prompt_line(line)) {
+            s_wd_blacklist_valid = true;
+            xSemaphoreTake(s_mutex, portMAX_DELAY);
+            if (s_state == STATE_WARDRIVE_BLACKLIST) s_state = STATE_IDLE;
+            xSemaphoreGive(s_mutex);
+            broadcast_json("{\"type\":\"wardrive_blacklist\",\"count\":%d}",
+                           (int)s_wd_blacklist.count);
+        }
+        break;
+    }
+
+    case STATE_WARDRIVE_RUN: {
+        /* Parse the key status lines into a cache the web polls over HTTP.
+         * This is the reliable path: the WebSocket can drop frames under the
+         * CSV flood, so we do NOT depend on it for the badge/stats. */
+        if (strstr(line, "GPS fix obtained") || strstr(line, "GPS fix recovered")) {
+            s_wd_status.gps_valid = true;
+            ESP_LOGI(TAG, "WD: GPS fix");
+        } else if (strstr(line, "GPS fix lost")) {
+            s_wd_status.gps_valid = false;
+            ESP_LOGI(TAG, "WD: GPS fix lost");
+        } else if (strstr(line, "Wardrive promisc:")) {
+            const char *p;
+            if ((p = strstr(line, "promisc:")))     s_wd_status.nets    = atoi(p + 8);
+            if ((p = strstr(line, "networks, ")))    s_wd_status.bt      = atoi(p + 10);
+            if ((p = strstr(line, "devices, ")))     s_wd_status.relogs  = atoi(p + 9);
+            if ((p = strstr(line, "best ch: ")))     s_wd_status.best_ch = atoi(p + 9);
+            if ((p = strstr(line, "sats: ")))        s_wd_status.sats    = atoi(p + 6);
+            if ((p = strstr(line, "dist: ")))        s_wd_status.dist    = atof(p + 6);
+            if (strstr(line, "GPS: valid"))          s_wd_status.gps_valid = true;
+            ESP_LOGI(TAG, "WD stats: fix=%d nets=%d bt=%d relogs=%d ch=%d sats=%d dist=%.0f",
+                     s_wd_status.gps_valid, s_wd_status.nets, s_wd_status.bt,
+                     s_wd_status.relogs, s_wd_status.best_ch, s_wd_status.sats, s_wd_status.dist);
+        } else if (strstr(line, "Flushed ") && strstr(line, " to ")) {
+            const char *path = strstr(line, " to ") + 4;
+            const char *base = strrchr(path, '/');
+            base = base ? base + 1 : path;
+            int i = 0;
+            while (base[i] && base[i] != '\r' && base[i] != '\n' &&
+                   base[i] != ' ' && i < (int)sizeof(s_wd_status.file) - 1) {
+                s_wd_status.file[i] = base[i];
+                i++;
+            }
+            s_wd_status.file[i] = '\0';
+            s_wd_status.gps_valid = true;  /* a flush means we're logging with a fix */
+        }
+
+        /* Streaming run. Status lines also flow through as raw uart_line events
+         * and are parsed client-side (WS fast path when it survives).
+         *
+         * BUT a flush emits 100+ CSV sighting rows in a burst. Broadcasting
+         * each as its own WS frame overflows the 16-slot queue and starves the
+         * low-rate status frames above -- which left the UI badge stuck on
+         * "Waiting for GPS fix" with no stats tile. Throttle the CSV rows
+         * (MAC...,WIFI / ...,BLE) to a trickle so the important frames always
+         * get through; the live table still samples sightings. */
+        size_t l = strlen(line);
+        bool is_csv = l > 18 && line[2] == ':' && line[5] == ':' &&
+                      ((l >= 5 && strcmp(line + l - 5, ",WIFI") == 0) ||
+                       (l >= 4 && strcmp(line + l - 4, ",BLE") == 0));
+        if (is_csv) {
+            static int64_t s_wd_csv_last_us = 0;
+            int64_t now = esp_timer_get_time();
+            if (now - s_wd_csv_last_us < 300000) return;  /* drop row, no WS flood */
+            s_wd_csv_last_us = now;
+        }
+        break;
+    }
+
+    case STATE_ANTISURV_RUN:
+        /* Follower alerts + summary are low-rate; forward as-is. */
+        break;
+
+    case STATE_DEAUTH_DETECT: {
+        /* Parse "[DEAUTH] CH: 6 | AP: MyNetwork (AA:BB:CC:DD:EE:FF) | RSSI: -45"
+         * into the aggregated cache the web polls (robust to WS drops during a
+         * deauth flood). */
+        const char *tag = strstr(line, "[DEAUTH]");
+        if (tag) {
+            int ch = 0, rssi = 0;
+            char ap[33] = {0}, bssid[18] = {0};
+            const char *p;
+            if ((p = strstr(tag, "CH:")))   ch   = atoi(p + 3);
+            if ((p = strstr(tag, "RSSI:"))) rssi = atoi(p + 5);
+            if ((p = strstr(tag, "AP:"))) {
+                p += 3;
+                while (*p == ' ') p++;
+                const char *paren = strchr(p, '(');
+                if (paren) {
+                    int n = (int)(paren - p);
+                    while (n > 0 && p[n - 1] == ' ') n--;
+                    if (n > (int)sizeof(ap) - 1) n = sizeof(ap) - 1;
+                    memcpy(ap, p, n);
+                    ap[n] = '\0';
+                    const char *b = paren + 1;
+                    const char *end = strchr(b, ')');
+                    if (end) {
+                        int bn = (int)(end - b);
+                        if (bn > (int)sizeof(bssid) - 1) bn = sizeof(bssid) - 1;
+                        memcpy(bssid, b, bn);
+                        bssid[bn] = '\0';
+                    }
+                }
+            }
+            if (bssid[0]) deauth_record(bssid, ap, ch, rssi);
         }
         break;
     }
@@ -2661,6 +3097,10 @@ void cmd_handler_init(void)
     dynvec_init(&s_handshakes,       sizeof(parsed_portal_file_t), 8);
     dynvec_init(&s_wardrive_logs,    sizeof(parsed_portal_file_t), 8);
     dynvec_init(&s_wardrive_files,   sizeof(wardrive_file_t),      8);
+    dynvec_init(&s_wd_blacklist,   sizeof(char[18]),             8);
+    dynvec_init(&s_deauth_events,  sizeof(deauth_event_t),       8);
+    memset(&s_wd_cfg,       0, sizeof(s_wd_cfg));
+    memset(&s_wd_cfg_build, 0, sizeof(s_wd_cfg_build));
     dynvec_init(&s_probes,         sizeof(parsed_probe_t),       8);
     dynvec_init(&s_probes_build,   sizeof(parsed_probe_t),       8);
     dynvec_init(&s_portal_captures,   sizeof(portal_capture_t),    8);
@@ -2669,16 +3109,16 @@ void cmd_handler_init(void)
     dynvec_init(&s_subghz_build,   sizeof(subghz_signal_t),      8);
     dynvec_init(&s_arp_hosts,      sizeof(arp_host_t),           8);
     dynvec_init(&s_nmap_hosts,     sizeof(nmap_host_t),          8);
+    dynvec_init(&s_zig_pans,       sizeof(zig_pan_t),            8);
+    dynvec_init(&s_zig_nodes,      sizeof(zig_node_t),           8);
+    dynvec_init(&s_zig_edges,      sizeof(zig_edge_t),           8);
     dynvec_init(&s_bt_devices,     sizeof(bt_device_t),          16);
     reset_sniffer_build();
 
     uart_bridge_register_line_cb(on_uart_line, NULL);
 
-    /* Keepalive: JanOS only chatters on its own during active work, so an
-     * otherwise-idle C5 would drop below the 15s "connected" window even
-     * though it's perfectly healthy. Ping it periodically while idle; the
-     * pong (or any reply) refreshes s_last_uart_ms. Skipped while a command
-     * is running so we never inject a stray "ping" mid-listing/attack. */
+    /* Retry the initial detection while idle. Stop permanently after the C5
+     * confirms the ping with `pong`; never inject a stray ping mid-command. */
     const esp_timer_create_args_t ka_args = {
         .callback = keepalive_timer_cb,
         .name     = "c5_keepalive",
@@ -2737,8 +3177,12 @@ const char *cmd_state_name(cmd_state_t s)
     case STATE_LISTING_SNIFFER:   return "listing_sniffer";
     case STATE_LISTING_HANDSHAKES:return "listing_handshakes";
     case STATE_LISTING_WARDRIVE:  return "listing_wardrive";
-    case STATE_WARDRIVE:          return "wardrive";
     case STATE_WARDRIVE_CONFIG:   return "wardrive_config";
+    case STATE_WARDRIVE_BLACKLIST:return "wardrive_blacklist";
+    case STATE_WARDRIVE_RUN:      return "wardrive_run";
+    case STATE_ANTISURV_RUN:      return "antisurv_run";
+    case STATE_DEAUTH_DETECT:     return "deauth_detect";
+    case STATE_WARDRIVE:          return "wardrive";
     case STATE_LISTING_WARDRIVE_FILES: return "listing_wardrive_files";
     case STATE_WARDRIVE_UPLOAD:   return "wardrive_upload";
     case STATE_GPS_RAW:           return "gps_raw";
@@ -2749,6 +3193,7 @@ const char *cmd_state_name(cmd_state_t s)
     case STATE_SUBGHZ_LIST:       return "subghz_list";
     case STATE_SUBGHZ_IMPORT:     return "subghz_import";
     case STATE_SUBGHZ_EXPORT:     return "subghz_export";
+    case STATE_ZIG_RECON:         return "zig_recon";
     }
     return "unknown";
 }
@@ -2798,6 +3243,8 @@ static bool is_listing_state(cmd_state_t s)
            s == STATE_LISTING_SNIFFER ||
            s == STATE_LISTING_HANDSHAKES ||
            s == STATE_LISTING_WARDRIVE ||
+           s == STATE_WARDRIVE_CONFIG ||
+           s == STATE_WARDRIVE_BLACKLIST ||
            s == STATE_LISTING_PROBES ||
            s == STATE_SUBGHZ_LIST ||
            s == STATE_SUBGHZ_IMPORT ||
@@ -2864,6 +3311,7 @@ static bool set_state_if_idle(cmd_state_t new_state)
 bool cmd_do_scan(void)
 {
     if (!set_state_if_idle(STATE_SCANNING)) return false;
+    s_observer_pending = false;   /* a bare scan must not auto-start the sniffer */
     scan_clear();
     s_scan_expected = -1;
     if (s_display_cb) s_display_cb("scan_networks", NULL);
@@ -2967,6 +3415,64 @@ bool cmd_do_sniffer_noscan(void)
     if (s_display_cb) s_display_cb("start_sniffer_noscan", NULL);
     uart_bridge_send("start_sniffer_noscan");
     broadcast_json("{\"type\":\"attack_started\",\"attack\":\"sniffer\"}");
+    return true;
+}
+
+/* Observer launch (phase 1). Runs a scan; the scan_done handler in
+ * on_uart_line fires cmd_do_sniffer_noscan once results are in. cmd_do_scan
+ * clears s_observer_pending, so we arm it only after the scan has started. */
+bool cmd_do_observer_start(void)
+{
+    if (!cmd_do_scan()) return false;
+    s_observer_pending = true;
+    return true;
+}
+
+/* ---------- Mesh Recon (Zigbee) commands ---------- */
+
+static void zig_reset_locked(void)
+{
+    dynvec_clear(&s_zig_pans);
+    dynvec_clear(&s_zig_nodes);
+    dynvec_clear(&s_zig_edges);
+    memset(&s_zig_status, 0, sizeof(s_zig_status));
+}
+
+bool cmd_do_zig_recon_start(void)
+{
+    if (!set_state_if_idle(STATE_ZIG_RECON)) return false;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    zig_reset_locked();
+    xSemaphoreGive(s_mutex);
+    if (s_display_cb) s_display_cb("start_zig_recon", NULL);
+    uart_bridge_send("start_zig_recon all 250");
+    broadcast_json("{\"type\":\"attack_started\",\"attack\":\"zig_recon\"}");
+    return true;
+}
+
+bool cmd_do_zig_recon_refresh(void)
+{
+    if (cmd_get_state() != STATE_ZIG_RECON) return false;
+    /* One query per call, rotating, so we never blast three commands into the
+     * Monster's CLI at once (JanOS processes input a line at a time). The web
+     * polls this ~1.3s, so status / PANs / nodes each refresh every ~4s —
+     * matching Tab5's pacing. Responses ([ZIG] lines) are parsed async by
+     * handle_zig_line into the caches the /api/zigbee/results endpoint reads. */
+    static int rot = 0;
+    switch (rot++ % 3) {
+        case 0:  uart_bridge_send("zig_recon_status");    break;
+        case 1:  uart_bridge_send("zig_recon_list all");  break;
+        default: uart_bridge_send("zig_recon_nodes all"); break;
+    }
+    return true;
+}
+
+bool cmd_do_zig_recon_clear(void)
+{
+    uart_bridge_send("zig_recon_clear");
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    zig_reset_locked();
+    xSemaphoreGive(s_mutex);
     return true;
 }
 
@@ -3266,12 +3772,14 @@ bool cmd_do_wifi_disconnect(void)
     return true;
 }
 
-bool cmd_do_stop(void)
+static bool cmd_do_stop_with_command(const char *command)
 {
-    if (s_display_cb) s_display_cb("stop", NULL);
-    uart_bridge_send("stop");
+    if (s_display_cb) s_display_cb(command, NULL);
+    uart_bridge_send(command);
 
     s_sniffer_collecting = false;
+    s_wd_status.active = false;
+    s_observer_pending = false;   /* cancel any pending observer scan->sniffer handoff */
     s_probe_resume_state = STATE_IDLE;
     s_subghz_import_count = 0;
     s_bt_scan_active = false;
@@ -3295,6 +3803,16 @@ bool cmd_do_stop(void)
 
     broadcast_json("{\"type\":\"attack_stopped\"}");
     return true;
+}
+
+bool cmd_do_stop(void)
+{
+    return cmd_do_stop_with_command("stop");
+}
+
+bool cmd_do_subghz_stop(void)
+{
+    return cmd_do_stop_with_command("subghz_stop");
 }
 
 bool cmd_do_list_portals(void)
@@ -3393,6 +3911,17 @@ bool cmd_do_list_wardrive_logs(void)
     return true;
 }
 
+/* ---------- Wardrive 2.0 config / control ---------- */
+
+bool cmd_do_wardrive_config_load(void)
+{
+    if (!set_state_if_idle(STATE_WARDRIVE_CONFIG)) return false;
+    memset(&s_wd_cfg_build, 0, sizeof(s_wd_cfg_build));
+    if (s_display_cb) s_display_cb("get_wardrive_config", NULL);
+    uart_bridge_send("get_wardrive_config");
+    return true;
+}
+
 bool cmd_do_start_wardrive(bool trace)
 {
     if (!set_state_if_idle(STATE_WARDRIVE)) return false;
@@ -3419,6 +3948,159 @@ bool cmd_do_get_wardrive_config(void)
     if (s_display_cb) s_display_cb("get_wardrive_config", NULL);
     uart_bridge_send("get_wardrive_config");
     return true;
+}
+
+void cmd_get_wardrive_cfg(wardrive_cfg_t *out)
+{
+    if (out) *out = s_wd_cfg;
+}
+
+bool cmd_do_wardrive_config_set(const wardrive_apply_t *a)
+{
+    if (!a) return false;
+    /* Config writes are only safe while idle (they hit NVS on the C5 and
+     * would otherwise interleave with an active scan/attack). */
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool idle = (s_state == STATE_IDLE);
+    xSemaphoreGive(s_mutex);
+    if (!idle) return false;
+
+    char cmd[192];
+    if (a->gps[0]) {
+        snprintf(cmd, sizeof(cmd), "gps_set %s", a->gps);
+        uart_bridge_send(cmd);
+    }
+    if (a->bands[0]) {
+        snprintf(cmd, sizeof(cmd), "set_wardrive_bands %s", a->bands);
+        uart_bridge_send(cmd);
+    }
+    if (a->channels[0]) {
+        if (!strcmp(a->channels, "custom") && a->custom[0])
+            snprintf(cmd, sizeof(cmd), "set_wardrive_channels custom %s", a->custom);
+        else
+            snprintf(cmd, sizeof(cmd), "set_wardrive_channels %s", a->channels);
+        uart_bridge_send(cmd);
+    }
+    if (a->wifi_delta >= 0) {
+        snprintf(cmd, sizeof(cmd), "set_wardrive_rssi_delta wifi %d", a->wifi_delta);
+        uart_bridge_send(cmd);
+    }
+    if (a->ble_delta >= 0) {
+        snprintf(cmd, sizeof(cmd), "set_wardrive_rssi_delta ble %d", a->ble_delta);
+        uart_bridge_send(cmd);
+    }
+    if (a->mem_cap >= 0) {
+        snprintf(cmd, sizeof(cmd), "set_wardrive_memcap %d", a->mem_cap);
+        uart_bridge_send(cmd);
+    }
+    if (a->cooldown >= 0) {
+        snprintf(cmd, sizeof(cmd), "set_wardrive_cooldown %d", a->cooldown);
+        uart_bridge_send(cmd);
+    }
+    if (a->antisurv[0]) {
+        snprintf(cmd, sizeof(cmd), "set_antisurv_sensitivity %s", a->antisurv);
+        uart_bridge_send(cmd);
+    }
+    /* Invalidate the cached snapshot so the next config load reflects NVS. */
+    s_wd_cfg.valid = false;
+    return true;
+}
+
+bool cmd_do_wardrive_start(bool trace)
+{
+    if (!set_state_if_idle(STATE_WARDRIVE_RUN)) return false;
+    memset(&s_wd_status, 0, sizeof(s_wd_status));
+    s_wd_status.active = true;
+    const char *c = trace ? "start_wardrive_promisc_trace" : "start_wardrive_promisc";
+    if (s_display_cb) s_display_cb(c, NULL);
+    uart_bridge_send(c);
+    broadcast_json("{\"type\":\"attack_started\",\"attack\":\"wardrive\"}");
+    return true;
+}
+
+bool cmd_do_antisurv_start(void)
+{
+    if (!set_state_if_idle(STATE_ANTISURV_RUN)) return false;
+    if (s_display_cb) s_display_cb("start_antisurveillance", NULL);
+    uart_bridge_send("start_antisurveillance");
+    broadcast_json("{\"type\":\"attack_started\",\"attack\":\"antisurv\"}");
+    return true;
+}
+
+bool cmd_do_deauth_detect_start(void)
+{
+    if (!set_state_if_idle(STATE_DEAUTH_DETECT)) return false;
+    dynvec_clear(&s_deauth_events);
+    if (s_display_cb) s_display_cb("deauth_detector", NULL);
+    uart_bridge_send("deauth_detector");
+    broadcast_json("{\"type\":\"attack_started\",\"attack\":\"deauth_detect\"}");
+    return true;
+}
+
+int cmd_get_deauth_events(deauth_event_t *out, int max)
+{
+    int n = (int)s_deauth_events.count < max ? (int)s_deauth_events.count : max;
+    if (n > 0 && out) memcpy(out, s_deauth_events.data, n * sizeof(deauth_event_t));
+    return n;
+}
+
+int cmd_get_deauth_events_count(void)
+{
+    return (int)s_deauth_events.count;
+}
+
+bool cmd_do_wardrive_blacklist_load(void)
+{
+    if (!set_state_if_idle(STATE_WARDRIVE_BLACKLIST)) return false;
+    dynvec_clear(&s_wd_blacklist);
+    s_wd_blacklist_valid = false;
+    if (s_display_cb) s_display_cb("wardrive_blacklist list", NULL);
+    uart_bridge_send("wardrive_blacklist list");
+    return true;
+}
+
+bool cmd_do_wardrive_blacklist_edit(const char *action, const char *mac)
+{
+    if (!action) return false;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool idle = (s_state == STATE_IDLE);
+    xSemaphoreGive(s_mutex);
+    if (!idle) return false;
+
+    char cmd[64];
+    if (!strcmp(action, "clear")) {
+        snprintf(cmd, sizeof(cmd), "wardrive_blacklist clear");
+    } else if ((!strcmp(action, "add") || !strcmp(action, "remove")) && mac && mac[0]) {
+        snprintf(cmd, sizeof(cmd), "wardrive_blacklist %s %s", action, mac);
+    } else {
+        return false;
+    }
+    if (s_display_cb) s_display_cb(cmd, NULL);
+    uart_bridge_send(cmd);
+    s_wd_blacklist_valid = false;   /* force reload on next GET */
+    return true;
+}
+
+bool cmd_get_wardrive_blacklist_valid(void)
+{
+    return s_wd_blacklist_valid;
+}
+
+void cmd_get_wardrive_status(wardrive_status_t *out)
+{
+    if (out) *out = s_wd_status;
+}
+
+int cmd_get_wardrive_blacklist(char (*out)[18], int max)
+{
+    int n = (int)s_wd_blacklist.count < max ? (int)s_wd_blacklist.count : max;
+    if (n > 0 && out) memcpy(out, s_wd_blacklist.data, n * sizeof(*out));
+    return n;
+}
+
+int cmd_get_wardrive_blacklist_count(void)
+{
+    return (int)s_wd_blacklist.count;
 }
 
 bool cmd_do_set_wardrive_config(const wardrive_config_t *cfg, bool apply_gps)
@@ -3599,9 +4281,8 @@ bool cmd_handshake_initial_done(void)
 
 bool cmd_is_c5_connected(void)
 {
-    /* Sticky: once the C5 has ever replied we consider it connected. This
-     * avoids periodic pings just to keep the indicator green while idle.
-     * Tradeoff: an idle unplug isn't reflected until a real command times out. */
+    /* Sticky: once the C5 confirms the initial ping with `pong`, it remains
+     * considered connected and automatic detection pings stay disabled. */
     return s_c5_established;
 }
 
@@ -3802,6 +4483,52 @@ void cmd_get_nmap_state(nmap_state_t *out)
     if (!out) return;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     *out = s_nmap_state;
+    xSemaphoreGive(s_mutex);
+}
+
+/* ---------- Mesh Recon (Zigbee) getters ---------- */
+
+int cmd_get_zig_pans(zig_pan_t *out, int max)
+{
+    if (!out || max <= 0) return 0;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    int n = (int)s_zig_pans.count < max ? (int)s_zig_pans.count : max;
+    if (n > 0) memcpy(out, s_zig_pans.data, (size_t)n * sizeof(zig_pan_t));
+    xSemaphoreGive(s_mutex);
+    return n;
+}
+
+int cmd_get_zig_pan_count(void) { return (int)s_zig_pans.count; }
+
+int cmd_get_zig_nodes(zig_node_t *out, int max)
+{
+    if (!out || max <= 0) return 0;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    int n = (int)s_zig_nodes.count < max ? (int)s_zig_nodes.count : max;
+    if (n > 0) memcpy(out, s_zig_nodes.data, (size_t)n * sizeof(zig_node_t));
+    xSemaphoreGive(s_mutex);
+    return n;
+}
+
+int cmd_get_zig_node_count(void) { return (int)s_zig_nodes.count; }
+
+int cmd_get_zig_edges(zig_edge_t *out, int max)
+{
+    if (!out || max <= 0) return 0;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    int n = (int)s_zig_edges.count < max ? (int)s_zig_edges.count : max;
+    if (n > 0) memcpy(out, s_zig_edges.data, (size_t)n * sizeof(zig_edge_t));
+    xSemaphoreGive(s_mutex);
+    return n;
+}
+
+int cmd_get_zig_edge_count(void) { return (int)s_zig_edges.count; }
+
+void cmd_get_zig_status(zig_status_t *out)
+{
+    if (!out) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    *out = s_zig_status;
     xSemaphoreGive(s_mutex);
 }
 

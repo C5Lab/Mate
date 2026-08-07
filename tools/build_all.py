@@ -4,7 +4,8 @@ build_all.py – build all board permutations of janos-web-client locally,
 mirroring the GitHub Actions workflow (espressif/idf:release-v6.0).
 
 Calls Docker directly from Python (no bash wrapper) to avoid MSYS path
-conversion issues on Windows. Build logic mirrors container_build.sh.
+conversion issues on Windows. This script is the single source of truth for
+the board build matrix, mirrored into CI via --print-matrix.
 
 Output layout:
   binaries/
@@ -25,6 +26,7 @@ Usage:
 """
 
 import argparse
+import json
 import shutil
 import subprocess
 import sys
@@ -52,6 +54,18 @@ BOARDS = {
         "idf_target":         "esp32c6",
         "sdkconfig_defaults": "sdkconfig.defaults;sdkconfig.defaults.nanoc6",
         "chip":               "esp32c6",
+        "flash_size":         "4MB",
+        "flash_mode":         "dio",
+        "flash_freq":         "80m",
+        "boot_offset":        "0x0",
+        "ptable_offset":      "0x8000",
+        "app_offset":         "0x10000",
+        "spiffs_offset":      "0x1D0000",  # 0x10000 + 0x1C0000 (partitions_4mb.csv)
+    },
+    "cardkb2": {
+        "idf_target":         "esp32c61",
+        "sdkconfig_defaults": "sdkconfig.defaults;sdkconfig.defaults.cardkb2",
+        "chip":               "esp32c61",
         "flash_size":         "4MB",
         "flash_mode":         "dio",
         "flash_freq":         "80m",
@@ -139,17 +153,71 @@ BOARDS = {
         "flash_size":         "4MB",
         "flash_mode":         "dio",
         "flash_freq":         "40m",
+        "default_baud":        115200,
+        "default_no_stub":     True,
         "boot_offset":        "0x1000",
         "ptable_offset":      "0x8000",
         "app_offset":         "0x10000",
         "spiffs_offset":      "0x1D0000",  # 0x10000 + 0x1C0000 (partitions_4mb.csv)
     },
+    "atom-lite-c25_21": {
+        "idf_target":         "esp32",
+        "sdkconfig_defaults": "sdkconfig.defaults;sdkconfig.defaults.atom-lite-c25_21",
+        "chip":               "esp32",
+        "flash_size":         "4MB",
+        "flash_mode":         "dio",
+        "flash_freq":         "40m",
+        "default_baud":        115200,
+        "default_no_stub":     True,
+        "boot_offset":        "0x1000",
+        "ptable_offset":      "0x8000",
+        "app_offset":         "0x10000",
+        "spiffs_offset":      "0x1D0000",  # 0x10000 + 0x1C0000 (partitions_4mb.csv)
+    },
+    "atom-matrix": {
+        "idf_target":         "esp32",
+        "sdkconfig_defaults": "sdkconfig.defaults;sdkconfig.defaults.atom-matrix",
+        "chip":               "esp32",
+        "flash_size":         "4MB",
+        "flash_mode":         "dio",
+        "flash_freq":         "40m",
+        "boot_offset":        "0x1000",
+        "ptable_offset":      "0x8000",
+        "app_offset":         "0x10000",
+        "spiffs_offset":      "0x1D0000",  # 0x10000 + 0x1C0000 (partitions_4mb.csv)
+    },
+    "coreink": {
+        "idf_target":         "esp32",
+        "sdkconfig_defaults": "sdkconfig.defaults;sdkconfig.defaults.coreink",
+        "chip":               "esp32",
+        "flash_size":         "4MB",
+        "flash_mode":         "dio",
+        "flash_freq":         "40m",
+        "boot_offset":        "0x1000",
+        "ptable_offset":      "0x8000",
+        "app_offset":         "0x10000",
+        "spiffs_offset":      "0x1D0000",  # 0x10000 + 0x1C0000 (partitions_4mb.csv)
+    },
+    "atoms3u": {
+        "idf_target":         "esp32s3",
+        "sdkconfig_defaults": "sdkconfig.defaults;sdkconfig.defaults.atoms3u",
+        "chip":               "esp32s3",
+        "flash_size":         "8MB",
+        "flash_mode":         "dio",
+        "flash_freq":         "80m",
+        "boot_offset":        "0x0",
+        "ptable_offset":      "0x8000",
+        "app_offset":         "0x10000",
+        "spiffs_offset":      "0x3D0000",  # 0x10000 + 0x3C0000 (partitions_8mb.csv)
+    },
 }
 
 IMAGE        = "espressif/idf:release-v6.0"
+NODE_IMAGE   = "node:24-alpine"
 REPO_ROOT    = Path(__file__).resolve().parent.parent
 BINARIES_DIR = REPO_ROOT / "binaries"
 CACHE_DIR    = REPO_ROOT / ".espressif"
+WEB_DIR      = REPO_ROOT / "web"
 
 # ---------------------------------------------------------------------------
 
@@ -172,7 +240,36 @@ def docker_available() -> bool:
         return False
 
 
-def build_board(board: str, keep_build: bool, out_root: Path) -> None:
+def build_web(use_docker: bool) -> None:
+    """Rebuild the Preact web UI into spiffs/ before packaging firmware.
+
+    The ESP-IDF container has no npm, so the firmware build alone embeds
+    whatever stale spiffs/app.js is on disk. Run `npm run build` here (vite
+    outputs to ../spiffs per web/vite.config.js) so the flashed UI always
+    matches web/src. Always run this in the Node Docker image: it keeps the
+    host's platform-specific node_modules out of the build."""
+    if not (WEB_DIR / "package.json").exists():
+        log("web/ not found — skipping web build")
+        return
+
+    if not use_docker:
+        sys.exit("The web UI build requires Docker. Use Docker or pass --no-web "
+                 "with --no-docker.")
+
+    log("=== Building web UI in Docker (npm run build -> spiffs/) ===")
+    # Shadow the host node_modules with an anonymous volume so host-installed
+    # binaries never leak into the Linux container.
+    run([
+        "docker", "run", "--rm",
+        "--volume", f"{REPO_ROOT}:/proj",
+        "--volume", "/proj/web/node_modules",
+        "--workdir", "/proj/web",
+        NODE_IMAGE,
+        "sh", "-c", "npm ci --no-audit --no-fund && npm run build",
+    ])
+
+
+def build_board(board: str, keep_build: bool, out_root: Path, use_docker: bool = True) -> None:
     cfg       = BOARDS[board]
     build_dir = REPO_ROOT / f"build-{board}"
     out_dir   = out_root / board
@@ -200,18 +297,24 @@ def build_board(board: str, keep_build: bool, out_root: Path) -> None:
         f" && idf.py -B build-{board} build"
     )
 
-    docker_cmd = [
-        "docker", "run", "--rm",
-        "--workdir", "/project",
-        "--env", f"IDF_TARGET={cfg['idf_target']}",
-        "--env", f"SDKCONFIG_DEFAULTS={cfg['sdkconfig_defaults']}",
-        "--volume", f"{REPO_ROOT}:/project",
-        "--volume", f"{CACHE_DIR}:/root/.espressif",
-        IMAGE,
-        "bash", "-c", idf_cmd,
-    ]
+    if use_docker:
+        cmd = [
+            "docker", "run", "--rm",
+            "--workdir", "/project",
+            "--env", f"IDF_TARGET={cfg['idf_target']}",
+            "--env", f"SDKCONFIG_DEFAULTS={cfg['sdkconfig_defaults']}",
+            "--volume", f"{REPO_ROOT}:/project",
+            "--volume", f"{CACHE_DIR}:/root/.espressif",
+            IMAGE,
+            "bash", "-c", idf_cmd,
+        ]
+    else:
+        # Native build: assume we're already inside the esp-idf container/host
+        # (e.g. GitHub Actions). Reuse the exact same idf command sequence so
+        # the anti-config-leak guarantees hold identically to the Docker path.
+        cmd = ["bash", "-c", idf_cmd]
 
-    run(docker_cmd)
+    run(cmd)
     _verify_config(board, cfg)
     _collect_artifacts(board, build_dir, out_dir)
     generate_flasher(board, out_dir)
@@ -281,10 +384,12 @@ flash_board.py – Mate firmware flasher for {board}
 Chip: {chip} | Flash: {flash_size} | Mode: {flash_mode} @ {flash_freq}
 
 Auto-installs esptool and pyserial into a local .venv if needed.
+Flashes with a full erase by default (reliable across board/partition
+changes); pass --no-erase for a faster same-board reflash.
 Usage:
-  python flash_board.py              # auto-detect port
+  python flash_board.py              # auto-detect port, full erase + flash
   python flash_board.py --port COM3
-  python flash_board.py --erase      # full erase before flash
+  python flash_board.py --no-erase   # skip erase (faster; same board only)
   python flash_board.py --monitor    # open serial monitor after flash
 """
 import os
@@ -308,7 +413,8 @@ CHIP          = "{chip}"
 FLASH_SIZE    = "{flash_size}"
 FLASH_MODE    = "{flash_mode}"
 FLASH_FREQ    = "{flash_freq}"
-DEFAULT_BAUD  = 460800
+DEFAULT_BAUD  = {default_baud}
+DEFAULT_NO_STUB = {default_no_stub}
 MIN_ESPTOOL   = "5.2.0"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -402,6 +508,18 @@ def check_files():
 def list_ports():
     return {{p.device for p in serial.tools.list_ports.comports()}}
 
+def flash_size_bytes():
+    s = FLASH_SIZE.strip().upper()
+    if s.endswith("MB"):
+        return int(s[:-2]) * 1024 * 1024
+    if s.endswith("M"):
+        return int(s[:-1]) * 1024 * 1024
+    if s.endswith("KB"):
+        return int(s[:-2]) * 1024
+    if s.endswith("K"):
+        return int(s[:-1]) * 1024
+    return int(s, 0)
+
 def wait_for_port(before, timeout=30.0):
     print(f"{{CYAN}}Hold BOOT and connect the board (or press BOOT + RESET).{{RESET}}")
     sp = ["|", "/", "-", "\\\\"]
@@ -417,16 +535,20 @@ def wait_for_port(before, timeout=30.0):
     print(f"\\n{{RED}}Timeout — no new port detected.{{RESET}}")
     sys.exit(1)
 
-def erase(port, baud):
+def erase(port, baud, no_stub=False):
     cmd = [sys.executable, "-m", "esptool",
            "-p", port, "-b", str(baud),
-           "--chip", CHIP, "--before", "default-reset", "--after", "no_reset",
-           "erase_flash"]
-    print(f"{{CYAN}}Erasing flash...{{RESET}}")
-    r = subprocess.run(cmd)
-    if r.returncode:
-        print(f"{{RED}}Erase failed ({{r.returncode}}).{{RESET}}")
-        sys.exit(r.returncode)
+           "--chip", CHIP, "--before", "default-reset", "--after", "no-reset"]
+    if no_stub:
+        cmd.append("--no-stub")
+        size = flash_size_bytes()
+        cmd += ["erase-region", "0x0", hex(size)]
+        mode = " (--no-stub erase-region 0x0..0x%X @ %d)" % (size, baud)
+    else:
+        cmd.append("erase-flash")
+        mode = " (@ %d)" % baud
+    print(f"{{CYAN}}Erasing flash{{mode}}...{{RESET}}")
+    return subprocess.run(cmd).returncode
 
 def flash(port, baud, no_stub=False):
     cmd = [sys.executable, "-m", "esptool",
@@ -476,9 +598,12 @@ def main():
     ap = argparse.ArgumentParser(description=f"Mate flasher – {{BOARD}}")
     ap.add_argument("--port",    help="Serial port (e.g. COM3 or /dev/ttyUSB0)")
     ap.add_argument("--baud",    type=int, default=DEFAULT_BAUD)
-    ap.add_argument("--erase",   action="store_true", help="Full erase before flashing")
+    ap.add_argument("--no-erase", action="store_true", help="Skip the full erase (faster; same-board reflash only)")
     ap.add_argument("--monitor", action="store_true", help="Serial monitor after flash")
-    ap.add_argument("--no-stub", action="store_true", help="Flash without the stub (slower, robust for finicky ESP32 modules)")
+    ap.add_argument("--no-stub", action="store_true", default=DEFAULT_NO_STUB,
+                    help="Flash without the stub (slower, robust for finicky ESP32 modules)")
+    ap.add_argument("--stub", action="store_false", dest="no_stub",
+                    help="Use the RAM stub flasher even on boards that default to --no-stub")
     args = ap.parse_args()
 
     check_files()
@@ -490,8 +615,14 @@ def main():
         port   = wait_for_port(before)
     print(f"{{GREEN}}Port: {{port}}{{RESET}}")
 
-    if args.erase:
-        erase(port, args.baud)
+    if not args.no_erase:
+        rc = erase(port, args.baud, no_stub=args.no_stub)
+        if rc and (not args.no_stub or args.baud != 115200):
+            print(f"{{YELLOW}}Erase failed at {{args.baud}} baud — retrying with --no-stub @ 115200...{{RESET}}")
+            rc = erase(port, 115200, no_stub=True)
+        if rc:
+            print(f"{{RED}}Erase failed ({{rc}}).{{RESET}}")
+            sys.exit(rc)
 
     rc = flash(port, args.baud, no_stub=args.no_stub)
     if rc and not args.no_stub:
@@ -524,6 +655,8 @@ def generate_flasher(board: str, out_dir: Path) -> None:
         ptable_offset  = cfg["ptable_offset"],
         app_offset     = cfg["app_offset"],
         spiffs_offset  = cfg["spiffs_offset"],
+        default_baud   = cfg.get("default_baud", 460800),
+        default_no_stub = "True" if cfg.get("default_no_stub", False) else "False",
     )
     dest = out_dir / "flash_board.py"
     dest.write_text(content, encoding="utf-8")
@@ -547,46 +680,156 @@ def parse_args() -> argparse.Namespace:
         "--output-dir", default=str(BINARIES_DIR),
         help=f"Root output directory (default: {BINARIES_DIR})",
     )
+    p.add_argument(
+        "--no-docker", action="store_true",
+        help="Run idf.py directly instead of via Docker (for CI inside the "
+             "espressif/idf container, or a host with esp-idf installed); "
+             "requires --no-web",
+    )
+    p.add_argument(
+        "--no-web", action="store_true",
+        help="Skip rebuilding the web UI; embed the existing spiffs/ as-is "
+             "(e.g. when the web was already built in a separate CI step)",
+    )
+    p.add_argument(
+        "--print-matrix", action="store_true",
+        help="Print the board build matrix as JSON and exit. Single source of "
+             "truth for the GitHub Actions matrix.",
+    )
+    p.add_argument(
+        "--retry-failed", action="store_true",
+        help="Rebuild only the boards that failed on the last run (read from "
+             "the .build_failed state file). Leaves all other boards untouched.",
+    )
+    p.add_argument(
+        "--retry", type=int, default=0, metavar="N",
+        help="Auto re-attempt boards that fail, up to N extra times in this "
+             "run (useful for flaky Docker/network failures). Default: 0.",
+    )
     return p.parse_args()
+
+
+def print_matrix() -> None:
+    """Emit the board matrix as a compact JSON array for GitHub Actions to
+    consume via `fromJSON`. Keeps the CI matrix in lockstep with BOARDS."""
+    matrix = [{"board": b, "idf_target": cfg["idf_target"]}
+              for b, cfg in BOARDS.items()]
+    print(json.dumps(matrix))
+
+
+STATE_FILE_NAME = ".build_failed"
+
+
+def clean_board_dirs(out_root: Path, boards: list) -> None:
+    for b in boards:
+        d = out_root / b
+        if d.exists():
+            log(f"Cleaning {d} ...")
+            shutil.rmtree(d)
+
+
+def build_boards(boards: list, keep_build: bool, out_root: Path,
+                 use_docker: bool) -> list:
+    """Build each board; return the list that failed (in order)."""
+    failed: list[str] = []
+    for board in boards:
+        try:
+            build_board(board, keep_build, out_root, use_docker=use_docker)
+            log(f"  -> artifacts written to {out_root / board}")
+        except SystemExit as exc:
+            log(f"  FAILED: {exc}")
+            failed.append(board)
+    return failed
 
 
 def main() -> None:
     args = parse_args()
 
-    if not docker_available():
+    if args.print_matrix:
+        print_matrix()
+        return
+
+    if not args.no_docker and not docker_available():
         sys.exit("Docker is not available. Please install Docker and ensure the daemon is running.")
 
-    if args.targets:
+    out_root   = Path(args.output_dir)
+    state_file = out_root / STATE_FILE_NAME
+
+    # Read the previous run's failures BEFORE any cleaning (a full build wipes
+    # out_root, taking the state file with it).
+    prev_failed: list[str] = []
+    if state_file.exists():
+        prev_failed = [b for b in state_file.read_text(encoding="utf-8").split()
+                       if b in BOARDS]
+
+    # Decide which boards to build. retry-failed and targets are both "subset"
+    # builds that leave untargeted boards' artifacts untouched.
+    if args.retry_failed:
+        if not prev_failed:
+            sys.exit(f"No failed boards recorded in {state_file}; nothing to "
+                     f"retry. Run a build first, or use --targets.")
+        boards = prev_failed
+        subset = True
+        log(f"Retrying last failed board(s): {', '.join(boards)}")
+    elif args.targets:
         boards = [b.strip() for b in args.targets.split(",")]
         unknown = [b for b in boards if b not in BOARDS]
         if unknown:
             sys.exit(f"Unknown board(s): {', '.join(unknown)}. Available: {', '.join(BOARDS)}")
+        subset = True
     else:
         boards = list(BOARDS.keys())
+        subset = False
 
-    out_root = Path(args.output_dir)
-
-    if out_root.exists():
-        log(f"Cleaning {out_root} ...")
-        shutil.rmtree(out_root)
-    out_root.mkdir(parents=True)
+    if subset:
+        # Only clear the boards we're about to rebuild, so siblings' artifacts
+        # (and their flashers) survive. CI builds one board per job into a
+        # shared tree and relies on this.
+        out_root.mkdir(parents=True, exist_ok=True)
+        clean_board_dirs(out_root, boards)
+    else:
+        # Full build: wipe everything so a removed board leaves no stale output.
+        if out_root.exists():
+            log(f"Cleaning {out_root} ...")
+            shutil.rmtree(out_root)
+        out_root.mkdir(parents=True)
 
     log(f"Build matrix ({len(boards)} jobs):")
     for b in boards:
         log(f"  {b}  [{BOARDS[b]['idf_target']}]")
 
-    failed: list[str] = []
-    for board in boards:
-        try:
-            build_board(board, args.keep_build, out_root)
-            log(f"  -> artifacts written to {out_root / board}")
-        except SystemExit as exc:
-            log(f"  FAILED: {exc}")
-            failed.append(board)
+    # Rebuild the web UI once (target-agnostic) so every board embeds fresh
+    # spiffs. This is the step build_all previously lacked, which meant
+    # firmware-only rebuilds silently shipped a stale UI.
+    if not args.no_web:
+        build_web(not args.no_docker)
+
+    failed = build_boards(boards, args.keep_build, out_root, not args.no_docker)
+
+    # Auto re-attempt flaky failures within this same run.
+    attempts_left = args.retry
+    while failed and attempts_left > 0:
+        attempts_left -= 1
+        log(f"Re-attempting {len(failed)} failed board(s) "
+            f"({attempts_left} more retr{'y' if attempts_left == 1 else 'ies'} after this): "
+            f"{', '.join(failed)}")
+        clean_board_dirs(out_root, failed)
+        failed = build_boards(failed, args.keep_build, out_root, not args.no_docker)
+
+    # Persist the failed set for --retry-failed. Merge with prior state: keep
+    # previously-failed boards we didn't touch this run, drop the ones we just
+    # fixed, add this run's failures.
+    new_state = (set(prev_failed) - set(boards)) | set(failed)
+    if new_state:
+        out_root.mkdir(parents=True, exist_ok=True)
+        state_file.write_text("\n".join(sorted(new_state)) + "\n", encoding="utf-8")
+    elif state_file.exists():
+        state_file.unlink()
 
     print()
     if failed:
         log(f"Build FAILED for: {', '.join(failed)}")
+        log("Rebuild just these with:  python tools/build_all.py --retry-failed")
         sys.exit(1)
     else:
         log(f"All {len(boards)} build(s) succeeded. Binaries in: {out_root}")

@@ -30,12 +30,12 @@ export function SubGhzJammer() {
   }
 
   async function stop() {
-    await api.stop();
+    await api.subghzStop();
     setRunning(false);
   }
 
   return (
-    <Layout title="SubGHZ Jammer" back="/subghz">
+    <Layout title="SubGHZ Jammer" back="/subghz" onBack={() => api.subghzStop()}>
       <section class="glass-card card-body reveal">
         <div class="section-head">
           <h3 class="section-title">Continuous TX</h3>
