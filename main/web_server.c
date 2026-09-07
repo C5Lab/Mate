@@ -485,6 +485,30 @@ static esp_err_t api_attack_post(httpd_req_t *req)
     else if (strstr(uri, "/sniffer_dog")) ok = cmd_do_sniffer_dog();
     else if (strstr(uri, "/sniffer"))    ok = cmd_do_sniffer();
     else if (strstr(uri, "/mitm"))       ok = cmd_do_mitm();
+    else if (strstr(uri, "/rogue_gitm")) {
+        char body[256] = {0};
+        if (req->content_len > 0) {
+            int received = httpd_req_recv(req, body, sizeof(body) - 1);
+            if (received < 0) body[0] = '\0';
+        }
+        char ssid[33] = {0}, pw[64] = {0};
+        json_get_string(body, "\"ssid\"", ssid, sizeof(ssid));
+        json_get_string(body, "\"password\"", pw, sizeof(pw));
+        ok = cmd_do_rogue_gitm(ssid, pw);
+    }
+    else if (strstr(uri, "/gitm")) {
+        char body[256] = {0};
+        if (req->content_len > 0) {
+            int received = httpd_req_recv(req, body, sizeof(body) - 1);
+            if (received < 0) body[0] = '\0';
+        }
+        char ssid[33] = {0}, pw[64] = {0}, pcap[96] = {0};
+        json_get_string(body, "\"ssid\"", ssid, sizeof(ssid));
+        json_get_string(body, "\"password\"", pw, sizeof(pw));
+        json_get_string(body, "\"pcap_name\"", pcap, sizeof(pcap));
+        ok = cmd_do_capture_gateway_start(ssid, pw[0] ? pw : NULL,
+                                          pcap[0] ? pcap : NULL);
+    }
     else if (strstr(uri, "/beacon_spam")) {
         char body[1024] = {0};
         if (req->content_len > 0) {
@@ -1012,6 +1036,76 @@ static esp_err_t api_nmap_results_get(httpd_req_t *req)
     }
     cw_printf(&cw, "]}");
     free(hosts);
+    return cw_finish(&cw);
+}
+
+/* ---------- Capture Gateway (GITM) / Rogue GITM ---------- */
+
+static void json_escape(char *dst, size_t dstsz, const char *src); /* fwd */
+
+/* POST /api/gitm/refresh -> send `capture_gateway status`. The `[CGW]` block is
+ * parsed asynchronously into the cached snapshot; the web then GETs
+ * /api/gitm/status. Mirrors the sniffer refresh/results split. */
+static esp_err_t api_gitm_refresh_post(httpd_req_t *req)
+{
+    send_json(req, cmd_do_gitm_status_refresh()
+        ? "{\"ok\":true}" : "{\"ok\":false,\"error\":\"busy\"}");
+    return ESP_OK;
+}
+
+/* GET /api/gitm/status -> the last committed `[CGW]` snapshot + `[PCAP_FINAL]`
+ * summary. Source of truth for the live view (robust to WS drops). */
+static esp_err_t api_gitm_status_get(httpd_req_t *req)
+{
+    cgw_snapshot_t s;
+    cgw_final_t f;
+    cmd_get_cgw_snapshot(&s);
+    cmd_get_cgw_final(&f);
+
+    char ssid_esc[80], up_esc[80], file_esc[264], final_esc[264];
+    json_escape(ssid_esc, sizeof(ssid_esc), s.ssid);
+    json_escape(up_esc, sizeof(up_esc), s.upstream_ssid);
+    json_escape(file_esc, sizeof(file_esc), s.file);
+    json_escape(final_esc, sizeof(final_esc), f.file);
+
+    chunked_writer_t cw;
+    cw_init(&cw, req);
+    cw_printf(&cw,
+        "{\"ok\":true,\"complete\":%s,\"active\":%s,\"upstream\":%s,\"napt\":%s,"
+        "\"capture_active\":%s,\"dns_proxy\":%s,\"adaptive\":%s,"
+        "\"channel\":%u,\"reported_clients\":%u,"
+        "\"ssid\":\"%s\",\"security\":\"%s\",\"upstream_ssid\":\"%s\","
+        "\"ap_ip\":\"%s\",\"sta_ip\":\"%s\",\"dns\":\"%s\",\"upstream_dns\":\"%s\","
+        "\"file\":\"%s\",\"pcap_scope\":\"%s\",\"client_isolation\":\"%s\","
+        "\"packets\":%u,\"drops\":%u,\"file_bytes\":%llu,"
+        "\"rate_limit_kbps\":%u,\"rate_effective_kbps\":%u,"
+        "\"rate_queue_drops\":%u,\"throttle_events\":%u,\"pause_events\":%u,"
+        "\"clients_truncated\":%s,\"clients\":[",
+        s.complete ? "true" : "false",
+        s.active ? "true" : "false",
+        s.upstream ? "true" : "false",
+        s.napt ? "true" : "false",
+        s.capture_active ? "true" : "false",
+        s.dns_proxy ? "true" : "false",
+        s.adaptive ? "true" : "false",
+        s.channel, s.reported_clients,
+        ssid_esc, s.security, up_esc,
+        s.ap_ip, s.sta_ip, s.dns, s.upstream_dns,
+        file_esc, s.pcap_scope, s.client_isolation,
+        (unsigned)s.packets, (unsigned)s.drops,
+        (unsigned long long)s.file_bytes,
+        (unsigned)s.rate_limit_kbps, (unsigned)s.rate_effective_kbps,
+        (unsigned)s.rate_queue_drops, (unsigned)s.throttle_events,
+        (unsigned)s.pause_events,
+        s.clients_truncated ? "true" : "false");
+    for (int i = 0; i < s.client_count; i++) {
+        cw_printf(&cw, "%s{\"mac\":\"%s\",\"ip\":\"%s\"}",
+                  i > 0 ? "," : "", s.clients[i].mac, s.clients[i].ip);
+    }
+    cw_printf(&cw,
+        "],\"final\":{\"valid\":%s,\"file\":\"%s\",\"frames\":%u,\"drops\":%u}}",
+        f.valid ? "true" : "false", final_esc,
+        (unsigned)f.frames, (unsigned)f.drops);
     return cw_finish(&cw);
 }
 
@@ -2050,6 +2144,8 @@ esp_err_t web_server_start(void)
     REGISTER_URI("/api/portal/captures", HTTP_GET,  api_portal_captures_get);
     REGISTER_URI("/api/sniffer_dog/results", HTTP_GET, api_sniffer_dog_results_get);
     REGISTER_URI("/api/nmap/results",    HTTP_GET,  api_nmap_results_get);
+    REGISTER_URI("/api/gitm/refresh",    HTTP_POST, api_gitm_refresh_post);
+    REGISTER_URI("/api/gitm/status",     HTTP_GET,  api_gitm_status_get);
     REGISTER_URI("/api/zigbee/start",    HTTP_POST, api_zigbee_start_post);
     REGISTER_URI("/api/zigbee/refresh",  HTTP_POST, api_zigbee_refresh_post);
     REGISTER_URI("/api/zigbee/clear",    HTTP_POST, api_zigbee_clear_post);

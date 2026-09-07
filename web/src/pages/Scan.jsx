@@ -71,6 +71,8 @@ const ATTACK_OPTIONS = [
   { id: 'mitm', label: 'MITM', available: true },
   { id: 'nmap', label: 'Nmap', available: true },
   { id: 'arp', label: 'ARP', available: true },
+  { id: 'gitm', label: 'GITM', available: true },
+  { id: 'rogue_gitm', label: 'Rogue GITM', available: true },
 ];
 
 const STA_REQUIRED_ATTACKS = new Set(['mitm', 'nmap', 'arp']);
@@ -682,8 +684,8 @@ export function Scan() {
       return;
     }
 
-    if (attack === 'sae' && targets.length !== 1) {
-      showToast('SAE Overflow requires exactly 1 target', 'warning');
+    if ((attack === 'sae' || attack === 'gitm' || attack === 'rogue_gitm') && targets.length !== 1) {
+      showToast(`${selectedAttack.label} requires exactly 1 target`, 'warning');
       return;
     }
 
@@ -696,6 +698,20 @@ export function Scan() {
 
     if (attack === 'rogueap') {
       route('/rogueap');
+      return;
+    }
+
+    /* GITM and Rogue GITM are two different attacks (capture_gateway start vs
+     * start_rogue_gitm). For GITM the selected network is the upstream uplink
+     * preselect; for Rogue GITM it's the victim to mirror. Their WiFi connect
+     * and start command happen on their own dedicated pages. */
+    if (attack === 'gitm') {
+      route('/gitm');
+      return;
+    }
+
+    if (attack === 'rogue_gitm') {
+      route('/roguegitm');
       return;
     }
 

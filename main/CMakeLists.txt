@@ -5,6 +5,7 @@ set(srcs
     "web_server.c"
     "command_handler.c"
     "response_parser.c"
+    "cgw_parser.c"
     "display.c"
     "dynvec.c"
     "power_sticks3.c"

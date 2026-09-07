@@ -40,6 +40,8 @@ import { DeauthDetector } from './pages/DeauthDetector';
 import { Portal } from './pages/Portal';
 import { SnifferDog } from './pages/SnifferDog';
 import { BeaconSpam } from './pages/BeaconSpam';
+import { GITM } from './pages/GITM';
+import { RogueGITM } from './pages/RogueGITM';
 import { SubGhz } from './pages/SubGhz';
 import { SubGhzListen } from './pages/subghz/Listen';
 import { SubGhzTransmit } from './pages/subghz/Transmit';
@@ -91,7 +93,7 @@ function SettingsIcon() {
 /* Bump this on every web change so the footer confirms which build is loaded.
  * If the footer version doesn't match the latest, the browser is serving a
  * cached/stale app.js (hard-refresh or open in a private tab). */
-export const WEB_VERSION = '0015';
+export const WEB_VERSION = '0017';
 
 export function App() {
   const [, forceUpdate] = useState(0);
@@ -403,6 +405,8 @@ export function App() {
           <SnifferDog path="/snifferdog" />
           <BeaconSpam path="/beaconspam" />
           <DeauthDetector path="/detector" />
+          <GITM path="/gitm" />
+          <RogueGITM path="/roguegitm" />
           <SubGhz path="/subghz" />
           <SubGhzListen path="/subghz/listen" />
           <SubGhzTransmit path="/subghz/transmit" />

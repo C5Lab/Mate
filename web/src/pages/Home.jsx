@@ -6,6 +6,7 @@ import { showToast } from '../components/Toast';
 const MODULES = [
   { id: 'scan', title: 'Scan APs', note: 'WiFi scan', icon: 'wifi', path: '/scan', accent: 'blue' },
   { id: 'attacks', title: 'Attacks', note: 'Controls', icon: 'radar', path: '/global', accent: 'red' },
+  { id: 'gitm', title: 'GITM', note: 'Capture Gateway', icon: 'ap', path: '/gitm', accent: 'red' },
   { id: 'detector', title: 'Detector', note: 'Deauth watch', icon: 'alert', path: '/detector', accent: 'red' },
   { id: 'subghz', title: 'SubGHZ', note: 'RF tools', icon: 'radio', path: '/subghz', accent: 'violet' },
   { id: 'observer', title: 'Observer', note: 'Telemetry', icon: 'eye', path: '/sniffer', accent: 'slate' },

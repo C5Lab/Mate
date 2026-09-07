@@ -1,6 +1,7 @@
 #pragma once
 
 #include "response_parser.h"
+#include "cgw_parser.h"
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -178,6 +179,8 @@ typedef enum {
     STATE_ATTACK_NMAP,
     STATE_ATTACK_ARP,
     STATE_ATTACK_ARP_BAN,
+    STATE_ATTACK_GITM,          /* Capture Gateway (GITM): NAPT + PCAP SoftAP */
+    STATE_ATTACK_ROGUE_GITM,    /* Rogue GITM: WPA2 mirror AP + Capture Gateway */
     STATE_ATTACK_BT_SCAN,
     STATE_ATTACK_BT_TRACK,
     STATE_ATTACK_AIRTAG,
@@ -344,6 +347,36 @@ bool cmd_do_arp(void);
 
 /** Start ARP ban (poison) for a single host MAC, optionally with IP. */
 bool cmd_do_arp_ban(const char *mac, const char *ip);
+
+/* ---------- Capture Gateway (GITM) / Rogue GITM ----------
+ * Both build on JanOS's `capture_gateway` engine. GITM stands up a dedicated
+ * NAPT SoftAP + PCAP recorder after `wifi_connect`; Rogue GITM adds a WPA2
+ * SoftAP mirror of a victim and optional same-channel deauth. The `[CGW]`
+ * status block and `[PCAP_FINAL]` stop summary are parsed into a cached
+ * snapshot the web polls over HTTP (robust to WebSocket drops). Stop uses the
+ * universal `stop` command, never `capture_gateway stop`. */
+
+/** Start Capture Gateway. Requires a prior `wifi_connect` with upstream IPv4.
+ *  `password` NULL/empty => open SoftAP; `pcap_name` NULL/empty => JanOS auto
+ *  name. Sends `capture_gateway start "<ssid>" ["<pass>"] [--pcap-name <name>]`. */
+bool cmd_do_capture_gateway_start(const char *ssid, const char *password,
+                                  const char *pcap_name);
+
+/** Start Rogue GITM. Requires a prior `wifi_connect` (uplink) and, for the
+ *  optional deauth, a prior `select_networks` of the victim. Sends
+ *  `start_rogue_gitm "<ssid>" "<password>"`. */
+bool cmd_do_rogue_gitm(const char *ssid, const char *password);
+
+/** Poll the gateway: sends `capture_gateway status`. The `[CGW]` block is
+ *  parsed asynchronously into the cached snapshot (see cmd_get_cgw_*). */
+bool cmd_do_gitm_status_refresh(void);
+
+/** Copy the last committed `[CGW]` status snapshot. `out->complete` is true
+ *  once at least one full block terminated by `[CGW] END` has been parsed. */
+void cmd_get_cgw_snapshot(cgw_snapshot_t *out);
+
+/** Copy the `[PCAP_FINAL]` stop summary (out->valid once a stop finalized). */
+void cmd_get_cgw_final(cgw_final_t *out);
 
 /** Mesh Recon (Zigbee/802.15.4): start capture (start_zig_recon all 250). */
 bool cmd_do_zig_recon_start(void);

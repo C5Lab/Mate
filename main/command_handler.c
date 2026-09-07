@@ -225,6 +225,18 @@ static nmap_state_t         s_nmap_state = {0};
 static int                  s_nmap_current_idx = -1; /* index into s_nmap_hosts */
 static bool                 s_nmap_active = false;   /* set by cmd_do_nmap, cleared on completion */
 
+/* Capture Gateway (GITM) / Rogue GITM cache. Same rationale as the nmap/ARP
+ * caches: the `[CGW]` status block streams in response to `capture_gateway
+ * status` polls, and the FSM flips back to IDLE on the command echo before the
+ * block arrives. The `[CGW]` / `[CGW_CLIENT]` / `[PCAP_FINAL]` prefixes are
+ * unambiguous, so we parse them state-independently and commit a snapshot only
+ * on the terminating `[CGW] END`. The web polls `/api/gitm/status` against this
+ * cache so the live view survives WS drops during channel hops. */
+static cgw_snapshot_t       s_cgw_accum;      /* block currently being assembled */
+static cgw_snapshot_t       s_cgw_snap;       /* last committed ([CGW] END) block */
+static cgw_final_t          s_cgw_final;      /* [PCAP_FINAL] stop summary */
+static bool                 s_gitm_active = false; /* armed by GITM/Rogue GITM start */
+
 /* Mesh Recon (Zigbee/802.15.4) caches. The Monster streams key=value
  * "[ZIG] status|pan|node|edge" lines in response to zig_recon_* poll commands;
  * we upsert them (keyed by pan id / addr / from-to) so the graph is stable
@@ -861,6 +873,68 @@ static void nmap_reset(void)
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     nmap_reset_locked();
     xSemaphoreGive(s_mutex);
+}
+
+/* ---------- Capture Gateway (GITM) parsing ---------- */
+
+static void cgw_reset(void)
+{
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    cgw_snapshot_reset(&s_cgw_accum);
+    cgw_snapshot_reset(&s_cgw_snap);
+    memset(&s_cgw_final, 0, sizeof(s_cgw_final));
+    xSemaphoreGive(s_mutex);
+}
+
+/* Parse `[CGW]` / `[CGW_CLIENT]` / `[PCAP_FINAL]` lines regardless of FSM
+ * state. The parser ignores everything else, so this is safe to call on every
+ * UART line. Commits a snapshot only on the terminating `[CGW] END`. */
+static void handle_cgw_line(const char *line)
+{
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    cgw_snapshot_t committed_snap;
+    bool committed = false;
+    if (cgw_parse_line(line, &s_cgw_accum)) {
+        s_cgw_snap = s_cgw_accum;                 /* full block terminated by END */
+        cgw_snapshot_reset(&s_cgw_accum);         /* ready for the next response */
+        committed_snap = s_cgw_snap;
+        committed = true;
+    }
+    xSemaphoreGive(s_mutex);
+
+    /* Broadcast a compact fast-path event outside the lock so an attached page
+     * can react before its next HTTP poll (GET /api/gitm/status stays the
+     * authoritative source). */
+    if (committed) {
+        broadcast_json(
+            "{\"type\":\"cgw_status\",\"active\":%s,\"upstream\":%s,\"napt\":%s,"
+            "\"capture\":%s,\"clients\":%d,\"channel\":%u,\"packets\":%u,"
+            "\"drops\":%u,\"rate_queue_drops\":%u}",
+            committed_snap.active ? "true" : "false",
+            committed_snap.upstream ? "true" : "false",
+            committed_snap.napt ? "true" : "false",
+            committed_snap.capture_active ? "true" : "false",
+            committed_snap.client_count, committed_snap.channel,
+            (unsigned)committed_snap.packets, (unsigned)committed_snap.drops,
+            (unsigned)committed_snap.rate_queue_drops);
+    }
+
+    cgw_final_t fin;
+    if (cgw_parse_final_line(line, &fin)) {
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        s_cgw_final = fin;
+        xSemaphoreGive(s_mutex);
+        char esc[256];
+        int j = 0;
+        for (int i = 0; fin.file[i] && j < (int)sizeof(esc) - 2; i++) {
+            if (fin.file[i] == '"' || fin.file[i] == '\\') esc[j++] = '\\';
+            esc[j++] = fin.file[i];
+        }
+        esc[j] = '\0';
+        broadcast_json(
+            "{\"type\":\"cgw_final\",\"file\":\"%s\",\"frames\":%u,\"drops\":%u}",
+            esc, (unsigned)fin.frames, (unsigned)fin.drops);
+    }
 }
 
 /* Append a host or update the existing entry that matches `ip`. Returns the
@@ -1937,6 +2011,12 @@ static void on_uart_line(const char *line, void *ctx)
      * echo (long before the actual scan results arrive), so we accumulate
      * `Host:`/`port/tcp open` rows in a state-independent helper. */
     handle_nmap_line(line);
+
+    /* Capture Gateway (GITM) / Rogue GITM: "[CGW]" / "[CGW_CLIENT]" status
+     * blocks and the "[PCAP_FINAL]" stop summary arrive in response to
+     * `capture_gateway status` / universal `stop`. The FSM has already flipped
+     * to IDLE on the command echo, so parse them state-independently. */
+    handle_cgw_line(line);
 
     /* Mesh Recon: "[ZIG] pan|node|edge|status" lines arrive in response to the
      * zig_recon_* polls; parse them regardless of FSM state. */
@@ -3168,6 +3248,8 @@ const char *cmd_state_name(cmd_state_t s)
     case STATE_ATTACK_NMAP:       return "nmap";
     case STATE_ATTACK_ARP:        return "arp";
     case STATE_ATTACK_ARP_BAN:    return "arp_ban";
+    case STATE_ATTACK_GITM:       return "gitm";
+    case STATE_ATTACK_ROGUE_GITM: return "rogue_gitm";
     case STATE_ATTACK_BT_SCAN:    return "bt_scan";
     case STATE_ATTACK_BT_TRACK:   return "bt_track";
     case STATE_ATTACK_AIRTAG:     return "airtag";
@@ -3673,6 +3755,81 @@ bool cmd_do_arp_ban(const char *mac, const char *ip)
     return true;
 }
 
+/* ---------- Capture Gateway (GITM) / Rogue GITM ---------- */
+
+/* Validate a `--pcap-name` basename: JanOS accepts [A-Za-z0-9._-] only and
+ * never overwrites, so a bad char here would be rejected downstream. We just
+ * drop the flag rather than send something the device refuses. */
+static bool cgw_pcap_name_ok(const char *name)
+{
+    if (!name || !name[0]) return false;
+    for (const char *p = name; *p; p++) {
+        char c = *p;
+        bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                  (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-';
+        if (!ok) return false;
+    }
+    return strlen(name) <= 90;   /* leave room for ".pcap" (max 95 incl. ext) */
+}
+
+bool cmd_do_capture_gateway_start(const char *ssid, const char *password,
+                                  const char *pcap_name)
+{
+    if (!ssid || !ssid[0]) return false;
+    if (!set_state_if_idle(STATE_ATTACK_GITM)) return false;
+
+    /* Arm parsing and clear any previous session's snapshot so the live view
+     * starts from the fresh block this start emits. */
+    cgw_reset();
+    s_gitm_active = true;
+
+    /* Quote the SSID/password so values with spaces survive the CLI split. */
+    char cmd[256];
+    int n;
+    if (password && password[0]) {
+        n = snprintf(cmd, sizeof(cmd),
+                     "capture_gateway start \"%s\" \"%s\"", ssid, password);
+    } else {
+        n = snprintf(cmd, sizeof(cmd),
+                     "capture_gateway start \"%s\"", ssid);
+    }
+    if (n > 0 && n < (int)sizeof(cmd) && cgw_pcap_name_ok(pcap_name)) {
+        snprintf(cmd + n, sizeof(cmd) - n, " --pcap-name %s", pcap_name);
+    }
+
+    if (s_display_cb) s_display_cb(cmd, NULL);
+    uart_bridge_send(cmd);
+    broadcast_json("{\"type\":\"attack_started\",\"attack\":\"gitm\"}");
+    return true;
+}
+
+bool cmd_do_rogue_gitm(const char *ssid, const char *password)
+{
+    if (!ssid || !ssid[0]) return false;
+    if (!password || !password[0]) return false;   /* WPA2 mirror requires a key */
+    if (!set_state_if_idle(STATE_ATTACK_ROGUE_GITM)) return false;
+
+    cgw_reset();
+    s_gitm_active = true;
+
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "start_rogue_gitm \"%s\" \"%s\"", ssid, password);
+
+    if (s_display_cb) s_display_cb(cmd, NULL);
+    uart_bridge_send(cmd);
+    broadcast_json("{\"type\":\"attack_started\",\"attack\":\"rogue_gitm\"}");
+    return true;
+}
+
+bool cmd_do_gitm_status_refresh(void)
+{
+    /* Fire-and-forget status poll: the `[CGW]` block is parsed asynchronously
+     * in handle_cgw_line() regardless of FSM state, so we don't touch it. */
+    if (s_display_cb) s_display_cb("capture_gateway status", NULL);
+    uart_bridge_send("capture_gateway status");
+    return true;
+}
+
 bool cmd_do_bt_scan(void)
 {
     if (!set_state_if_idle(STATE_ATTACK_BT_SCAN)) return false;
@@ -3785,6 +3942,7 @@ static bool cmd_do_stop_with_command(const char *command)
     s_bt_scan_active = false;
     s_bt_track_active = false;
     s_airtag_active = false;
+    s_gitm_active = false;
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     cmd_state_t prev = s_state;
@@ -3794,10 +3952,13 @@ static bool cmd_do_stop_with_command(const char *command)
     /* Bug 2: stopping MITM / NMAP / ARP_BAN on JanOS also tears down the
      * STA association, but the "Wi-Fi: disconnected" line is not always
      * emitted. Mark Mate's view of STA as disconnected so the next
-     * STA-required attack re-prompts for the password. */
+     * STA-required attack re-prompts for the password. GITM / Rogue GITM
+     * likewise drop the STA uplink when the gateway tears down. */
     if (prev == STATE_ATTACK_MITM ||
         prev == STATE_ATTACK_NMAP ||
-        prev == STATE_ATTACK_ARP_BAN) {
+        prev == STATE_ATTACK_ARP_BAN ||
+        prev == STATE_ATTACK_GITM ||
+        prev == STATE_ATTACK_ROGUE_GITM) {
         mark_sta_disconnected();
     }
 
@@ -4483,6 +4644,22 @@ void cmd_get_nmap_state(nmap_state_t *out)
     if (!out) return;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     *out = s_nmap_state;
+    xSemaphoreGive(s_mutex);
+}
+
+void cmd_get_cgw_snapshot(cgw_snapshot_t *out)
+{
+    if (!out) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    *out = s_cgw_snap;
+    xSemaphoreGive(s_mutex);
+}
+
+void cmd_get_cgw_final(cgw_final_t *out)
+{
+    if (!out) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    *out = s_cgw_final;
     xSemaphoreGive(s_mutex);
 }
 

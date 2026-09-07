@@ -41,6 +41,15 @@ export const api = {
   snifferDogResults: ()       => get('/api/sniffer_dog/results'),
   nmapResults:    ()          => get('/api/nmap/results'),
   arpBan:         (mac, ip)   => post('/api/attack/arp_ban', { mac, ip: ip || '' }),
+  /* Capture Gateway (GITM) + Rogue GITM. gitmStart needs a prior wifiConnect
+   * (upstream). rogueGitm needs a prior wifiConnect (uplink) + select(victim).
+   * gitmRefresh triggers a `capture_gateway status` poll; gitmStatus reads the
+   * firmware-parsed [CGW] snapshot (source of truth, robust to WS drops). */
+  gitmStart:      (ssid, pw, pcapName) =>
+                    post('/api/attack/gitm', { ssid, password: pw || '', pcap_name: pcapName || '' }),
+  rogueGitm:      (ssid, pw)  => post('/api/attack/rogue_gitm', { ssid, password: pw || '' }),
+  gitmRefresh:    ()          => post('/api/gitm/refresh'),
+  gitmStatus:     ()          => get('/api/gitm/status'),
   btScan:         ()          => post('/api/attack/bt_scan'),
   btTrack:        (mac)       => post('/api/attack/bt_track', { mac }),
   airtag:         ()          => post('/api/attack/airtag'),
