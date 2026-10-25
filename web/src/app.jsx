@@ -48,16 +48,24 @@ import { SubGhzTransmit } from './pages/subghz/Transmit';
 import { SubGhzManage } from './pages/subghz/Manage';
 import { SubGhzJammer } from './pages/subghz/Jammer';
 import { SubGhzTesla } from './pages/subghz/Tesla';
+import { Nfc } from './pages/Nfc';
+import { NfcRead } from './pages/nfc/Read';
+import { NfcLibrary } from './pages/nfc/Library';
+import { NfcDetail } from './pages/nfc/Detail';
+import { NfcEmulate } from './pages/nfc/Emulate';
 
 function normalizeStatus(value) {
   if (!value) return 'idle';
   if (value === 'scan') return 'scanning';
+  /* Dashboard file counts (list_dir of handshakes, portals, …) are not an
+   * operation the user started. Leave them out of the home tile. */
+  if (value.startsWith('listing_')) return 'idle';
   return value;
 }
 
 /* Device FSM states (mirrors the firmware `cmd_state_name` strings) that count
  * as a foreground attack for the global Scan lock. Scanning / listing /
- * wardrive / antisurv / subghz are deliberately excluded — they have their own
+ * wardrive / antisurv / subghz / nfc are deliberately excluded — they have their own
  * UI and run flags. */
 const ATTACK_RUNNING_STATES = new Set([
   'deauth', 'eviltwin', 'rogueap', 'portal', 'sae', 'handshake',
@@ -93,7 +101,7 @@ function SettingsIcon() {
 /* Bump this on every web change so the footer confirms which build is loaded.
  * If the footer version doesn't match the latest, the browser is serving a
  * cached/stale app.js (hard-refresh or open in a private tab). */
-export const WEB_VERSION = '0017';
+export const WEB_VERSION = '0024';
 
 export function App() {
   const [, forceUpdate] = useState(0);
@@ -413,6 +421,11 @@ export function App() {
           <SubGhzManage path="/subghz/manage" />
           <SubGhzJammer path="/subghz/jammer" />
           <SubGhzTesla path="/subghz/tesla" />
+          <Nfc path="/nfc" />
+          <NfcRead path="/nfc/read" />
+          <NfcLibrary path="/nfc/library" />
+          <NfcDetail path="/nfc/card/:idx" />
+          <NfcEmulate path="/nfc/emulate/:idx" />
         </Router>
       </main>
 

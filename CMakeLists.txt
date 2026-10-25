@@ -8,7 +8,9 @@ project(janos-web-client)
 find_program(NPM_BIN npm)
 if(NPM_BIN)
     add_custom_target(web_build
-        COMMAND ${NPM_BIN} run build
+        COMMAND ${CMAKE_COMMAND} -E env
+            PATH=/opt/homebrew/opt/node@24/bin:$ENV{PATH}
+            ${NPM_BIN} run build
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/web
         COMMENT "Building Preact web UI..."
         BYPRODUCTS ${CMAKE_SOURCE_DIR}/spiffs/app.js

@@ -2,6 +2,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <stdbool.h>
 #include <stdarg.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -26,6 +27,7 @@ static int s_cb_count = 0;
 
 static char s_line_buf[UART_BRIDGE_LINE_MAX];
 static int  s_line_pos = 0;
+static bool s_line_discard = false;
 
 static uint32_t millis(void)
 {
@@ -80,7 +82,7 @@ static void uart_rx_task(void *arg)
             char c = (char)rx_buf[i];
 
             if (c == '\n' || c == '\r') {
-                if (s_line_pos > 0) {
+                if (s_line_pos > 0 && !s_line_discard) {
                     s_line_buf[s_line_pos] = '\0';
                     /* Mirror the TX log so the user sees both sides of the
                      * conversation in the Mate console. INFO level by design
@@ -89,18 +91,17 @@ static void uart_rx_task(void *arg)
                      * essential for diagnosing parser issues. */
                     ESP_LOGI(TAG, "RX: %s", s_line_buf);
                     dispatch_line(s_line_buf);
-                    s_line_pos = 0;
                 }
-            } else {
-                if (s_line_pos < UART_BRIDGE_LINE_MAX - 1) {
-                    s_line_buf[s_line_pos++] = c;
-                } else if (s_line_pos == UART_BRIDGE_LINE_MAX - 1) {
-                    s_line_buf[s_line_pos] = '\0';
-                    ESP_LOGW(TAG, "Line too long, truncating: %.40s...", s_line_buf);
-                    ESP_LOGI(TAG, "RX (truncated): %s", s_line_buf);
-                    dispatch_line(s_line_buf);
-                    s_line_pos = 0;
+                s_line_pos = 0;
+                s_line_discard = false;
+            } else if (c == 0 || s_line_pos >= UART_BRIDGE_LINE_MAX - 1) {
+                if (!s_line_discard) {
+                    ESP_LOGW(TAG, "Line too long, discarding");
                 }
+                s_line_pos = 0;
+                s_line_discard = true;
+            } else if (!s_line_discard) {
+                s_line_buf[s_line_pos++] = c;
             }
         }
     }

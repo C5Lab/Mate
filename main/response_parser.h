@@ -87,6 +87,7 @@ bool parse_probe_line(const char *line, parsed_probe_t *p);
  * indexing the buffer directly. */
 typedef struct {
     char  ssid[33];
+    char  bssid[18];
     int   channel;
     int   client_total;
     int   client_count;

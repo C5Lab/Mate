@@ -9,6 +9,7 @@ const MODULES = [
   { id: 'gitm', title: 'GITM', note: 'Capture Gateway', icon: 'ap', path: '/gitm', accent: 'red' },
   { id: 'detector', title: 'Detector', note: 'Deauth watch', icon: 'alert', path: '/detector', accent: 'red' },
   { id: 'subghz', title: 'SubGHZ', note: 'RF tools', icon: 'radio', path: '/subghz', accent: 'violet' },
+  { id: 'nfc', title: 'NFC', note: 'Read / emulate', icon: 'nfc', path: '/nfc', accent: 'cyan' },
   { id: 'observer', title: 'Observer', note: 'Telemetry', icon: 'eye', path: '/sniffer', accent: 'slate' },
   { id: 'wardrive', title: 'Wardrive', note: 'GPS logs', icon: 'map', path: '/wardrive', accent: 'yellow' },
   { id: 'mesh', title: 'Mesh Recon', note: 'Zigbee/802.15.4', icon: 'mesh', path: '/mesh', accent: 'violet' },
@@ -101,6 +102,14 @@ function Glyph({ name }) {
         <path d="M5.5 5.5a9 9 0 0 0 0 13M18.5 5.5a9 9 0 0 1 0 13" />
       </svg>
     ),
+    nfc: (
+      <svg {...common}>
+        <rect x="5" y="6" width="14" height="12" rx="2.4" />
+        <path d="M8.5 12a4 4 0 0 1 7 0" />
+        <path d="M10.2 12a2.2 2.2 0 0 1 3.6 0" />
+        <circle cx="12" cy="12" r="0.9" fill="currentColor" stroke="none" />
+      </svg>
+    ),
     mesh: (
       <svg {...common}>
         <circle cx="12" cy="5" r="2.2" />
@@ -137,6 +146,9 @@ function operationLabel(status) {
     subghz: 'SubGHz',
     subghz_listen: 'SubGHz Listen',
     subghz_jam: 'SubGHz Jam',
+    nfc: 'NFC',
+    nfc_read: 'NFC Read',
+    nfc_emulate: 'NFC Emulate',
     wardrive: 'Wardrive',
     wardrive_run: 'Wardrive',
     antisurv: 'Anti-Surveillance',

@@ -1,8 +1,10 @@
 #include "command_handler.h"
 #include "uart_bridge.h"
 #include "response_parser.h"
+#include "nfc_parser.h"
 #include "display.h"
 #include "dynvec.h"
+#include "janos_sniffer_session.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -10,6 +12,7 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <stdatomic.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -84,6 +87,31 @@ static bool                 s_sniffer_collecting = false;
  * own command echo. Reset in begin_sniffer_snapshot(). */
 static bool                 s_sniffer_echo_seen = false;
 static int                  s_sniffer_ap_index = -1;
+/* unselect_networks (sent immediately before start_sniffer / start_sniffer_noscan)
+ * calls JanOS cmd_stop. That prints "Stop command received" and
+ * "All operations stopped." before the sniffer command is even echoed.
+ * Those lines are the prelude, not the end of the sniffer we just armed.
+ * Cleared on the start-command echo, on "Started sniffer" / "Now monitoring",
+ * on the first packet-count line, on an explicit stop, or after 5s. */
+static bool                 s_sniffer_arming = false;
+static int64_t              s_sniffer_arming_since_us = 0;
+/* Last time we asked JanOS for show_sniffer_clients while the sniffer runs.
+ * The phone's packet counter is live, but the AP/client list stays empty
+ * until something actually requests the snapshot. */
+static int64_t              s_sniffer_clients_refresh_us = 0;
+static void begin_sniffer_snapshot(void);
+static void sniffer_maybe_refresh_clients(void);
+static bool sniffer_send_station_deauth(const uint8_t ap[6], const uint8_t sta[6]);
+static void sniffer_flush_pending_deauth(void);
+static JsSession            s_js;
+/* Clicked pair waiting until the in-flight client snapshot frees the UART.
+ * js_load frees the live model, so D cannot require JS_READY at click time. */
+static uint8_t              s_deauth_ap[6];
+static uint8_t              s_deauth_sta[6];
+static atomic_bool          s_deauth_pending;
+/* Set by an explicit stop so a deferred click cannot TX after stop. */
+static atomic_bool          s_deauth_cancel;
+static esp_timer_handle_t   s_js_timer = NULL;
 /* Echo guards: while the sniffer attack runs, JanOS keeps emitting background
  * "> Sniffer packet count: N" lines that is_prompt_line() would otherwise treat
  * as the end of a `show_sniffer_results` / `list_probes` reply, prematurely
@@ -92,13 +120,15 @@ static int                  s_sniffer_ap_index = -1;
 static bool                 s_probes_echo_seen = false;
 static int                  s_handshake_count = -1;
 static bool                 s_handshake_initial_done = false;
-/* Header guard for `list_dir` replies. JanOS echoes the command back as a
- * "> list_dir ..." line, which is_prompt_line() treats as a CLI prompt; if we
- * ended the listing there we'd flip to IDLE before any file rows arrive. Only
- * start parsing (and only honor a terminating prompt) after the "Files in ..."
- * header. */
+/* list_dir echo is "> list_dir ...", which is_prompt_line() does not treat as
+ * the CLI prompt. A bare ">" after that echo is the end, including when JanOS
+ * has no SD and never prints "Files in ...". Without the echo flag that error
+ * reply left the FSM in listing_handshakes and the home tile showed it as the
+ * current operation. */
 static bool                 s_handshake_header_seen = false;
+static bool                 s_handshake_echo_seen = false;
 static bool                 s_wardrive_header_seen = false;
+static bool                 s_wardrive_echo_seen = false;
 static dynvec_t             s_handshakes;     /* parsed_portal_file_t */
 static dynvec_t             s_wardrive_logs;  /* parsed_portal_file_t */
 static wardrive_cfg_t       s_wd_cfg;         /* last parsed [WDCFG] snapshot */
@@ -207,6 +237,38 @@ static int                  s_subghz_import_count = 0;
  * a column when the value actually changed. */
 static int                  s_subghz_last_rssi = 0;
 static uint32_t             s_subghz_rssi_seq = 0;
+
+/* NFC: two RAM slots (last read vs loaded), SD library listing, bus/init. */
+typedef enum {
+    NFC_PEND_NONE = 0,
+    NFC_PEND_INIT,
+    NFC_PEND_BUS_GET,
+    NFC_PEND_BUS_SET,
+    NFC_PEND_READ,
+    NFC_PEND_SAVE,
+    NFC_PEND_LIST,
+    NFC_PEND_LOAD,
+    NFC_PEND_RENAME,
+    NFC_PEND_DELETE,
+    NFC_PEND_EMULATE,
+} nfc_pending_t;
+
+static nfc_pending_t        s_nfc_pending = NFC_PEND_NONE;
+static nfc_ui_card_t        s_nfc_accum;
+static nfc_ui_card_t        s_nfc_last;
+static nfc_ui_card_t        s_nfc_loaded;
+static bool                 s_nfc_probed = false;
+static bool                 s_nfc_detected = false;
+static bool                 s_nfc_emulating = false;
+static bool                 s_nfc_chain_bus_get = false;
+static bool                 s_nfc_chain_init = false;
+static bool                 s_nfc_last_timeout = false;
+static uint32_t             s_nfc_seq = 0;
+static char                 s_nfc_last_op[16];
+static char                 s_nfc_bus[12];
+static char                 s_nfc_backend[80];
+static dynvec_t             s_nfc_cards;  /* nfc_list_entry_t */
+static dynvec_t             s_nfc_build;
 /* Discovered hosts from `list_hosts` (ARP attack). Cached on the device so
  * the web UI can poll for them even if the WS dropped during the discovery
  * burst (e.g. after the softAP channel hops to follow the STA). */
@@ -279,6 +341,91 @@ static bool is_not_connected_line(const char *line)
     if (!line) return false;
     return strstr(line, "Not connected to WiFi") != NULL ||
            strstr(line, "Not connected to any AP") != NULL;
+}
+
+static void sniffer_arm_begin(void)
+{
+    s_sniffer_arming = true;
+    s_sniffer_arming_since_us = esp_timer_get_time();
+}
+
+static void sniffer_arm_end(void)
+{
+    s_sniffer_arming = false;
+}
+
+/* True only for the brief window in which unselect_networks' stop lines must
+ * be ignored. Expires so a missed echo cannot swallow a later real stop. */
+static bool sniffer_arming_active(void)
+{
+    if (!s_sniffer_arming) return false;
+    if (esp_timer_get_time() - s_sniffer_arming_since_us > 5000000) {
+        s_sniffer_arming = false;
+        return false;
+    }
+    return true;
+}
+
+static bool sniffer_start_was_refused(const char *line)
+{
+    return strstr(line, "Please scan_networks first.") != NULL ||
+           strstr(line, "Sniffer already active.") != NULL ||
+           strstr(line, "Failed to initialize selected networks for sniffer") != NULL;
+}
+
+/* JanOS echoes the command as "> start_sniffer" or "> start_sniffer_noscan".
+ * Do not match start_sniffer_dog or a sentence that merely mentions the name. */
+static bool line_is_sniffer_start_echo(const char *line)
+{
+    if (!line) return false;
+    while (*line == ' ' || *line == '\t') line++;
+    if (*line == '>') {
+        line++;
+        while (*line == ' ' || *line == '\t') line++;
+    }
+    if (strncmp(line, "start_sniffer_noscan", 20) == 0) {
+        char c = line[20];
+        return c == '\0' || c == '\r' || c == ' ';
+    }
+    if (strncmp(line, "start_sniffer", 13) == 0) {
+        char c = line[13];
+        return c == '\0' || c == '\r' || c == ' ';
+    }
+    return false;
+}
+
+static bool sniffer_counts_live(void)
+{
+    switch (cmd_get_state()) {
+    case STATE_ATTACK_SNIFFER:
+    case STATE_LISTING_SNIFFER:
+    case STATE_LISTING_PROBES:
+        return true;
+    default:
+        return sniffer_arming_active();
+    }
+}
+
+/* Background "Sniffer packet count: N" (~every 20 packets) is not a prompt
+ * and not the end of a client/probe snapshot. Publish it whenever the sniffer
+ * session is live, including while a show_sniffer_clients / list_probes reply
+ * has the FSM in a listing state. Returns true if the line was consumed. */
+static bool consume_sniffer_packet_count(const char *line)
+{
+    const char *p = strstr(line, "Sniffer packet count:");
+    if (!p) return false;
+    /* Capture liveness before clearing the arming flag: a count line means
+     * the sniffer task is up, so the unselect prelude is over. */
+    bool live = sniffer_counts_live();
+    if (s_sniffer_arming) sniffer_arm_end();
+    if (live) {
+        int count = atoi(p + (int)strlen("Sniffer packet count:"));
+        if (count < 0) count = 0;
+        s_sniffer.packet_count = count;
+        broadcast_json("{\"type\":\"sniffer_count\",\"count\":%d}", count);
+        sniffer_maybe_refresh_clients();
+    }
+    return true;
 }
 
 static void mark_sta_disconnected(void)
@@ -457,6 +604,9 @@ static void sniffer_results_clear(sniffer_results_t *r)
     r->empty        = false;
 }
 
+static void reset_sniffer_build(void);
+static void finish_sniffer_snapshot(void);
+
 static bool sniffer_results_push_ap(sniffer_results_t *r, const parsed_sniffer_ap_t *ap)
 {
     if (!r || !ap) return false;
@@ -471,6 +621,166 @@ static bool sniffer_results_push_ap(sniffer_results_t *r, const parsed_sniffer_a
     r->cap = (int)v.cap;
     if (!slot) return false;
     r->count = (int)v.count;
+    return true;
+}
+
+static uint32_t mate_now_ms(void)
+{
+    return (uint32_t)(esp_timer_get_time() / 1000);
+}
+
+static bool mate_js_send(void *ctx, const char *command)
+{
+    (void)ctx;
+    uart_bridge_send(command);
+    return true;
+}
+
+static void publish_js_snapshot(void)
+{
+    reset_sniffer_build();
+    if (!s_js.model.complete || s_js.model.failed) {
+        finish_sniffer_snapshot();
+        sniffer_flush_pending_deauth();
+        return;
+    }
+    for (unsigned i = 0; i < s_js.model.ap_count; ++i) {
+        parsed_sniffer_ap_t ap;
+        memset(&ap, 0, sizeof(ap));
+        sc_ap_label(&s_js.model.aps[i], ap.ssid, sizeof(ap.ssid));
+        sc_mac_text(ap.bssid, s_js.model.aps[i].bssid);
+        ap.channel = s_js.model.aps[i].channel;
+        for (unsigned c = 0; c < s_js.model.client_count; ++c) {
+            if (s_js.model.clients[c].ap != (uint8_t)i) continue;
+            char mac[18];
+            sc_mac_text(mac, s_js.model.clients[c].mac);
+            if (!sniffer_ap_push_client(&ap, mac)) break;
+        }
+        ap.client_total = ap.client_count;
+        if (!sniffer_results_push_ap(&s_sniffer_build, &ap)) {
+            sniffer_ap_free(&ap);
+            break;
+        }
+    }
+    finish_sniffer_snapshot();
+    sniffer_flush_pending_deauth();
+}
+
+static void mate_js_timer_cb(void *arg)
+{
+    (void)arg;
+    JsPhase before = s_js.phase;
+    js_tick(&s_js, mate_now_ms());
+    if (before == JS_STARTING && s_js.phase == JS_RELOAD_REQUIRED) {
+        broadcast_json("{\"type\":\"station_deauth\",\"status\":\"error\",\"reason\":\"%s\"}",
+                       s_js.error[0] ? s_js.error : "timeout");
+    }
+    if (s_js.phase == JS_READY && s_sniffer_collecting)
+        publish_js_snapshot();
+    else if ((s_js.phase == JS_ERROR || s_js.phase == JS_RELOAD_REQUIRED) &&
+             s_sniffer_collecting) {
+        publish_js_snapshot();
+    }
+    sniffer_flush_pending_deauth();
+}
+
+static void mate_js_arm_timer(void)
+{
+    if (!s_js_timer) {
+        const esp_timer_create_args_t args = {
+            .callback = mate_js_timer_cb,
+            .name = "sniff_js",
+        };
+        esp_timer_create(&args, &s_js_timer);
+    }
+    /* js_tick uses timestamps, so a running 250 ms timer is enough.
+     * esp_timer_stop from this callback would wait on itself. */
+    esp_timer_start_periodic(s_js_timer, 250000);
+}
+
+/* True while a client snapshot or another listing still owns the UART.
+ * start_deauth_station must not be written into the middle of that reply. */
+static bool sniffer_deauth_uart_busy(void)
+{
+    if (s_sniffer_collecting) return true;
+    switch (s_js.phase) {
+    case JS_LOADING:
+    case JS_STARTING:
+    case JS_ACTIVE:
+        return true;
+    default:
+        break;
+    }
+    cmd_state_t st = cmd_get_state();
+    return st == STATE_LISTING_SNIFFER || st == STATE_LISTING_PROBES;
+}
+
+/* Send start_deauth_station for a pair the phone already showed. JanOS checks
+ * the pair in its sniffer database; the live JsSession model is often freed
+ * by the background show_sniffer_clients refresh, so it is not the lookup. */
+static bool sniffer_send_station_deauth(const uint8_t ap[6], const uint8_t sta[6])
+{
+    if (s_js.phase == JS_STARTING || s_js.phase == JS_ACTIVE) return false;
+    char bssid[18], station[18], command[80];
+    memcpy(s_js.pending_ap, ap, 6);
+    memcpy(s_js.pending_sta, sta, 6);
+    sc_mac_text(bssid, ap);
+    sc_mac_text(station, sta);
+    snprintf(command, sizeof(command), "start_deauth_station %s %s", bssid, station);
+    if (atomic_load(&s_deauth_cancel)) return false;
+    s_js.phase = JS_STARTING;
+    s_js.start_sent_ms = mate_now_ms();
+    s_js.error[0] = 0;
+    if (atomic_load(&s_deauth_cancel)) {
+        s_js.phase = JS_RELOAD_REQUIRED;
+        return false;
+    }
+    if (!js_send(&s_js, command)) {
+        js_set_error(&s_js, JS_RELOAD_REQUIRED, "UART TX failed; check link");
+        return false;
+    }
+    mate_js_arm_timer();
+    if (s_display_cb) s_display_cb("start_deauth_station", NULL);
+    ESP_LOGI(TAG, "TX start_deauth_station %s %s", bssid, station);
+    return true;
+}
+
+static void sniffer_flush_pending_deauth(void)
+{
+    if (!atomic_load(&s_deauth_pending)) return;
+    if (atomic_load(&s_deauth_cancel) || sniffer_deauth_uart_busy()) return;
+    if (!atomic_exchange(&s_deauth_pending, false)) return;
+    if (atomic_load(&s_deauth_cancel) || s_js.phase == JS_RELOAD_REQUIRED) return;
+    if (sniffer_deauth_uart_busy()) {
+        atomic_store(&s_deauth_pending, true);
+        return;
+    }
+    uint8_t ap[6], sta[6];
+    memcpy(ap, s_deauth_ap, 6);
+    memcpy(sta, s_deauth_sta, 6);
+    if (!sniffer_send_station_deauth(ap, sta))
+        ESP_LOGW(TAG, "Deferred station deauth was not sent");
+}
+
+static bool mate_feed_sniffer_line(const char *line)
+{
+    if (!s_sniffer_collecting && s_js.phase != JS_STARTING && s_js.phase != JS_ACTIVE)
+        return false;
+    JsPhase before = s_js.phase;
+    js_line(&s_js, line, mate_now_ms());
+    if (s_js.phase != before && s_js.phase == JS_READY && s_sniffer_collecting)
+        publish_js_snapshot();
+    else if (s_js.phase != before && s_js.phase == JS_ACTIVE) {
+        char bssid[18], station[18];
+        sc_mac_text(bssid, s_js.pending_ap);
+        sc_mac_text(station, s_js.pending_sta);
+        broadcast_json(
+            "{\"type\":\"station_deauth\",\"status\":\"started\",\"bssid\":\"%s\",\"station\":\"%s\"}",
+            bssid, station);
+    } else if (s_js.phase != before && before == JS_STARTING && s_js.phase == JS_READY) {
+        broadcast_json("{\"type\":\"station_deauth\",\"status\":\"error\",\"reason\":\"%s\"}",
+                       s_js.error[0] ? s_js.error : "refused");
+    }
     return true;
 }
 
@@ -536,6 +846,30 @@ static void begin_sniffer_snapshot(void)
     reset_sniffer_build();
     s_sniffer_collecting = true;
     s_sniffer_echo_seen  = false;
+    s_sniffer_clients_refresh_us = esp_timer_get_time();
+    js_load(&s_js, mate_now_ms());
+    mate_js_arm_timer();
+}
+
+/* Ask for the client snapshot a few seconds after the sniffer is up, then
+ * again while it keeps running. Runs on the UART task (same place js_line
+ * is fed). Skips the request while a snapshot or station deauth is open so
+ * list_probes cannot land in the middle of the JSON. */
+static void sniffer_maybe_refresh_clients(void)
+{
+    if (atomic_load(&s_deauth_pending)) {
+        sniffer_flush_pending_deauth();
+        return;
+    }
+    if (cmd_get_state() != STATE_ATTACK_SNIFFER) return;
+    if (s_sniffer_collecting) return;
+    if (s_js.phase == JS_LOADING || s_js.phase == JS_STARTING || s_js.phase == JS_ACTIVE)
+        return;
+    int64_t now = esp_timer_get_time();
+    if (s_sniffer_clients_refresh_us != 0 &&
+        now - s_sniffer_clients_refresh_us < 5000000)
+        return;
+    begin_sniffer_snapshot();
 }
 
 /* ---------- ARP host cache helpers ---------- */
@@ -1982,6 +2316,358 @@ static bool handle_wardrive_stream_line(const char *line)
     return false;
 }
 
+static void nfc_esc(char *dst, size_t n, const char *src)
+{
+    size_t j = 0;
+    for (size_t i = 0; src && src[i] && j + 2 < n; i++) {
+        unsigned char ch = (unsigned char)src[i];
+        if (ch == '"' || ch == '\\') { dst[j++] = '\\'; dst[j++] = (char)ch; }
+        else if (ch >= 0x20) dst[j++] = (char)ch;
+    }
+    if (n) dst[j] = '\0';
+}
+
+static const char *nfc_pending_name(nfc_pending_t pend)
+{
+    switch (pend) {
+    case NFC_PEND_INIT:    return "init";
+    case NFC_PEND_BUS_GET: return "bus_get";
+    case NFC_PEND_BUS_SET: return "bus_set";
+    case NFC_PEND_READ:    return "read";
+    case NFC_PEND_SAVE:    return "save";
+    case NFC_PEND_LIST:    return "list";
+    case NFC_PEND_LOAD:    return "load";
+    case NFC_PEND_RENAME:  return "rename";
+    case NFC_PEND_DELETE:  return "delete";
+    case NFC_PEND_EMULATE: return "emulate";
+    default:               return "";
+    }
+}
+
+static void nfc_apply_bus(const nfc_ui_card_t *c)
+{
+    if (c->have_bus && c->bus[0])
+        snprintf(s_nfc_bus, sizeof(s_nfc_bus), "%s", c->bus);
+    if (c->have_backend && c->backend[0])
+        snprintf(s_nfc_backend, sizeof(s_nfc_backend), "%s", c->backend);
+}
+
+static void nfc_broadcast_init(void)
+{
+    char bus_e[24], be_e[160];
+    nfc_esc(bus_e, sizeof(bus_e), s_nfc_bus);
+    nfc_esc(be_e, sizeof(be_e), s_nfc_backend);
+    broadcast_json(
+        "{\"type\":\"nfc_init_done\",\"detected\":%s,\"probed\":%s,"
+        "\"bus\":\"%s\",\"backend\":\"%s\"}",
+        s_nfc_detected ? "true" : "false",
+        s_nfc_probed ? "true" : "false",
+        bus_e, be_e);
+}
+
+static void nfc_broadcast_card(const char *ev, const nfc_ui_card_t *c, bool no_card)
+{
+    char type_e[40], uid_e[72], path_e[100], idm_e[40], err_e[72], emu_e[100];
+    const char *path = c->loaded_path[0] ? c->loaded_path
+                     : c->saved_path[0] ? c->saved_path : "";
+    nfc_esc(type_e, sizeof(type_e), c->type);
+    nfc_esc(uid_e, sizeof(uid_e), c->uid);
+    nfc_esc(path_e, sizeof(path_e), path);
+    nfc_esc(idm_e, sizeof(idm_e), c->idm);
+    nfc_esc(err_e, sizeof(err_e), c->error);
+    nfc_esc(emu_e, sizeof(emu_e), c->emulating_summary);
+    char buf[768];
+    int len = snprintf(buf, sizeof(buf),
+        "{\"type\":\"%s\",\"cardType\":\"%s\",\"uid\":\"%s\","
+        "\"atqa0\":%u,\"atqa1\":%u,\"sak\":%u,\"haveAtqaSak\":%s,"
+        "\"idm\":\"%s\",\"haveIdm\":%s,\"haveData\":%s,\"dataLen\":%u,"
+        "\"noCard\":%s,\"path\":\"%s\",\"emulating\":\"%s\","
+        "\"emulateFullUl\":%s,\"emulateUidOnly\":%s,"
+        "\"classic\":%s,\"ultralight\":%s,\"error\":\"%s\"}",
+        ev, type_e, uid_e,
+        (unsigned)c->atqa[0], (unsigned)c->atqa[1], (unsigned)c->sak,
+        c->have_atqa_sak ? "true" : "false",
+        idm_e, c->have_idm ? "true" : "false",
+        c->have_data ? "true" : "false", c->data_len,
+        no_card ? "true" : "false", path_e, emu_e,
+        c->emulate_full_ul ? "true" : "false",
+        c->emulate_uid_only ? "true" : "false",
+        nfc_type_is_classic(c->type) ? "true" : "false",
+        nfc_type_is_ultralight(c->type) ? "true" : "false",
+        err_e);
+    if (len > 0 && s_ws_broadcast)
+        s_ws_broadcast(buf, len);
+}
+
+static void nfc_finish(nfc_pending_t pend, nfc_ui_card_t accum)
+{
+    bool chain_bus = false;
+    bool chain_init = false;
+    bool go_idle = true;
+    bool emulate_ok = false;
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    nfc_apply_bus(&accum);
+
+    switch (pend) {
+    case NFC_PEND_INIT:
+        s_nfc_probed = true;
+        s_nfc_detected = accum.detected && !accum.not_detected;
+        chain_bus = s_nfc_chain_bus_get;
+        s_nfc_chain_bus_get = false;
+        if (chain_bus) {
+            s_nfc_pending = NFC_PEND_BUS_GET;
+            nfc_card_reset(&s_nfc_accum);
+            go_idle = false;
+        }
+        break;
+    case NFC_PEND_BUS_GET:
+        break;
+    case NFC_PEND_BUS_SET:
+        chain_init = s_nfc_chain_init;
+        s_nfc_chain_init = false;
+        if (chain_init) {
+            s_nfc_pending = NFC_PEND_INIT;
+            nfc_card_reset(&s_nfc_accum);
+            go_idle = false;
+        }
+        break;
+    case NFC_PEND_READ:
+        /* Always keep the latest poll, including "no card", so the web can
+         * GET /api/nfc/status instead of waiting on a WebSocket frame. */
+        s_nfc_last = accum;
+        s_nfc_last_timeout = false;
+        break;
+    case NFC_PEND_SAVE:
+        break;
+    case NFC_PEND_LIST: {
+        dynvec_t tmp = s_nfc_cards;
+        s_nfc_cards = s_nfc_build;
+        s_nfc_build = tmp;
+        dynvec_clear(&s_nfc_build);
+        break;
+    }
+    case NFC_PEND_LOAD:
+        s_nfc_loaded = accum;
+        break;
+    case NFC_PEND_RENAME:
+        if (accum.have_renamed && accum.renamed_to[0]) {
+            snprintf(s_nfc_loaded.loaded_path, sizeof(s_nfc_loaded.loaded_path),
+                     "%s", accum.renamed_to);
+            s_nfc_loaded.have_loaded = true;
+        }
+        break;
+    case NFC_PEND_DELETE:
+        break;
+    case NFC_PEND_EMULATE:
+        emulate_ok = accum.have_emulating &&
+                     !accum.emulate_failed &&
+                     !accum.no_card_loaded &&
+                     !accum.load_failed;
+        s_nfc_emulating = emulate_ok;
+        s_nfc_loaded.emulate_failed = accum.emulate_failed;
+        s_nfc_loaded.no_card_loaded = accum.no_card_loaded;
+        s_nfc_loaded.load_failed = accum.load_failed;
+        if (accum.error[0])
+            snprintf(s_nfc_loaded.error, sizeof(s_nfc_loaded.error), "%s", accum.error);
+        if (accum.have_emulating) {
+            s_nfc_loaded.have_emulating = true;
+            snprintf(s_nfc_loaded.emulating_summary, sizeof(s_nfc_loaded.emulating_summary),
+                     "%s", accum.emulating_summary);
+            s_nfc_loaded.emulate_full_ul = accum.emulate_full_ul;
+            s_nfc_loaded.emulate_uid_only = accum.emulate_uid_only;
+            if (accum.type[0])
+                snprintf(s_nfc_loaded.type, sizeof(s_nfc_loaded.type), "%s", accum.type);
+            if (accum.uid[0])
+                snprintf(s_nfc_loaded.uid, sizeof(s_nfc_loaded.uid), "%s", accum.uid);
+        }
+        if (emulate_ok) {
+            s_state = STATE_NFC_EMULATE;
+            s_nfc_pending = NFC_PEND_NONE;
+            go_idle = false;
+        }
+        break;
+    default:
+        break;
+    }
+
+    if (go_idle) {
+        s_nfc_pending = NFC_PEND_NONE;
+        if (s_state == STATE_NFC || s_state == STATE_NFC_READ ||
+            (s_state == STATE_NFC_EMULATE && !s_nfc_emulating)) {
+            s_state = STATE_IDLE;
+        }
+    }
+    s_nfc_seq++;
+    snprintf(s_nfc_last_op, sizeof(s_nfc_last_op), "%s", nfc_pending_name(pend));
+    int list_count = (int)s_nfc_cards.count;
+    xSemaphoreGive(s_mutex);
+
+    if (pend == NFC_PEND_READ || pend == NFC_PEND_LOAD || pend == NFC_PEND_EMULATE) {
+        ESP_LOGI(TAG, "NFC %s done seq=%u uid='%s' type='%s' emulating=%d",
+                 nfc_pending_name(pend), (unsigned)s_nfc_seq,
+                 accum.uid, accum.type, s_nfc_emulating ? 1 : 0);
+    }
+
+    switch (pend) {
+    case NFC_PEND_INIT:
+        nfc_broadcast_init();
+        if (chain_bus) {
+            if (s_display_cb) s_display_cb("get_nfc_bus", NULL);
+            uart_bridge_send("get_nfc_bus");
+        }
+        break;
+    case NFC_PEND_BUS_GET:
+        nfc_broadcast_init();
+        break;
+    case NFC_PEND_BUS_SET: {
+        char bus_e[24];
+        nfc_esc(bus_e, sizeof(bus_e), s_nfc_bus);
+        broadcast_json("{\"type\":\"nfc_bus_set\",\"bus\":\"%s\"}", bus_e);
+        if (chain_init) {
+            if (s_display_cb) s_display_cb("init_nfc", NULL);
+            uart_bridge_send("init_nfc");
+        }
+        break;
+    }
+    case NFC_PEND_READ:
+        nfc_broadcast_card("nfc_read_done", &accum,
+                           accum.no_card || !nfc_card_is_present(&accum));
+        break;
+    case NFC_PEND_SAVE: {
+        char path_e[100], err_e[72];
+        nfc_esc(path_e, sizeof(path_e), accum.saved_path);
+        nfc_esc(err_e, sizeof(err_e), accum.error);
+        if (accum.have_saved && !accum.nothing_to_save && !accum.save_failed) {
+            broadcast_json("{\"type\":\"nfc_save_done\",\"path\":\"%s\"}", path_e);
+        } else {
+            broadcast_json("{\"type\":\"nfc_save_err\",\"reason\":\"%s\"}",
+                           accum.nothing_to_save ? "nothing_to_save" :
+                           err_e[0] ? err_e : "save_failed");
+        }
+        break;
+    }
+    case NFC_PEND_LIST:
+        broadcast_json("{\"type\":\"nfc_list_end\",\"count\":%d}", list_count);
+        break;
+    case NFC_PEND_LOAD:
+        if (accum.load_failed || accum.not_found || !nfc_card_is_present(&accum)) {
+            char err_e[72];
+            nfc_esc(err_e, sizeof(err_e), accum.error);
+            broadcast_json("{\"type\":\"nfc_load_err\",\"error\":\"%s\"}",
+                           err_e[0] ? err_e : "load_failed");
+        } else {
+            nfc_broadcast_card("nfc_load_done", &accum, false);
+        }
+        break;
+    case NFC_PEND_RENAME: {
+        char from_e[100], to_e[100], err_e[72];
+        nfc_esc(from_e, sizeof(from_e), accum.renamed_from);
+        nfc_esc(to_e, sizeof(to_e), accum.renamed_to);
+        nfc_esc(err_e, sizeof(err_e), accum.error);
+        if (accum.have_renamed && !accum.rename_failed && !accum.not_found) {
+            broadcast_json("{\"type\":\"nfc_rename_done\",\"from\":\"%s\",\"to\":\"%s\"}",
+                           from_e, to_e);
+        } else {
+            broadcast_json("{\"type\":\"nfc_rename_err\",\"error\":\"%s\"}",
+                           err_e[0] ? err_e : "rename_failed");
+        }
+        break;
+    }
+    case NFC_PEND_DELETE: {
+        char path_e[100], err_e[72];
+        nfc_esc(path_e, sizeof(path_e), accum.deleted_path);
+        nfc_esc(err_e, sizeof(err_e), accum.error);
+        if (accum.have_deleted && !accum.delete_failed && !accum.not_found) {
+            broadcast_json("{\"type\":\"nfc_delete_done\",\"path\":\"%s\"}", path_e);
+        } else {
+            broadcast_json("{\"type\":\"nfc_delete_err\",\"error\":\"%s\"}",
+                           err_e[0] ? err_e : "delete_failed");
+        }
+        break;
+    }
+    case NFC_PEND_EMULATE:
+        if (emulate_ok) {
+            nfc_broadcast_card("nfc_emulate_started", &accum, false);
+            broadcast_json("{\"type\":\"attack_started\",\"attack\":\"nfc_emulate\"}");
+        } else {
+            char err_e[72];
+            nfc_esc(err_e, sizeof(err_e), accum.error);
+            broadcast_json("{\"type\":\"nfc_emulate_failed\",\"error\":\"%s\"}",
+                           accum.no_card_loaded ? "no_card_loaded" :
+                           err_e[0] ? err_e : "emulate_failed");
+            broadcast_json("{\"type\":\"attack_stopped\"}");
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+static bool handle_nfc_line(const char *line)
+{
+    if (!line) return false;
+
+    /* Parse [NFC] lines regardless of FSM state. JanOS can print the card
+     * block after a prompt echo has already flipped us idle (same pattern as
+     * nmap/ARP/CGW). Dropping those lines left the GUI spinning until its
+     * WebSocket wait timed out, even though uart_bridge logged a full dump. */
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    nfc_pending_t pend = s_nfc_pending;
+
+    if (pend == NFC_PEND_LIST) {
+        nfc_list_entry_t ent;
+        if (nfc_parse_list_entry(line, &ent)) {
+            xSemaphoreGive(s_mutex);
+            if (!dynvec_push(&s_nfc_build, &ent)) log_drop("nfc_cards");
+            return true;
+        }
+        int n = 0;
+        if (nfc_parse_card_count(line, &n)) {
+            xSemaphoreGive(s_mutex);
+            return true;
+        }
+    }
+
+    bool had_present = s_nfc_accum.present_card;
+    bool had_type = s_nfc_accum.type[0] != '\0';
+    if (!nfc_parse_card_line(line, &s_nfc_accum)) {
+        xSemaphoreGive(s_mutex);
+        return false;
+    }
+
+    bool now_present = s_nfc_accum.present_card;
+    bool now_type = s_nfc_accum.type[0] != '\0';
+    char type_copy[sizeof(s_nfc_accum.type)];
+    snprintf(type_copy, sizeof(type_copy), "%s", s_nfc_accum.type);
+    bool is_end = nfc_line_is_end(line);
+    nfc_ui_card_t snap = s_nfc_accum;
+    xSemaphoreGive(s_mutex);
+
+    if (pend == NFC_PEND_READ || pend == NFC_PEND_NONE) {
+        if (!had_present && now_present) {
+            broadcast_json("{\"type\":\"nfc_read_progress\",\"present\":true}");
+        } else if (!had_type && now_type) {
+            char type_e[40];
+            nfc_esc(type_e, sizeof(type_e), type_copy);
+            broadcast_json("{\"type\":\"nfc_read_progress\",\"cardType\":\"%s\"}", type_e);
+        }
+    }
+
+    if (is_end) {
+        if (pend != NFC_PEND_NONE) {
+            nfc_finish(pend, snap);
+        } else if (snap.have_loaded || snap.load_failed || snap.not_found) {
+            nfc_finish(NFC_PEND_LOAD, snap);
+        } else if (snap.have_emulating || snap.emulate_failed || snap.no_card_loaded) {
+            nfc_finish(NFC_PEND_EMULATE, snap);
+        } else if (snap.present_card || nfc_card_is_present(&snap) || snap.no_card) {
+            nfc_finish(NFC_PEND_READ, snap);
+        }
+    }
+    return true;
+}
+
 static void on_uart_line(const char *line, void *ctx)
 {
     (void)ctx;
@@ -1999,6 +2685,10 @@ static void on_uart_line(const char *line, void *ctx)
      * arrives at ~10 Hz, so we MUST avoid the LCD redraw / display update on
      * this path or the uart_rx_task starves and the host reboots. */
     if (handle_subghz_event_line(line)) {
+        return;
+    }
+
+    if (handle_nfc_line(line)) {
         return;
     }
 
@@ -2046,17 +2736,59 @@ static void on_uart_line(const char *line, void *ctx)
         s_display_cb(NULL, line);
     }
 
-    /* Universal stop marker: JanOS prints "All operations stopped." whenever
-     * any long-running task ends -- via our `stop`, a physical button, or the
-     * serial console. Treat it as authoritative: force our FSM back to IDLE
-     * (so /api/status stops reporting the old run) and tell every client the
-     * operation ended, without waiting for the next status poll. */
-    if (strstr(line, "All operations stopped.")) {
-        s_wd_status.active = false;
+    /* The start-command echo (and the "now monitoring" banner) arrive only
+     * after unselect_networks has finished printing its stop lines. */
+    if (s_sniffer_arming &&
+        (line_is_sniffer_start_echo(line) ||
+         strstr(line, "Started sniffer") ||
+         strstr(line, "Now monitoring"))) {
+        sniffer_arm_end();
+    }
+
+    /* Start was armed, then JanOS refused it. The unselect prelude was
+     * ignored above, so drop back to idle or the phone stays on Live at 0. */
+    if (sniffer_start_was_refused(line) && cmd_get_state() == STATE_ATTACK_SNIFFER) {
+        sniffer_arm_end();
+        s_sniffer_collecting = false;
         xSemaphoreTake(s_mutex, portMAX_DELAY);
         s_state = STATE_IDLE;
         xSemaphoreGive(s_mutex);
         broadcast_json("{\"type\":\"attack_stopped\"}");
+        ESP_LOGW(TAG, "Sniffer start refused");
+    }
+
+    /* Universal stop marker: JanOS prints "All operations stopped." whenever
+     * any long-running task ends -- via our `stop`, a physical button, or the
+     * serial console. Treat it as authoritative: force our FSM back to IDLE
+     * (so /api/status stops reporting the old run) and tell every client the
+     * operation ended, without waiting for the next status poll.
+     * Exception: unselect_networks sent as the prelude to start_sniffer[_noscan]
+     * prints this before the sniffer is running. Swallow it or the phone drops
+     * out of the observer and never applies "Sniffer packet count" lines. */
+    /* Station-deauth ACK is JSON. JanOS prints its internal stop text before
+     * that JSON, and the FSM may already have left the sniffer state. Feed
+     * the line whenever a start is outstanding so `started` is not dropped. */
+    if (s_js.phase == JS_STARTING || s_js.phase == JS_ACTIVE)
+        mate_feed_sniffer_line(line);
+
+    if (strstr(line, "All operations stopped.")) {
+        if (sniffer_arming_active()) {
+            ESP_LOGI(TAG, "Sniffer arming: ignoring stop from unselect_networks");
+        } else if (s_js.phase == JS_STARTING) {
+            /* start_deauth_station calls cmd_stop internally. Those lines are
+             * not the ACK and not a user stop. */
+            ESP_LOGI(TAG, "Station deauth: ignoring internal stop");
+        } else {
+            s_wd_status.active = false;
+            s_nfc_emulating = false;
+            s_nfc_pending = NFC_PEND_NONE;
+            s_nfc_chain_bus_get = false;
+            s_nfc_chain_init = false;
+            xSemaphoreTake(s_mutex, portMAX_DELAY);
+            s_state = STATE_IDLE;
+            xSemaphoreGive(s_mutex);
+            broadcast_json("{\"type\":\"attack_stopped\"}");
+        }
     }
 
     /* `sd_status` reply is state-independent (SD_OK / SD_NONE on its own line). */
@@ -2088,6 +2820,13 @@ static void on_uart_line(const char *line, void *ctx)
     if (strstr(line, "Wi-Fi: disconnected") || strstr(line, "Disconnected from AP")) {
         s_sta_connected = false;
         s_sta_ssid[0] = '\0';
+    }
+
+    /* Packet counts are prompt-prefixed ("> Sniffer packet count: N") and
+     * keep arriving during client/probe listings. Handle them before the FSM
+     * so a listing state cannot drop them, and do not forward the raw line. */
+    if (consume_sniffer_packet_count(line)) {
+        return;
     }
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
@@ -2394,68 +3133,20 @@ static void on_uart_line(const char *line, void *ctx)
 
     case STATE_ATTACK_SNIFFER: {
         attack_event_t ev = parse_attack_event(line);
-        if (ev.type == ATTACK_EVENT_SNIFFER_COUNT) {
-            s_sniffer.packet_count = ev.int_val;
-            broadcast_json("{\"type\":\"sniffer_count\",\"count\":%d}", ev.int_val);
-            /* Background count lines arrive prompt-prefixed ("> Sniffer packet
-             * count: N"); stop here so they never reach the is_prompt_line
-             * check below and prematurely finish the snapshot. */
-            break;
-        } else if (ev.type == ATTACK_EVENT_STOP_ACK) {
+        if (ev.type == ATTACK_EVENT_STOP_ACK &&
+            !sniffer_arming_active() && s_js.phase != JS_STARTING) {
             s_sniffer_collecting = false;
             xSemaphoreTake(s_mutex, portMAX_DELAY);
             s_state = STATE_IDLE;
             xSemaphoreGive(s_mutex);
             broadcast_json("{\"type\":\"attack_stopped\"}");
+        } else if (ev.type == ATTACK_EVENT_STOP_ACK && sniffer_arming_active()) {
+            ESP_LOGI(TAG, "Sniffer arming: ignoring stop from unselect_networks");
+        } else if (ev.type == ATTACK_EVENT_STOP_ACK) {
+            ESP_LOGI(TAG, "Station deauth: ignoring internal stop");
         }
 
-        if (s_sniffer_collecting) {
-            parsed_sniffer_ap_t ap;
-            char client[SNIFFER_CLIENT_LEN];
-
-            /* Only trust a terminating prompt once we've seen our command echo;
-             * a stray background "> " before that is not our result's end. */
-            if (!s_sniffer_echo_seen && strstr(line, "show_sniffer_results") != NULL) {
-                s_sniffer_echo_seen = true;
-                break;
-            }
-
-            if (parse_sniffer_empty_line(line)) {
-                finish_sniffer_snapshot();
-                break;
-            }
-
-            if (parse_sniffer_ap_line(line, &ap)) {
-                /* parse_sniffer_ap_line zeroes the inline-array layout; we
-                 * own client storage now, so reset the heap-pointer fields
-                 * before pushing the AP into the build buffer. */
-                ap.clients      = NULL;
-                ap.client_count = 0;
-                ap.client_cap   = 0;
-                if (sniffer_results_push_ap(&s_sniffer_build, &ap)) {
-                    s_sniffer_ap_index = s_sniffer_build.count - 1;
-                } else {
-                    log_drop("sniffer_aps");
-                }
-                break;
-            }
-
-            if (parse_sniffer_client_line(line, client, sizeof(client))) {
-                if (s_sniffer_ap_index >= 0) {
-                    parsed_sniffer_ap_t *cur =
-                        &s_sniffer_build.aps[s_sniffer_ap_index];
-                    if (!sniffer_ap_push_client(cur, client)) {
-                        log_drop("sniffer_clients");
-                    }
-                }
-                break;
-            }
-
-            if (is_prompt_line(line) && s_sniffer_echo_seen) {
-                finish_sniffer_snapshot();
-                break;
-            }
-        }
+        mate_feed_sniffer_line(line);
         break;
     }
 
@@ -2722,60 +3413,18 @@ static void on_uart_line(const char *line, void *ctx)
     }
 
     case STATE_LISTING_SNIFFER: {
-        attack_event_t ev = parse_attack_event(line);
-        if (ev.type == ATTACK_EVENT_SNIFFER_COUNT) {
-            s_sniffer.packet_count = ev.int_val;
-            broadcast_json("{\"type\":\"sniffer_count\",\"count\":%d}", ev.int_val);
-            break;
-        }
-
         if (!s_sniffer_collecting) {
             begin_sniffer_snapshot();
         }
-
-        /* Our own command echo -- mark it seen, don't treat as prompt. */
-        if (strstr(line, "show_sniffer_results")) {
-            s_sniffer_echo_seen = true;
-            break;
-        }
-
-        if (parse_sniffer_empty_line(line)) {
-            finish_sniffer_snapshot();
-            break;
-        }
-
-        parsed_sniffer_ap_t ap;
-        if (parse_sniffer_ap_line(line, &ap)) {
-            ap.clients      = NULL;
-            ap.client_count = 0;
-            ap.client_cap   = 0;
-            if (sniffer_results_push_ap(&s_sniffer_build, &ap)) {
-                s_sniffer_ap_index = s_sniffer_build.count - 1;
-            } else {
-                log_drop("sniffer_aps");
-            }
-            break;
-        }
-
-        char client[SNIFFER_CLIENT_LEN];
-        if (parse_sniffer_client_line(line, client, sizeof(client))) {
-            if (s_sniffer_ap_index >= 0) {
-                parsed_sniffer_ap_t *cur =
-                    &s_sniffer_build.aps[s_sniffer_ap_index];
-                if (!sniffer_ap_push_client(cur, client)) {
-                    log_drop("sniffer_clients");
-                }
-            }
-            break;
-        }
-
-        if (is_prompt_line(line) && s_sniffer_echo_seen) {
-            finish_sniffer_snapshot();
-        }
+        mate_feed_sniffer_line(line);
         break;
     }
 
     case STATE_LISTING_HANDSHAKES: {
+        if (!s_handshake_echo_seen && strstr(line, "list_dir") != NULL) {
+            s_handshake_echo_seen = true;
+            break;
+        }
         /* Ignore the "> list_dir ..." echo; only parse after the header. */
         if (strstr(line, "Files in ")) {
             s_handshake_header_seen = true;
@@ -2795,10 +3444,13 @@ static void on_uart_line(const char *line, void *ctx)
         }
 
         if ((strstr(line, "Found ") && strstr(line, "file(s) in")) ||
-            (s_handshake_header_seen && is_prompt_line(line))) {
+            (s_handshake_echo_seen && is_prompt_line(line)) ||
+            strstr(line, "Failed to initialize SD") ||
+            strstr(line, "Command returned non-zero")) {
             if (s_handshake_count < 0) s_handshake_count = 0;
             s_handshake_initial_done = true;
             s_handshake_header_seen = false;
+            s_handshake_echo_seen = false;
             xSemaphoreTake(s_mutex, portMAX_DELAY);
             s_state = STATE_IDLE;
             xSemaphoreGive(s_mutex);
@@ -2807,6 +3459,10 @@ static void on_uart_line(const char *line, void *ctx)
     }
 
     case STATE_LISTING_WARDRIVE: {
+        if (!s_wardrive_echo_seen && strstr(line, "list_dir") != NULL) {
+            s_wardrive_echo_seen = true;
+            break;
+        }
         /* Ignore the "> list_dir ..." echo; only parse after the header. */
         if (strstr(line, "Files in ")) {
             s_wardrive_header_seen = true;
@@ -2822,8 +3478,11 @@ static void on_uart_line(const char *line, void *ctx)
         }
 
         if ((strstr(line, "Found ") && strstr(line, "file(s) in")) ||
-            (s_wardrive_header_seen && is_prompt_line(line))) {
+            (s_wardrive_echo_seen && is_prompt_line(line)) ||
+            strstr(line, "Failed to initialize SD") ||
+            strstr(line, "Command returned non-zero")) {
             s_wardrive_header_seen = false;
+            s_wardrive_echo_seen = false;
             xSemaphoreTake(s_mutex, portMAX_DELAY);
             s_state = STATE_IDLE;
             xSemaphoreGive(s_mutex);
@@ -3161,6 +3820,9 @@ static void keepalive_timer_cb(void *arg)
 void cmd_handler_init(void)
 {
     s_mutex = xSemaphoreCreateMutex();
+    js_init(&s_js, mate_js_send, NULL);
+    atomic_init(&s_deauth_pending, false);
+    atomic_init(&s_deauth_cancel, false);
     memset(&s_scan, 0, sizeof(s_scan));
     memset(&s_sniffer, 0, sizeof(s_sniffer));
     memset(&s_sniffer_build, 0, sizeof(s_sniffer_build));
@@ -3187,6 +3849,11 @@ void cmd_handler_init(void)
     dynvec_init(&s_snifferdog_events, sizeof(sniffer_dog_event_t), 16);
     dynvec_init(&s_subghz_signals, sizeof(subghz_signal_t),      8);
     dynvec_init(&s_subghz_build,   sizeof(subghz_signal_t),      8);
+    dynvec_init(&s_nfc_cards,     sizeof(nfc_list_entry_t),     8);
+    dynvec_init(&s_nfc_build,     sizeof(nfc_list_entry_t),     8);
+    nfc_card_reset(&s_nfc_accum);
+    nfc_card_reset(&s_nfc_last);
+    nfc_card_reset(&s_nfc_loaded);
     dynvec_init(&s_arp_hosts,      sizeof(arp_host_t),           8);
     dynvec_init(&s_nmap_hosts,     sizeof(nmap_host_t),          8);
     dynvec_init(&s_zig_pans,       sizeof(zig_pan_t),            8);
@@ -3276,6 +3943,9 @@ const char *cmd_state_name(cmd_state_t s)
     case STATE_SUBGHZ_IMPORT:     return "subghz_import";
     case STATE_SUBGHZ_EXPORT:     return "subghz_export";
     case STATE_ZIG_RECON:         return "zig_recon";
+    case STATE_NFC:               return "nfc";
+    case STATE_NFC_READ:          return "nfc_read";
+    case STATE_NFC_EMULATE:       return "nfc_emulate";
     }
     return "unknown";
 }
@@ -3330,7 +4000,8 @@ static bool is_listing_state(cmd_state_t s)
            s == STATE_LISTING_PROBES ||
            s == STATE_SUBGHZ_LIST ||
            s == STATE_SUBGHZ_IMPORT ||
-           s == STATE_SUBGHZ_EXPORT;
+           s == STATE_SUBGHZ_EXPORT ||
+           s == STATE_NFC;
 }
 
 static bool is_recoverable_state(cmd_state_t s)
@@ -3340,7 +4011,8 @@ static bool is_recoverable_state(cmd_state_t s)
      * "Scan results printed" marker can be lost in a UART glitch and
      * leave Mate stuck (Bug 1). */
     return is_listing_state(s) || s == STATE_SCANNING ||
-           s == STATE_WARDRIVE_CONFIG || s == STATE_LISTING_WARDRIVE_FILES;
+           s == STATE_WARDRIVE_CONFIG || s == STATE_LISTING_WARDRIVE_FILES ||
+           s == STATE_NFC_READ;
 }
 
 static bool set_state_if_idle(cmd_state_t new_state)
@@ -3360,6 +4032,8 @@ static bool set_state_if_idle(cmd_state_t new_state)
         int64_t threshold_ms =
             (s_state == STATE_SUBGHZ_IMPORT || s_state == STATE_SUBGHZ_EXPORT)
                 ? 30000   /* SD I/O */
+            : (s_state == STATE_NFC_READ)
+                ? 25000   /* nfc_read: poll + Classic dict dump is UART-quiet */
             : (s_state == STATE_SCANNING)
                 ? 6000    /* Bug 1: scan stalled past last network line */
                 : 8000;
@@ -3375,6 +4049,37 @@ static bool set_state_if_idle(cmd_state_t new_state)
                 s_scan_expected = -1;
                 broadcast_json("{\"type\":\"scan_complete\",\"count\":%d}",
                                s_scan.count);
+            }
+            if (s_state == STATE_NFC || s_state == STATE_NFC_READ) {
+                nfc_pending_t pend = s_nfc_pending;
+                s_nfc_pending = NFC_PEND_NONE;
+                s_nfc_chain_bus_get = false;
+                s_nfc_chain_init = false;
+                if (pend == NFC_PEND_READ) {
+                    s_nfc_last.no_card = true;
+                    s_nfc_last_timeout = true;
+                    snprintf(s_nfc_last_op, sizeof(s_nfc_last_op), "read");
+                    s_nfc_seq++;
+                    broadcast_json("{\"type\":\"nfc_read_done\",\"noCard\":true,\"timeout\":true}");
+                } else if (pend == NFC_PEND_LIST) {
+                    snprintf(s_nfc_last_op, sizeof(s_nfc_last_op), "list");
+                    s_nfc_seq++;
+                    broadcast_json("{\"type\":\"nfc_list_end\",\"count\":%d}",
+                                   (int)s_nfc_cards.count);
+                } else if (pend == NFC_PEND_LOAD) {
+                    s_nfc_loaded.load_failed = true;
+                    snprintf(s_nfc_loaded.error, sizeof(s_nfc_loaded.error), "timeout");
+                    snprintf(s_nfc_last_op, sizeof(s_nfc_last_op), "load");
+                    s_nfc_seq++;
+                    broadcast_json("{\"type\":\"nfc_load_err\",\"error\":\"timeout\"}");
+                } else if (pend == NFC_PEND_EMULATE) {
+                    s_nfc_emulating = false;
+                    s_nfc_loaded.emulate_failed = true;
+                    snprintf(s_nfc_loaded.error, sizeof(s_nfc_loaded.error), "timeout");
+                    snprintf(s_nfc_last_op, sizeof(s_nfc_last_op), "emulate");
+                    s_nfc_seq++;
+                    broadcast_json("{\"type\":\"nfc_emulate_failed\",\"error\":\"timeout\"}");
+                }
             }
             s_state = STATE_IDLE;
         }
@@ -3482,6 +4187,10 @@ bool cmd_do_sniffer(void)
     sniffer_results_clear(&s_sniffer);
     reset_sniffer_build();
     s_sniffer_collecting = false;
+    sniffer_arm_begin();
+    s_sniffer_clients_refresh_us = 0;
+    uart_bridge_send("unselect_networks");
+    vTaskDelay(pdMS_TO_TICKS(50));
     if (s_display_cb) s_display_cb("start_sniffer", NULL);
     uart_bridge_send("start_sniffer");
     broadcast_json("{\"type\":\"attack_started\",\"attack\":\"sniffer\"}");
@@ -3494,6 +4203,10 @@ bool cmd_do_sniffer_noscan(void)
     sniffer_results_clear(&s_sniffer);
     reset_sniffer_build();
     s_sniffer_collecting = false;
+    sniffer_arm_begin();
+    s_sniffer_clients_refresh_us = 0;
+    uart_bridge_send("unselect_networks");
+    vTaskDelay(pdMS_TO_TICKS(50));
     if (s_display_cb) s_display_cb("start_sniffer_noscan", NULL);
     uart_bridge_send("start_sniffer_noscan");
     broadcast_json("{\"type\":\"attack_started\",\"attack\":\"sniffer\"}");
@@ -3610,6 +4323,14 @@ bool cmd_do_beacon_spam(const char *const *ssids, int count)
 
 bool cmd_do_list_probes(void)
 {
+    /* show_sniffer_clients is a multi-line JSON snapshot. A list_probes in
+     * the middle of it is parsed as probe text and the client records are lost. */
+    if (s_sniffer_collecting || atomic_load(&s_deauth_pending) ||
+        s_js.phase == JS_LOADING || s_js.phase == JS_STARTING || s_js.phase == JS_ACTIVE) {
+        ESP_LOGW(TAG, "Client snapshot or station deauth in progress, rejecting list_probes");
+        return false;
+    }
+
     xSemaphoreTake(s_mutex, portMAX_DELAY);
 
     if (s_state != STATE_IDLE && s_state != STATE_ATTACK_SNIFFER && is_listing_state(s_state)) {
@@ -3931,10 +4652,18 @@ bool cmd_do_wifi_disconnect(void)
 
 static bool cmd_do_stop_with_command(const char *command)
 {
+    atomic_store(&s_deauth_cancel, true);
+    atomic_store(&s_deauth_pending, false);
+    /* Drop a late `started` for a start we just cancelled. Internal stop text
+     * from start_deauth_station itself is not this path. */
+    if (s_js.phase == JS_STARTING || s_js.phase == JS_ACTIVE)
+        s_js.phase = JS_RELOAD_REQUIRED;
+
     if (s_display_cb) s_display_cb(command, NULL);
     uart_bridge_send(command);
 
     s_sniffer_collecting = false;
+    sniffer_arm_end();
     s_wd_status.active = false;
     s_observer_pending = false;   /* cancel any pending observer scan->sniffer handoff */
     s_probe_resume_state = STATE_IDLE;
@@ -3943,6 +4672,10 @@ static bool cmd_do_stop_with_command(const char *command)
     s_bt_track_active = false;
     s_airtag_active = false;
     s_gitm_active = false;
+    s_nfc_pending = NFC_PEND_NONE;
+    s_nfc_emulating = false;
+    s_nfc_chain_bus_get = false;
+    s_nfc_chain_init = false;
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     cmd_state_t prev = s_state;
@@ -4009,8 +4742,42 @@ bool cmd_do_list_passwords(pw_kind_t kind)
     return true;
 }
 
+bool cmd_do_deauth_station(const char *bssid, const char *station)
+{
+    uint8_t ap[6], sta[6];
+    if (!bssid || !station || !sc_parse_mac(bssid, ap) || !sc_parse_mac(station, sta)) {
+        ESP_LOGW(TAG, "Station deauth: bad MAC");
+        return false;
+    }
+    if (s_js.phase == JS_STARTING || s_js.phase == JS_ACTIVE) {
+        bool same = memcmp(s_js.pending_ap, ap, 6) == 0 &&
+                    memcmp(s_js.pending_sta, sta, 6) == 0;
+        ESP_LOGI(TAG, "Station deauth already %s", same ? "in progress" : "busy");
+        return same;
+    }
+    cmd_state_t st = cmd_get_state();
+    if (st != STATE_IDLE && st != STATE_ATTACK_SNIFFER &&
+        st != STATE_LISTING_SNIFFER && st != STATE_LISTING_PROBES) {
+        ESP_LOGW(TAG, "Station deauth refused, state=%s", cmd_state_name(st));
+        return false;
+    }
+    atomic_store(&s_deauth_cancel, false);
+    if (sniffer_deauth_uart_busy()) {
+        memcpy(s_deauth_ap, ap, 6);
+        memcpy(s_deauth_sta, sta, 6);
+        atomic_store(&s_deauth_pending, true);
+        ESP_LOGI(TAG, "Station deauth deferred until the client snapshot ends");
+        return true;
+    }
+    return sniffer_send_station_deauth(ap, sta);
+}
+
 bool cmd_do_sniffer_results(void)
 {
+    if (s_sniffer_collecting || atomic_load(&s_deauth_pending) ||
+        s_js.phase == JS_LOADING || s_js.phase == JS_STARTING || s_js.phase == JS_ACTIVE)
+        return true;
+
     xSemaphoreTake(s_mutex, portMAX_DELAY);
 
     if (s_state != STATE_IDLE &&
@@ -4036,8 +4803,7 @@ bool cmd_do_sniffer_results(void)
     xSemaphoreGive(s_mutex);
 
     begin_sniffer_snapshot();
-    if (s_display_cb) s_display_cb("show_sniffer_results", NULL);
-    uart_bridge_send("show_sniffer_results");
+    if (s_display_cb) s_display_cb("show_sniffer_clients", NULL);
     return true;
 }
 
@@ -4046,6 +4812,7 @@ bool cmd_do_list_handshake_count(void)
     if (!set_state_if_idle(STATE_LISTING_HANDSHAKES)) return false;
     s_handshake_count = 0;
     s_handshake_header_seen = false;
+    s_handshake_echo_seen = false;
     dynvec_clear(&s_handshakes);
     if (s_display_cb) s_display_cb("list_dir /sdcard/lab/handshakes", NULL);
     uart_bridge_send("list_dir /sdcard/lab/handshakes");
@@ -4067,6 +4834,7 @@ bool cmd_do_list_wardrive_logs(void)
     if (!set_state_if_idle(STATE_LISTING_WARDRIVE)) return false;
     dynvec_clear(&s_wardrive_logs);
     s_wardrive_header_seen = false;
+    s_wardrive_echo_seen = false;
     if (s_display_cb) s_display_cb("list_dir /sdcard/lab/wardrives", NULL);
     uart_bridge_send("list_dir /sdcard/lab/wardrives");
     return true;
@@ -4871,4 +5639,165 @@ void cmd_get_subghz_rssi(int *rssi_out, uint32_t *seq_out)
 {
     if (rssi_out) *rssi_out = s_subghz_last_rssi;
     if (seq_out)  *seq_out  = s_subghz_rssi_seq;
+}
+
+/* ---------- NFC commands ---------- */
+
+static bool nfc_begin(cmd_state_t st, nfc_pending_t pend, const char *cmd,
+                      bool chain_bus, bool chain_init)
+{
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (s_state == STATE_NFC) {
+        int64_t now_ms = esp_timer_get_time() / 1000;
+        int64_t silent_ms = (s_last_uart_ms > 0) ? (now_ms - s_last_uart_ms) : 999999;
+        if (silent_ms > 2000) {
+            ESP_LOGW(TAG, "Preempting stale NFC (silent %lldms pend=%d)",
+                     (long long)silent_ms, (int)s_nfc_pending);
+            s_state = STATE_IDLE;
+            s_nfc_pending = NFC_PEND_NONE;
+        }
+    }
+    bool ok = (s_state == STATE_IDLE);
+    if (ok) {
+        s_state = st;
+        s_nfc_pending = pend;
+        s_nfc_chain_bus_get = chain_bus;
+        s_nfc_chain_init = chain_init;
+        nfc_card_reset(&s_nfc_accum);
+    }
+    cmd_state_t cur = s_state;
+    xSemaphoreGive(s_mutex);
+
+    if (!ok) {
+        ESP_LOGW(TAG, "nfc cmd rejected (busy state=%s)", cmd_state_name(cur));
+        return false;
+    }
+    if (pend == NFC_PEND_LIST)
+        dynvec_clear(&s_nfc_build);
+    if (s_display_cb) s_display_cb(cmd, NULL);
+    uart_bridge_send(cmd);
+    return true;
+}
+
+static bool nfc_bus_mode_ok(const char *mode)
+{
+    return mode &&
+           (strcmp(mode, "i2c") == 0 ||
+            strcmp(mode, "spi") == 0 ||
+            strcmp(mode, "pn532") == 0 ||
+            strcmp(mode, "st25") == 0 ||
+            strcmp(mode, "st25spi") == 0);
+}
+
+bool cmd_do_nfc_init(void)
+{
+    return nfc_begin(STATE_NFC, NFC_PEND_INIT, "init_nfc", true, false);
+}
+
+bool cmd_do_nfc_bus_get(void)
+{
+    return nfc_begin(STATE_NFC, NFC_PEND_BUS_GET, "get_nfc_bus", false, false);
+}
+
+bool cmd_do_nfc_bus_set(const char *mode)
+{
+    if (!nfc_bus_mode_ok(mode)) return false;
+    char cmd[40];
+    snprintf(cmd, sizeof(cmd), "set_nfc_bus %s", mode);
+    return nfc_begin(STATE_NFC, NFC_PEND_BUS_SET, cmd, false, true);
+}
+
+bool cmd_do_nfc_read(void)
+{
+    return nfc_begin(STATE_NFC_READ, NFC_PEND_READ, "nfc_read", false, false);
+}
+
+bool cmd_do_nfc_save(const char *name)
+{
+    if (!nfc_name_is_valid(name)) return false;
+    char cmd[80];
+    snprintf(cmd, sizeof(cmd), "nfc_save %s", name);
+    return nfc_begin(STATE_NFC, NFC_PEND_SAVE, cmd, false, false);
+}
+
+bool cmd_do_nfc_list_refresh(void)
+{
+    return nfc_begin(STATE_NFC, NFC_PEND_LIST, "nfc_list", false, false);
+}
+
+bool cmd_do_nfc_load(int index, const char *name)
+{
+    char cmd[96];
+    if (name && name[0]) {
+        if (!nfc_name_is_valid(name)) return false;
+        snprintf(cmd, sizeof(cmd), "nfc_load %s", name);
+    } else if (index >= 0) {
+        snprintf(cmd, sizeof(cmd), "nfc_load %d", index);
+    } else {
+        return false;
+    }
+    return nfc_begin(STATE_NFC, NFC_PEND_LOAD, cmd, false, false);
+}
+
+bool cmd_do_nfc_rename(int index, const char *newname)
+{
+    if (index < 0 || !nfc_name_is_valid(newname)) return false;
+    char cmd[128];
+    snprintf(cmd, sizeof(cmd), "nfc_rename %d %s", index, newname);
+    return nfc_begin(STATE_NFC, NFC_PEND_RENAME, cmd, false, false);
+}
+
+bool cmd_do_nfc_delete(int index, const char *name)
+{
+    char cmd[96];
+    if (name && name[0]) {
+        if (!nfc_name_is_valid(name)) return false;
+        snprintf(cmd, sizeof(cmd), "nfc_delete %s", name);
+    } else if (index >= 0) {
+        snprintf(cmd, sizeof(cmd), "nfc_delete %d", index);
+    } else {
+        return false;
+    }
+    return nfc_begin(STATE_NFC, NFC_PEND_DELETE, cmd, false, false);
+}
+
+bool cmd_do_nfc_emulate(void)
+{
+    return nfc_begin(STATE_NFC_EMULATE, NFC_PEND_EMULATE, "start_nfc_emulate", false, false);
+}
+
+bool cmd_do_nfc_stop(void)
+{
+    return cmd_do_stop();
+}
+
+int cmd_get_nfc_cards(nfc_list_entry_t *out, int max)
+{
+    int n = (int)s_nfc_cards.count < max ? (int)s_nfc_cards.count : max;
+    if (n > 0 && out) memcpy(out, s_nfc_cards.data, n * sizeof(nfc_list_entry_t));
+    return n;
+}
+
+int cmd_get_nfc_count(void)
+{
+    return (int)s_nfc_cards.count;
+}
+
+void cmd_get_nfc_status(nfc_status_t *out)
+{
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    out->probed = s_nfc_probed;
+    out->detected = s_nfc_detected;
+    out->emulating = s_nfc_emulating;
+    out->timeout = s_nfc_last_timeout;
+    out->seq = s_nfc_seq;
+    snprintf(out->pending, sizeof(out->pending), "%s", nfc_pending_name(s_nfc_pending));
+    snprintf(out->last_op, sizeof(out->last_op), "%s", s_nfc_last_op);
+    snprintf(out->bus, sizeof(out->bus), "%s", s_nfc_bus);
+    snprintf(out->backend, sizeof(out->backend), "%s", s_nfc_backend);
+    out->last = s_nfc_last;
+    out->loaded = s_nfc_loaded;
+    xSemaphoreGive(s_mutex);
 }

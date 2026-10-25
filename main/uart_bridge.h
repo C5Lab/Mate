@@ -4,7 +4,7 @@
 #include <stdbool.h>
 
 #define UART_BRIDGE_BUF_SIZE    4096
-#define UART_BRIDGE_LINE_MAX    512
+#define UART_BRIDGE_LINE_MAX    1024
 
 typedef void (*uart_line_cb_t)(const char *line, void *ctx);
 

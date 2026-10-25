@@ -15,17 +15,20 @@ const SCAN_TIMEOUT_MS = 60000;
  * APs/clients (e.g. between captures), and we don't want the UI to blink. */
 function mergeAps(prev, fresh) {
   const map = new Map();
+  const keyOf = (a) => a.bssid || `${a.ssid}__${a.channel}`;
   for (const a of prev) {
-    map.set(`${a.ssid}__${a.channel}`, { ...a, clients: [...(a.clients || [])] });
+    map.set(keyOf(a), { ...a, clients: [...(a.clients || [])] });
   }
   for (const a of fresh) {
-    const key = `${a.ssid}__${a.channel}`;
+    const key = keyOf(a);
     const existing = map.get(key);
     if (existing) {
       const all = new Set([...(existing.clients || []), ...(a.clients || [])]);
       existing.clients = [...all];
       existing.clientCount = Math.max(existing.clientCount || 0, a.clientCount || all.size);
       existing.channel = a.channel || existing.channel;
+      existing.bssid = a.bssid || existing.bssid;
+      existing.ssid = a.ssid || existing.ssid;
     } else {
       map.set(key, { ...a, clients: [...(a.clients || [])] });
     }
@@ -40,22 +43,34 @@ function mergeProbes(prev, fresh) {
   return [...map.values()].sort((a, b) => (a.index || 0) - (b.index || 0));
 }
 
-function NetworkRow({ ap, expanded, onToggle }) {
+function NetworkRow({ ap, expanded, onToggle, onDeauth }) {
   const clientCount = ap.clientCount || 0;
   const clients = ap.clients || [];
+  const label = ap.ssid || (ap.bssid ? `${ap.bssid} CH${ap.channel}` : 'Unknown');
 
   return (
     <li class={`observer-net ${expanded ? 'open' : ''}`}>
       <button class="observer-net-header" onClick={onToggle}>
         <span class={`observer-chevron ${expanded ? 'open' : ''}`}>▸</span>
-        <span class="observer-ssid">{ap.ssid || 'Unknown'}</span>
+        <span class="observer-ssid">{label}</span>
         <span class="observer-net-meta">CH{ap.channel}</span>
         <span class={`badge ${clientCount > 0 ? 'ok' : ''}`}>{clientCount} clients</span>
       </button>
       {expanded ? (
         <ul class="observer-clients">
           {clients.length > 0 ? clients.map((mac) => (
-            <li class="observer-client" key={`${ap.ssid}-${mac}`}>{mac}</li>
+            <li class="observer-client" key={`${ap.bssid || ap.ssid}-${mac}`}>
+              <span>{mac}</span>
+              {ap.bssid ? (
+                <button
+                  class="btn btn-danger"
+                  style="margin-left:8px;padding:2px 8px;font-size:12px"
+                  onClick={() => onDeauth(ap.bssid, mac)}
+                >
+                  D
+                </button>
+              ) : null}
+            </li>
           )) : (
             <li class="observer-client empty">Waiting for client list...</li>
           )}
@@ -65,7 +80,7 @@ function NetworkRow({ ap, expanded, onToggle }) {
   );
 }
 
-function NetworksPanel({ aps }) {
+function NetworksPanel({ aps, onDeauth }) {
   const [expandedKey, setExpandedKey] = useState(null);
 
   if (!aps.length) {
@@ -77,13 +92,14 @@ function NetworksPanel({ aps }) {
   return (
     <ul class="observer-net-list">
       {sorted.map((ap) => {
-        const key = `${ap.ssid}-${ap.channel}`;
+        const key = ap.bssid || `${ap.ssid}-${ap.channel}`;
         const expanded = expandedKey === key;
         return (
           <NetworkRow
             ap={ap}
             expanded={expanded}
             onToggle={() => setExpandedKey(expanded ? null : key)}
+            onDeauth={onDeauth}
             key={key}
           />
         );
@@ -143,6 +159,21 @@ export function Sniffer() {
       }
     })();
 
+    /* /api/status is a cached read (no UART). sniffer_count frames can be
+     * dropped when the WS queue is full, so this is what keeps the Packets
+     * tile moving if a live frame is missed. */
+    const countPoll = setInterval(async () => {
+      try {
+        const s = await api.status();
+        if (s?.ok && s.state === 'sniffer' && typeof s.packet_count === 'number') {
+          setPacketCount(s.packet_count);
+          setState({ packetCount: s.packet_count });
+        }
+      } catch (e) {
+        /* ignore */
+      }
+    }, 1000);
+
     const removeWs = wsAddListener((msg) => {
       if (msg.type === 'sniffer_count') {
         setPacketCount(msg.count || 0);
@@ -164,6 +195,14 @@ export function Sniffer() {
         beginObserverMonitoring();
       }
 
+      if (msg.type === 'station_deauth') {
+        if (msg.status === 'started') {
+          showToast(`Deauth started ${msg.station || ''}`.trim(), 'success');
+        } else if (msg.status === 'error') {
+          showToast(msg.reason || 'Station deauth refused', 'error');
+        }
+      }
+
       if (msg.type === 'attack_stopped') {
         stopAllTimers();
         setRunning(false);
@@ -173,6 +212,7 @@ export function Sniffer() {
 
     return () => {
       stopAllTimers();
+      clearInterval(countPoll);
       removeWs();
     };
   }, []);
@@ -196,8 +236,12 @@ export function Sniffer() {
     try {
       const data = await api.snifferResults();
       if (!data.ok) return;
-      setPacketCount(data.packetCount || 0);
-      setState({ packetCount: data.packetCount || 0 });
+      /* An in-flight or empty snapshot reports 0. Don't wipe the live
+       * packet counter that sniffer_count / status already moved. */
+      if (data.packetCount > 0) {
+        setPacketCount(data.packetCount);
+        setState({ packetCount: data.packetCount });
+      }
       const fresh = Array.isArray(data.aps) ? data.aps : [];
       /* Only merge into the visible list when we got something. Empty refreshes
        * are common (firmware between snapshots) and would otherwise blank the
@@ -223,20 +267,18 @@ export function Sniffer() {
   }
 
   async function tickRefresh() {
-    /* Alternate between the two listing commands so JanOS never sees them
-       overlap (each listing locks state until its prompt completes).
-       Pull the fresh results ourselves ~700ms after asking JanOS to print
-       them, rather than depending solely on the `sniffer_results_updated`
-       WS frame (which can be dropped). This is what makes the Observed
-       Networks list update live instead of only on remount. */
+    /* Alternate the two UART listings. A bare GET never asks JanOS to print
+       the client snapshot, so Observed Networks stayed empty while the packet
+       counter moved. Ask, then read the cache; sniffer_results_updated is the
+       fast path if this timeout lands before the JSON ends. */
     const tick = refreshTickRef.current++;
     try {
       if (tick % 2 === 0) {
-        await api.refreshSniffer();
-        setTimeout(loadSnifferResults, 700);
+        const res = await api.refreshSniffer();
+        if (res?.ok) setTimeout(loadSnifferResults, 1000);
       } else {
-        await api.refreshProbes();
-        setTimeout(loadProbes, 700);
+        const res = await api.refreshProbes();
+        if (res?.ok) setTimeout(loadProbes, 800);
       }
     } catch (e) { /* ignore */ }
   }
@@ -264,9 +306,8 @@ export function Sniffer() {
     }
     setRunning(true);
     setIsScanning(false);
-    loadSnifferResults();
-    loadProbes();
     startRefreshLoop();
+    tickRefresh();
     return true;
   }
 
@@ -364,11 +405,31 @@ export function Sniffer() {
           <button class="btn btn-danger" onClick={stop} disabled={!running && !isScanning}>
             Stop
           </button>
+          <button
+            class="btn btn-secondary"
+            onClick={async () => {
+              try {
+                const res = await api.refreshSniffer();
+                if (res.ok) {
+                  showToast('Refreshing clients…', 'info');
+                  setTimeout(loadSnifferResults, 800);
+                } else {
+                  showToast(res.error || 'Refresh refused', 'error');
+                }
+              } catch (e) {
+                showToast('Refresh failed', 'error');
+              }
+            }}
+            disabled={!running}
+          >
+            Refresh
+          </button>
         </div>
 
         <div class="section-note">
           Start tells the Monster to scan then launch the sniffer itself (keeps
-          running if you disconnect); clients + probes refresh every 4s.
+          running if you disconnect). Refresh clients on demand; D deauths a
+          station by BSSID + MAC.
         </div>
       </section>
 
@@ -378,7 +439,17 @@ export function Sniffer() {
             <h3 class="section-title">Observed Networks</h3>
             <span class={`badge ${running ? 'ok' : ''}`}>{running ? 'Live' : 'Idle'}</span>
           </div>
-          <NetworksPanel aps={aps} />
+          <NetworksPanel
+            aps={aps}
+            onDeauth={async (bssid, station) => {
+              try {
+                const res = await api.deauthStation(bssid, station);
+                showToast(res.ok ? 'Station deauth starting' : (res.error || 'Deauth refused'), res.ok ? 'success' : 'error');
+              } catch (e) {
+                showToast('Deauth failed', 'error');
+              }
+            }}
+          />
         </section>
 
         <section class="glass-card card-body reveal">

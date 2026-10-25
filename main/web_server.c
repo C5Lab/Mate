@@ -475,6 +475,17 @@ static esp_err_t api_attack_post(httpd_req_t *req)
         ok = cmd_do_bt_track(mac[0] ? mac : NULL);
     }
     else if (strstr(uri, "/airtag"))     ok = cmd_do_airtag();
+    else if (strstr(uri, "/deauth_station")) {
+        char body[96] = {0};
+        if (req->content_len > 0) {
+            int received = httpd_req_recv(req, body, sizeof(body) - 1);
+            if (received < 0) body[0] = '\0';
+        }
+        char bssid[24] = {0}, station[24] = {0};
+        json_get_string(body, "\"bssid\"", bssid, sizeof(bssid));
+        json_get_string(body, "\"station\"", station, sizeof(station));
+        ok = cmd_do_deauth_station(bssid, station);
+    }
     else if (strstr(uri, "/deauth"))     ok = cmd_do_deauth();
     else if (strstr(uri, "/blackout"))   ok = cmd_do_blackout();
     else if (strstr(uri, "/eviltwin"))   ok = cmd_do_evil_twin();
@@ -834,8 +845,9 @@ static esp_err_t api_sniffer_results_get(httpd_req_t *req)
     for (int i = 0; i < results->count; i++) {
         const parsed_sniffer_ap_t *ap = &results->aps[i];
         cw_printf(&cw,
-            "%s{\"ssid\":\"%s\",\"channel\":%d,\"clientCount\":%d,\"clients\":[",
-            i > 0 ? "," : "", ap->ssid, ap->channel, ap->client_total);
+            "%s{\"ssid\":\"%s\",\"bssid\":\"%s\",\"channel\":%d,\"clientCount\":%d,\"clients\":[",
+            i > 0 ? "," : "", ap->ssid, ap->bssid[0] ? ap->bssid : "",
+            ap->channel, ap->client_total);
 
         for (int j = 0; j < ap->client_count; j++) {
             const char *mac = parsed_sniffer_ap_client(ap, j);
@@ -1953,6 +1965,168 @@ static esp_err_t api_subghz_rssi_get(httpd_req_t *req)
     return ESP_OK;
 }
 
+static void cw_nfc_card(chunked_writer_t *cw, const nfc_ui_card_t *c)
+{
+    char type_esc[64], uid_esc[96], path_esc[192], idm_esc[64], emu_esc[192], err_esc[128];
+    const char *path = c->loaded_path[0] ? c->loaded_path
+                     : c->saved_path[0] ? c->saved_path : "";
+    json_escape(type_esc, sizeof(type_esc), c->type);
+    json_escape(uid_esc, sizeof(uid_esc), c->uid);
+    json_escape(path_esc, sizeof(path_esc), path);
+    json_escape(idm_esc, sizeof(idm_esc), c->idm);
+    json_escape(emu_esc, sizeof(emu_esc), c->emulating_summary);
+    json_escape(err_esc, sizeof(err_esc), c->error);
+    cw_printf(cw,
+        "{\"type\":\"%s\",\"uid\":\"%s\",\"atqa0\":%u,\"atqa1\":%u,\"sak\":%u,"
+        "\"haveAtqaSak\":%s,\"idm\":\"%s\",\"haveIdm\":%s,"
+        "\"dataLen\":%u,\"numBlocks\":%u,\"blockSize\":%u,\"haveData\":%s,"
+        "\"noCard\":%s,\"path\":\"%s\",\"emulating\":\"%s\","
+        "\"emulateFullUl\":%s,\"emulateUidOnly\":%s,"
+        "\"classic\":%s,\"ultralight\":%s,"
+        "\"haveLoaded\":%s,\"loadFailed\":%s,\"notFound\":%s,"
+        "\"emulateFailed\":%s,\"noCardLoaded\":%s,\"error\":\"%s\"}",
+        type_esc, uid_esc,
+        (unsigned)c->atqa[0], (unsigned)c->atqa[1], (unsigned)c->sak,
+        c->have_atqa_sak ? "true" : "false",
+        idm_esc, c->have_idm ? "true" : "false",
+        c->data_len, c->num_blocks, c->block_size,
+        c->have_data ? "true" : "false",
+        c->no_card ? "true" : "false",
+        path_esc, emu_esc,
+        c->emulate_full_ul ? "true" : "false",
+        c->emulate_uid_only ? "true" : "false",
+        nfc_type_is_classic(c->type) ? "true" : "false",
+        nfc_type_is_ultralight(c->type) ? "true" : "false",
+        c->have_loaded ? "true" : "false",
+        c->load_failed ? "true" : "false",
+        c->not_found ? "true" : "false",
+        c->emulate_failed ? "true" : "false",
+        c->no_card_loaded ? "true" : "false",
+        err_esc);
+}
+
+static esp_err_t api_nfc_status_get(httpd_req_t *req)
+{
+    nfc_status_t st;
+    cmd_get_nfc_status(&st);
+
+    char bus_esc[24], be_esc[160], pend_esc[24], op_esc[24];
+    json_escape(bus_esc, sizeof(bus_esc), st.bus);
+    json_escape(be_esc, sizeof(be_esc), st.backend);
+    json_escape(pend_esc, sizeof(pend_esc), st.pending);
+    json_escape(op_esc, sizeof(op_esc), st.last_op);
+
+    chunked_writer_t cw;
+    cw_init(&cw, req);
+    cw_printf(&cw,
+        "{\"ok\":true,\"probed\":%s,\"detected\":%s,\"emulating\":%s,"
+        "\"timeout\":%s,\"seq\":%u,\"pending\":\"%s\",\"lastOp\":\"%s\","
+        "\"bus\":\"%s\",\"backend\":\"%s\",\"last\":",
+        st.probed ? "true" : "false",
+        st.detected ? "true" : "false",
+        st.emulating ? "true" : "false",
+        st.timeout ? "true" : "false",
+        (unsigned)st.seq, pend_esc, op_esc,
+        bus_esc, be_esc);
+    cw_nfc_card(&cw, &st.last);
+    cw_printf(&cw, ",\"loaded\":");
+    cw_nfc_card(&cw, &st.loaded);
+    cw_printf(&cw, "}");
+    return cw_finish(&cw);
+}
+
+static esp_err_t api_nfc_list_get(httpd_req_t *req)
+{
+    int count = cmd_get_nfc_count();
+    if (count < 0) count = 0;
+
+    nfc_list_entry_t *cards = NULL;
+    if (count > 0) {
+        cards = psram_malloc((size_t)count * sizeof(*cards));
+        if (!cards) {
+            send_json(req, "{\"ok\":false,\"error\":\"oom\"}");
+            return ESP_OK;
+        }
+        count = cmd_get_nfc_cards(cards, count);
+    }
+
+    chunked_writer_t cw;
+    cw_init(&cw, req);
+    cw_printf(&cw, "{\"ok\":true,\"count\":%d,\"cards\":[", count);
+    for (int i = 0; i < count; i++) {
+        char name_esc[128];
+        json_escape(name_esc, sizeof(name_esc), cards[i].name);
+        cw_printf(&cw, "%s{\"idx\":%d,\"name\":\"%s\"}",
+                  i > 0 ? "," : "", cards[i].idx, name_esc);
+    }
+    cw_printf(&cw, "]}");
+    free(cards);
+    return cw_finish(&cw);
+}
+
+static esp_err_t api_nfc_post(httpd_req_t *req)
+{
+    const char *uri = req->uri;
+    char body[192] = {0};
+    if (req->content_len > 0) {
+        int received = httpd_req_recv(req, body, sizeof(body) - 1);
+        if (received < 0) body[0] = '\0';
+    }
+
+    bool ok = false;
+
+    if (strstr(uri, "/stop")) {
+        ok = cmd_do_nfc_stop();
+    } else if (strstr(uri, "/init")) {
+        ok = cmd_do_nfc_init();
+    } else if (strstr(uri, "/read")) {
+        ok = cmd_do_nfc_read();
+    } else if (strstr(uri, "/list/refresh")) {
+        ok = cmd_do_nfc_list_refresh();
+    } else if (strstr(uri, "/save")) {
+        char name[48] = {0};
+        json_get_string(body, "\"name\"", name, sizeof(name));
+        ok = cmd_do_nfc_save(name);
+    } else if (strstr(uri, "/load")) {
+        int idx = -1;
+        char name[48] = {0};
+        json_get_int(body, "\"index\"", &idx);
+        json_get_string(body, "\"name\"", name, sizeof(name));
+        ok = cmd_do_nfc_load(idx, name[0] ? name : NULL);
+    } else if (strstr(uri, "/rename")) {
+        int idx = -1;
+        char name[48] = {0};
+        json_get_int(body, "\"index\"", &idx);
+        json_get_string(body, "\"name\"", name, sizeof(name));
+        ok = cmd_do_nfc_rename(idx, name);
+    } else if (strstr(uri, "/delete")) {
+        int idx = -1;
+        char name[48] = {0};
+        json_get_int(body, "\"index\"", &idx);
+        json_get_string(body, "\"name\"", name, sizeof(name));
+        ok = cmd_do_nfc_delete(idx, name[0] ? name : NULL);
+    } else if (strstr(uri, "/emulate")) {
+        ok = cmd_do_nfc_emulate();
+    } else if (strstr(uri, "/bus")) {
+        char mode[12] = {0};
+        json_get_string(body, "\"mode\"", mode, sizeof(mode));
+        if (!mode[0]) json_get_string(body, "\"bus\"", mode, sizeof(mode));
+        if (strcmp(mode, "get") == 0 || strstr(uri, "/bus/get")) {
+            ok = cmd_do_nfc_bus_get();
+        } else {
+            ok = cmd_do_nfc_bus_set(mode);
+        }
+    }
+
+    if (ok) {
+        send_json(req, "{\"ok\":true}");
+    } else {
+        httpd_resp_set_status(req, "409 Conflict");
+        send_json(req, "{\"ok\":false,\"error\":\"busy or bad params\"}");
+    }
+    return ESP_OK;
+}
+
 /* ---------- Root / SPA handler ---------- */
 
 static esp_err_t root_handler(httpd_req_t *req)
@@ -2156,6 +2330,9 @@ esp_err_t web_server_start(void)
     REGISTER_URI("/api/subghz/list",   HTTP_GET,  api_subghz_list_get);
     REGISTER_URI("/api/subghz/rssi",   HTTP_GET,  api_subghz_rssi_get);
     REGISTER_URI("/api/subghz/*",      HTTP_POST, api_subghz_post);
+    REGISTER_URI("/api/nfc/list",      HTTP_GET,  api_nfc_list_get);
+    REGISTER_URI("/api/nfc/status",    HTTP_GET,  api_nfc_status_get);
+    REGISTER_URI("/api/nfc/*",         HTTP_POST, api_nfc_post);
 
     /* Captive portal detection endpoints */
     REGISTER_URI("/generate_204",        HTTP_GET, android_204_handler);

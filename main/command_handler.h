@@ -2,6 +2,7 @@
 
 #include "response_parser.h"
 #include "cgw_parser.h"
+#include "nfc_parser.h"
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -207,6 +208,9 @@ typedef enum {
     STATE_SUBGHZ_IMPORT,
     STATE_SUBGHZ_EXPORT,
     STATE_ZIG_RECON,            /* start_zig_recon streaming (Mesh Recon) */
+    STATE_NFC,                  /* short NFC request/response until [NFC] END */
+    STATE_NFC_READ,             /* nfc_read (long; Classic dump is UART-quiet) */
+    STATE_NFC_EMULATE,          /* start_nfc_emulate until universal stop */
 } cmd_state_t;
 
 /** Captured-password category (matches JanOS `show_pass [evil|portal]`). */
@@ -423,6 +427,9 @@ bool cmd_do_list_passwords(pw_kind_t kind);
 
 /** Request sniffer results. */
 bool cmd_do_sniffer_results(void);
+
+/** Start station deauth using BSSID + client MAC from the sniffer snapshot. */
+bool cmd_do_deauth_station(const char *bssid, const char *station);
 
 /** Request handshake file listing (count + filenames) from SD card. */
 bool cmd_do_list_handshake_count(void);
@@ -736,3 +743,35 @@ int cmd_get_subghz_count(void);
  *  `subghz_rx`. Lets the Listen waterfall poll RSSI over HTTP as a
  *  fallback when the WebSocket is unavailable. Either arg may be NULL. */
 void cmd_get_subghz_rssi(int *rssi_out, uint32_t *seq_out);
+
+/* ---------- NFC (ST25 / PN532 via JanOS) ---------- */
+
+typedef struct {
+    bool probed;                 /* at least one init_nfc completed */
+    bool detected;
+    bool emulating;
+    bool timeout;                /* last nfc_read ended on Mate's silence fuse */
+    uint32_t seq;                /* increments on every NFC [NFC] END / timeout */
+    char pending[16];            /* read|init|list|... or empty when idle */
+    char last_op[16];            /* last finished pending name (for HTTP poll) */
+    char bus[12];                /* i2c | spi | pn532 */
+    char backend[80];
+    nfc_ui_card_t last;          /* last nfc_read result (incl. no_card) */
+    nfc_ui_card_t loaded;        /* last nfc_load / emulate result */
+} nfc_status_t;
+
+bool cmd_do_nfc_init(void);
+bool cmd_do_nfc_bus_get(void);
+bool cmd_do_nfc_bus_set(const char *mode);
+bool cmd_do_nfc_read(void);
+bool cmd_do_nfc_save(const char *name);
+bool cmd_do_nfc_list_refresh(void);
+bool cmd_do_nfc_load(int index, const char *name);
+bool cmd_do_nfc_rename(int index, const char *newname);
+bool cmd_do_nfc_delete(int index, const char *name);
+bool cmd_do_nfc_emulate(void);
+bool cmd_do_nfc_stop(void);
+
+int cmd_get_nfc_cards(nfc_list_entry_t *out, int max);
+int cmd_get_nfc_count(void);
+void cmd_get_nfc_status(nfc_status_t *out);
