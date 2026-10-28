@@ -188,6 +188,9 @@ export function RogueGITM() {
           </div>
           <div class="kv">
             <div class="kv-row"><span class="kv-key">SSID</span><span class="kv-val">{victim.ssid || '(hidden)'}</span></div>
+            {victim.vendor ? (
+              <div class="kv-row"><span class="kv-key">Vendor</span><span class="kv-val">{victim.vendor}</span></div>
+            ) : null}
             <div class="kv-row"><span class="kv-key">BSSID</span><span class="kv-val">{victim.bssid}</span></div>
             <div class="kv-row"><span class="kv-key">Security</span><span class="kv-val">{victim.security || 'open'}</span></div>
           </div>
@@ -202,7 +205,7 @@ export function RogueGITM() {
                 onChange={(e) => { setUplinkIdx(e.target.value); setUplinkPassword(''); }}>
                 {uplinks.map((n) => (
                   <option key={n.index} value={n.index}>
-                    {n.ssid} · {n.security || 'open'} · {n.rssi}dBm
+                    {n.ssid}{n.vendor ? ` · ${n.vendor}` : ''} · {n.security || 'open'} · {n.rssi}dBm
                   </option>
                 ))}
               </select>

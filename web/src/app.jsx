@@ -101,7 +101,7 @@ function SettingsIcon() {
 /* Bump this on every web change so the footer confirms which build is loaded.
  * If the footer version doesn't match the latest, the browser is serving a
  * cached/stale app.js (hard-refresh or open in a private tab). */
-export const WEB_VERSION = '0024';
+export const WEB_VERSION = '0025';
 
 export function App() {
   const [, forceUpdate] = useState(0);

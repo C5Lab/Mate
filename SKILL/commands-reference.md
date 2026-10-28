@@ -20,7 +20,8 @@ Commands are sent over UART as plain text terminated with `\r\n`. Responses are 
 "2","BRW","","64:7C:34:41:8F:EC","7","WPA/WPA2 Mixed","-72","2.4GHz"
 Scan results printed.
 ```
-- **CSV fields**: `"index","SSID","(empty)","BSSID","channel","security","RSSI","band"`
+- **CSV fields**: `"index","SSID","vendor","BSSID","channel","security","RSSI","band"`
+- **Quoting**: RFC 4180. Every field has exactly one pair of enclosing quotes. A `"` inside SSID or vendor is written as `""`. Commas inside those fields stay inside the quotes. Example: `"1","moja ""specjalna"" siec","Acme ""X"" Inc","AA:BB:CC:DD:EE:FF","6","WPA2","-50","2.4GHz"` is SSID `moja "specjalna" siec` and vendor `Acme "X" Inc`. An empty vendor is `""`.
 - **Notes**: Wardrive must be stopped first. Results are auto-printed; wait for `"Scan results printed"`.
 
 ### `show_scan_results`

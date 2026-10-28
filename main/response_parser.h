@@ -10,7 +10,8 @@
 
 typedef struct {
     int  index;
-    char ssid[33];
+    char ssid[33];      /* 32-byte 802.11 SSID + NUL; longer text is truncated */
+    char vendor[64];    /* OUI / vendor name; longer text is truncated */
     char bssid[18];
     int  channel;
     char security[24];
@@ -28,9 +29,15 @@ typedef struct {
 } scan_results_t;
 
 /**
- * Try to parse a UART line as a network CSV row.
- * Returns true if parsed successfully.
- * Format: "1","SSID","","BSSID","CH","Security","RSSI","Band"
+ * Try to parse a UART line from `scan_networks` / `show_scan_results`.
+ * Returns true if parsed successfully (index > 0 and all 8 fields present).
+ *
+ * Format (RFC 4180), one pair of enclosing quotes per field:
+ *   "index","SSID","vendor","BSSID","channel","auth","RSSI","band"
+ * A `"` inside a field is written as `""`. Commas inside quotes stay in
+ * the field. SSID and vendor are stored unescaped. A field longer than
+ * its buffer is truncated without shifting the fields that follow.
+ * Legacy rows with an empty vendor (`""`) parse the same as before.
  */
 bool parse_network_line(const char *line, parsed_network_t *net);
 

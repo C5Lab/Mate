@@ -51,7 +51,7 @@ export function SaeOverflow() {
         <div class="kv">
           <div class="kv-row">
             <span class="kv-key">Target</span>
-            <span class="kv-val">{target ? `${target.ssid} (${target.security})` : 'Not selected'}</span>
+            <span class="kv-val">{target ? `${target.ssid}${target.vendor ? ` · ${target.vendor}` : ''} (${target.security})` : 'Not selected'}</span>
           </div>
           <div class="kv-row">
             <span class="kv-key">Selected count</span>

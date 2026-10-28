@@ -103,6 +103,7 @@ export function Scan() {
 
   const [connectOpen, setConnectOpen] = useState(false);
   const [connectSsid, setConnectSsid] = useState('');
+  const [connectVendor, setConnectVendor] = useState('');
   const [connectSecurity, setConnectSecurity] = useState('');
   const [connectPassword, setConnectPassword] = useState('');
   const [connectBusy, setConnectBusy] = useState(false);
@@ -781,6 +782,7 @@ export function Scan() {
         closeMonitor();
 
         setConnectSsid(target.ssid);
+        setConnectVendor(target.vendor || '');
         setConnectSecurity(target.security || '');
         setConnectPassword('');
         setConnectError('');
@@ -909,6 +911,7 @@ export function Scan() {
             <div class="scan-modal-head">
               <h3 class="section-title">WiFi Connect Required</h3>
               <span class="badge info">{connectSsid}</span>
+              {connectVendor ? <span class="badge">{connectVendor}</span> : null}
             </div>
 
             <div class="field">

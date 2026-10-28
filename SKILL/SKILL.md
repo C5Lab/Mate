@@ -130,35 +130,29 @@ For commands without explicit end markers, use a timeout with empty-read detecti
 
 ### Key Parsing Recipes
 
-**Network scan CSV** -- fields: index, SSID, (empty), BSSID, channel, security, RSSI, band:
+**Network scan CSV** -- fields: index, SSID, vendor, BSSID, channel, security, RSSI, band. RFC 4180: a `"` inside SSID or vendor is `""`, and commas stay inside the enclosing quotes. Do not stop the field at the first `"`, and do not copy the whole line into a 256-byte buffer (a long vendor plus escaped quotes will shift the BSSID). `main/response_parser.c` is the implementation; the shape is:
+
 ```c
-// Line: "1","AX3","","C4:2B:44:12:29:20","112","WPA2","-59","5GHz"
-static bool parse_network_line(const char *line, wifi_network_t *net) {
-    if (line[0] != '"') return false;
-    char temp[256];
-    strncpy(temp, line, sizeof(temp) - 1);
-    char *fields[8] = {NULL};
-    int field_idx = 0;
-    char *p = temp;
-    while (*p && field_idx < 8) {
+// "1","moja ""specjalna"" siec","Acme ""X"" Inc","AA:BB:CC:DD:EE:FF","6","WPA2","-50","2.4GHz"
+// -> ssid moja "specjalna" siec, vendor Acme "X" Inc
+// Plain rows ("1","AX3","","AA:..","112","WPA2","-59","5GHz") are unchanged.
+// wifi_network_t needs char vendor[64] in addition to ssid[33].
+static bool csv_quoted_field(const char **pp, char *out, size_t out_len) {
+    const char *p = *pp;
+    size_t n = 0;
+    if (!p || *p != '"' || out_len == 0) return false;
+    for (p++; *p; p++) {
         if (*p == '"') {
+            if (p[1] == '"') { if (n + 1 < out_len) out[n++] = '"'; p++; continue; }
+            out[n] = '\0';
             p++;
-            fields[field_idx] = p;
-            while (*p && *p != '"') p++;
-            if (*p == '"') { *p = '\0'; p++; }
-            field_idx++;
             if (*p == ',') p++;
-        } else { p++; }
+            *pp = p;
+            return true;
+        }
+        if (n + 1 < out_len) out[n++] = *p;
     }
-    if (field_idx < 8) return false;
-    net->index = atoi(fields[0]);
-    strncpy(net->ssid, fields[1], sizeof(net->ssid) - 1);
-    strncpy(net->bssid, fields[3], sizeof(net->bssid) - 1);
-    net->channel = atoi(fields[4]);
-    strncpy(net->security, fields[5], sizeof(net->security) - 1);
-    net->rssi = atoi(fields[6]);
-    strncpy(net->band, fields[7], sizeof(net->band) - 1);
-    return true;
+    return false;
 }
 ```
 
