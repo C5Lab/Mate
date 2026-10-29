@@ -204,7 +204,7 @@ export function GITM() {
                 <option value="">-- choose --</option>
                 {st.networks.map((n) => (
                   <option key={n.index} value={n.index}>
-                    {n.ssid || '(hidden)'} · {n.security || 'open'} · {n.rssi}dBm
+                    {n.ssid || '(hidden)'}{n.vendor ? ` · ${n.vendor}` : ''} · {n.security || 'open'} · {n.rssi}dBm
                   </option>
                 ))}
               </select>

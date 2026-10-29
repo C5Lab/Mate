@@ -113,6 +113,12 @@ export function EvilTwin() {
             <span class="kv-key">Clone target</span>
             <span class="kv-val">{targetNet?.ssid || 'Not selected'}</span>
           </div>
+          {targetNet?.vendor ? (
+            <div class="kv-row">
+              <span class="kv-key">Vendor</span>
+              <span class="kv-val">{targetNet.vendor}</span>
+            </div>
+          ) : null}
           <div class="kv-row">
             <span class="kv-key">Deauth targets</span>
             <span class="kv-val">{st.selected.size}</span>

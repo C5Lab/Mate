@@ -6,43 +6,69 @@
 
 /* ---------- Network CSV parsing ---------- */
 
+/* Read one RFC 4180 quoted field from *pp.
+ * `""` inside the field becomes a single `"`. On success *pp is advanced
+ * past the field and a single separating comma, if one is present.
+ * Bytes that do not fit in `out` are discarded so a long SSID or vendor
+ * cannot shift BSSID / channel / RSSI / band. `out` is always NUL-terminated
+ * when out_len > 0. Does not write past out_len. */
+static bool csv_quoted_field(const char **pp, char *out, size_t out_len)
+{
+    const char *p;
+    size_t n = 0;
+
+    if (!pp || !out || out_len == 0) return false;
+    p = *pp;
+    if (!p || *p != '"') return false;
+    p++;
+
+    while (*p) {
+        if (*p == '"') {
+            if (p[1] == '"') {
+                if (n + 1 < out_len) out[n++] = '"';
+                p += 2;
+                continue;
+            }
+            p++;
+            out[n] = '\0';
+            if (*p == ',') p++;
+            *pp = p;
+            return true;
+        }
+        if (n + 1 < out_len) out[n++] = *p;
+        p++;
+    }
+    return false;
+}
+
 bool parse_network_line(const char *line, parsed_network_t *net)
 {
-    if (!line || line[0] != '"') return false;
+    parsed_network_t tmp;
+    char index_s[16];
+    char channel_s[16];
+    char rssi_s[16];
+    const char *p;
 
-    char tmp[256];
-    strncpy(tmp, line, sizeof(tmp) - 1);
-    tmp[sizeof(tmp) - 1] = '\0';
+    if (!line || !net || line[0] != '"') return false;
 
-    char *fields[8] = {NULL};
-    int idx = 0;
-    char *p = tmp;
+    memset(&tmp, 0, sizeof(tmp));
+    p = line;
+    if (!csv_quoted_field(&p, index_s, sizeof(index_s))) return false;
+    if (!csv_quoted_field(&p, tmp.ssid, sizeof(tmp.ssid))) return false;
+    if (!csv_quoted_field(&p, tmp.vendor, sizeof(tmp.vendor))) return false;
+    if (!csv_quoted_field(&p, tmp.bssid, sizeof(tmp.bssid))) return false;
+    if (!csv_quoted_field(&p, channel_s, sizeof(channel_s))) return false;
+    if (!csv_quoted_field(&p, tmp.security, sizeof(tmp.security))) return false;
+    if (!csv_quoted_field(&p, rssi_s, sizeof(rssi_s))) return false;
+    if (!csv_quoted_field(&p, tmp.band, sizeof(tmp.band))) return false;
 
-    while (*p && idx < 8) {
-        if (*p == '"') {
-            p++;
-            fields[idx] = p;
-            while (*p && *p != '"') p++;
-            if (*p == '"') { *p = '\0'; p++; }
-            idx++;
-            if (*p == ',') p++;
-        } else {
-            p++;
-        }
-    }
+    tmp.index   = atoi(index_s);
+    tmp.channel = atoi(channel_s);
+    tmp.rssi    = atoi(rssi_s);
+    if (tmp.index <= 0) return false;
 
-    if (idx < 8) return false;
-
-    memset(net, 0, sizeof(*net));
-    net->index   = atoi(fields[0]);
-    strncpy(net->ssid,     fields[1], sizeof(net->ssid) - 1);
-    strncpy(net->bssid,    fields[3], sizeof(net->bssid) - 1);
-    net->channel = atoi(fields[4]);
-    strncpy(net->security, fields[5], sizeof(net->security) - 1);
-    net->rssi    = atoi(fields[6]);
-    strncpy(net->band,     fields[7], sizeof(net->band) - 1);
-
-    return net->index > 0;
+    *net = tmp;
+    return true;
 }
 
 /* ---------- Password parsing ---------- */

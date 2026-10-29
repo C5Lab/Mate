@@ -46,6 +46,27 @@ static void broadcast_json(const char *fmt, ...)
     }
 }
 
+/* JSON string escape matching web_server's json_escape: quote and backslash
+ * are escaped, control characters are dropped, and the result is always
+ * NUL-terminated inside dstsz. Used so an SSID/vendor that contains `"`
+ * does not break the scan_network event. */
+static void json_escape_field(char *dst, size_t dstsz, const char *src)
+{
+    size_t j = 0;
+    if (!dst || dstsz == 0) return;
+    if (!src) src = "";
+    for (size_t i = 0; src[i] && j + 2 < dstsz; i++) {
+        unsigned char c = (unsigned char)src[i];
+        if (c == '"' || c == '\\') {
+            dst[j++] = '\\';
+            dst[j++] = (char)c;
+        } else if (c >= 0x20) {
+            dst[j++] = (char)c;
+        }
+    }
+    dst[j] = '\0';
+}
+
 /* Cached data.
  *
  * Variable-cardinality lists (scan results, sniffer APs/clients, ARP hosts,
@@ -2847,14 +2868,22 @@ static void on_uart_line(const char *line, void *ctx)
 
         parsed_network_t net;
         if (parse_network_line(line, &net)) {
+            char ssid_e[80], vendor_e[160], bssid_e[40], sec_e[64], band_e[24];
             if (!scan_push(&net)) log_drop("scan_networks");
+            /* Escape before interpolating. A `"` in the SSID or vendor would
+             * otherwise terminate the JSON string and the GUI would drop the row. */
+            json_escape_field(ssid_e, sizeof(ssid_e), net.ssid);
+            json_escape_field(vendor_e, sizeof(vendor_e), net.vendor);
+            json_escape_field(bssid_e, sizeof(bssid_e), net.bssid);
+            json_escape_field(sec_e, sizeof(sec_e), net.security);
+            json_escape_field(band_e, sizeof(band_e), net.band);
             /* Only send structured event, skip raw uart_line to save queue space */
             broadcast_json(
                 "{\"type\":\"scan_network\",\"network\":"
-                "{\"index\":%d,\"ssid\":\"%s\",\"bssid\":\"%s\","
+                "{\"index\":%d,\"ssid\":\"%s\",\"vendor\":\"%s\",\"bssid\":\"%s\","
                 "\"channel\":%d,\"security\":\"%s\",\"rssi\":%d,\"band\":\"%s\"}}",
-                net.index, net.ssid, net.bssid,
-                net.channel, net.security, net.rssi, net.band);
+                net.index, ssid_e, vendor_e, bssid_e,
+                net.channel, sec_e, net.rssi, band_e);
 
             /* All expected networks received? */
             if (s_scan_expected > 0 && s_scan.count >= s_scan_expected) {

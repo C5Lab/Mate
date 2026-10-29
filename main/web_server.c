@@ -368,6 +368,8 @@ static esp_err_t api_scan_post(httpd_req_t *req)
     return ESP_OK;
 }
 
+static void json_escape(char *dst, size_t dstsz, const char *src);
+
 static esp_err_t api_scan_results_get(httpd_req_t *req)
 {
     const scan_results_t *r = cmd_get_scan_results();
@@ -378,12 +380,18 @@ static esp_err_t api_scan_results_get(httpd_req_t *req)
               r->scan_complete ? "true" : "false", r->count);
     for (int i = 0; i < r->count; i++) {
         const parsed_network_t *n = &r->networks[i];
+        char ssid_e[80], vendor_e[160], bssid_e[40], sec_e[64], band_e[24];
+        json_escape(ssid_e, sizeof(ssid_e), n->ssid);
+        json_escape(vendor_e, sizeof(vendor_e), n->vendor);
+        json_escape(bssid_e, sizeof(bssid_e), n->bssid);
+        json_escape(sec_e, sizeof(sec_e), n->security);
+        json_escape(band_e, sizeof(band_e), n->band);
         cw_printf(&cw,
-            "%s{\"index\":%d,\"ssid\":\"%s\",\"bssid\":\"%s\","
+            "%s{\"index\":%d,\"ssid\":\"%s\",\"vendor\":\"%s\",\"bssid\":\"%s\","
             "\"channel\":%d,\"security\":\"%s\",\"rssi\":%d,\"band\":\"%s\"}",
             i > 0 ? "," : "",
-            n->index, n->ssid, n->bssid,
-            n->channel, n->security, n->rssi, n->band);
+            n->index, ssid_e, vendor_e, bssid_e,
+            n->channel, sec_e, n->rssi, band_e);
     }
     cw_printf(&cw, "]}");
     return cw_finish(&cw);
@@ -1052,8 +1060,6 @@ static esp_err_t api_nmap_results_get(httpd_req_t *req)
 }
 
 /* ---------- Capture Gateway (GITM) / Rogue GITM ---------- */
-
-static void json_escape(char *dst, size_t dstsz, const char *src); /* fwd */
 
 /* POST /api/gitm/refresh -> send `capture_gateway status`. The `[CGW]` block is
  * parsed asynchronously into the cached snapshot; the web then GETs

@@ -28,6 +28,7 @@ export function RogueAP() {
   const [knownPasswords, setKnownPasswords] = useState([]);
   const [captured, setCaptured] = useState([]);
   const st = getState();
+  const selectedNet = st.networks.find((n) => st.selected.has(n.index));
 
   useEffect(() => {
     loadPasswords();
@@ -144,6 +145,7 @@ export function RogueAP() {
                 onInput={(e) => setSsid(e.target.value)}
                 placeholder="Corporate Guest"
               />
+              {selectedNet?.vendor ? <p class="module-note">{selectedNet.vendor}</p> : null}
             </div>
 
             <div class="field">

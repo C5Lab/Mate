@@ -38,6 +38,7 @@ export function NetworkList({ networks, selected, onToggle, onToggleAll }) {
 
               <span class="network-main">
                 <span class="network-title">{n.ssid || '[Hidden Network]'}</span>
+                {n.vendor ? <span class="network-meta">{n.vendor}</span> : null}
                 <span class="network-meta network-mac">{n.bssid}</span>
                 <span class="network-meta">CH{n.channel} | {n.security || 'Open'} | {n.band || '2.4G'}</span>
               </span>
